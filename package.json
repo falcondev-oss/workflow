@@ -1,7 +1,7 @@
 {
   "name": "@falcondev-oss/workflow",
   "type": "module",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "packageManager": "pnpm@10.17.1",
   "description": "Simple type-safe queue worker with durable execution based on BullMQ.",
   "license": "MIT",
