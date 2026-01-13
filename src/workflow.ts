@@ -6,7 +6,7 @@ import type {
   QueueOptions,
   WorkerOptions,
 } from 'bullmq'
-import type { SetOptional } from 'type-fest'
+import type { Except, SetOptional } from 'type-fest'
 import type { Serialized } from './serializer'
 import type { WorkflowJobInternal, WorkflowQueueInternal } from './types'
 import { Queue, QueueEvents, Worker } from 'bullmq'
@@ -98,6 +98,42 @@ export class Workflow<RunInput, Input, Output> {
     return new WorkflowJob<Output>({
       job,
       queueEvents: await this.getOrCreateQueueEvents(),
+    })
+  }
+
+  async runIn(input: RunInput, delayMs: number, opts?: Except<JobsOptions, 'delay'>) {
+    return this.run(input, {
+      delay: delayMs,
+      ...opts,
+    })
+  }
+
+  async runAt(input: RunInput, date: Date, opts?: Except<JobsOptions, 'delay'>) {
+    const now = Date.now()
+    const dateTime = date.getTime()
+
+    return dateTime < now
+      ? this.run(input, opts)
+      : this.runIn(input, date.getTime() - Date.now(), opts)
+  }
+
+  async repeat(
+    input: RunInput,
+    cronOrInterval: string | number,
+    opts?: Except<JobsOptions, 'repeat'>,
+  ) {
+    return this.run(input, {
+      repeat: {
+        tz: Settings.defaultCronTimezone,
+        ...(typeof cronOrInterval === 'string'
+          ? {
+              pattern: cronOrInterval,
+            }
+          : {
+              every: cronOrInterval,
+            }),
+      },
+      ...opts,
     })
   }
 

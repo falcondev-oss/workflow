@@ -4,6 +4,7 @@ import IORedis from 'ioredis'
 export const Settings = {
   defaultPrefix: 'falcondev-oss-workflow',
   defaultConnection: undefined as IORedis | undefined,
+  defaultCronTimezone: undefined as string | undefined,
 }
 
 export const defaultRedisConnection = createSingletonPromise(async () => {
