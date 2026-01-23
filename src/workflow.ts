@@ -29,11 +29,13 @@ export interface WorkflowOptions<RunInput, Input, Output> {
 }
 
 export class Workflow<RunInput, Input, Output> {
+  id
   private opts
   private queue?: WorkflowQueueInternal<Input, Output>
   private queueEvents?: QueueEvents
 
   constructor(opts: WorkflowOptions<RunInput, Input, Output>) {
+    this.id = opts.id
     this.opts = opts
   }
 
