@@ -6,6 +6,7 @@ export type WorkflowJobInternal<Input, Output> = Job<
   Serialized<{
     input: Input
     stepData: Record<string, WorkflowStepData>
+    tracingHeaders: unknown
   }>,
   Serialized<Output>,
   string

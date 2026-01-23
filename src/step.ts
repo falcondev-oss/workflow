@@ -1,3 +1,4 @@
+import type { Span } from '@opentelemetry/api'
 import type { Options } from 'p-retry'
 import type { WorkflowQueueInternal } from './types'
 import { setTimeout } from 'node:timers/promises'
@@ -22,20 +23,33 @@ export class WorkflowStep {
   private workflowId
   private queue
   private workflowJobId
+  private stepNamePrefix
 
   constructor(opts: {
     queue: WorkflowQueueInternal<any, any>
     workflowJobId: string
     workflowId: string
+    stepNamePrefix?: string
   }) {
     this.queue = opts.queue
     this.workflowJobId = opts.workflowJobId
     this.workflowId = opts.workflowId
+    this.stepNamePrefix = opts.stepNamePrefix ? `${opts.stepNamePrefix}|` : ''
   }
 
-  async do<R>(name: string, run: () => R, options?: WorkflowStepOptions) {
-    const stepData = await this.getStepData('do', 'name')
-    if (stepData && 'result' in stepData) return stepData.result as R
+  private addNamePrefix(name: string) {
+    return `${this.stepNamePrefix}${name}`
+  }
+
+  async do<R>(
+    stepName: string,
+    run: (ctx: { step: WorkflowStep; span: Span }) => R,
+    options?: WorkflowStepOptions,
+  ) {
+    const name = this.addNamePrefix(stepName)
+
+    const stepData = await this.getStepData('do', name)
+    if (stepData?.result) return stepData.result as R
 
     const initialAttempt = stepData?.attempt ?? 0
     await this.updateStepData(name, {
@@ -47,12 +61,23 @@ export class WorkflowStep {
         const result = await runWithTracing(
           `step:${name}`,
           {
-            'workflow.id': this.workflowId,
-            'workflow.job_id': this.workflowJobId,
-            'workflow.step_name': name,
-            'workflow.step.attempt': attempt,
+            attributes: {
+              'workflow.id': this.workflowId,
+              'workflow.job_id': this.workflowJobId,
+              'workflow.step_name': name,
+              'workflow.step.attempt': attempt,
+            },
           },
-          run,
+          async (span) =>
+            run({
+              step: new WorkflowStep({
+                queue: this.queue,
+                workflowId: this.workflowId,
+                workflowJobId: this.workflowJobId,
+                stepNamePrefix: name,
+              }),
+              span,
+            }),
         )
 
         await this.updateStepData(name, {
@@ -66,23 +91,25 @@ export class WorkflowStep {
       {
         ...options?.retry,
         retries: (options?.retry?.retries ?? 0) - initialAttempt,
-        onFailedAttempt: async (context) => {
+        onFailedAttempt: async (ctx) => {
           await this.updateStepData(name, {
             type: 'do',
-            attempt: initialAttempt + context.attemptNumber,
+            attempt: initialAttempt + ctx.attemptNumber,
           })
-          return options?.retry?.onFailedAttempt?.(context)
+          return options?.retry?.onFailedAttempt?.(ctx)
         },
       },
     )
   }
 
-  async wait(name: string, durationMs: number) {
+  async wait(stepName: string, durationMs: number) {
+    const name = this.addNamePrefix(stepName)
+
     const job = await this.getWorkflowJob()
     const existingStepData = await this.getStepData('wait', name)
 
     const now = Date.now()
-    const stepData: Extract<WorkflowStepData, { type: 'wait' }> = existingStepData ?? {
+    const stepData = existingStepData ?? {
       type: 'wait',
       durationMs,
       startedAt: now,
@@ -93,9 +120,11 @@ export class WorkflowStep {
     await runWithTracing(
       `step:${name}`,
       {
-        'workflow.id': this.workflowId,
-        'workflow.job_id': this.workflowJobId,
-        'workflow.step_name': name,
+        attributes: {
+          'workflow.id': this.workflowId,
+          'workflow.job_id': this.workflowJobId,
+          'workflow.step_name': name,
+        },
       },
       async () => {
         const remainingMs = Math.max(0, stepData.startedAt + stepData.durationMs - now)
@@ -111,11 +140,11 @@ export class WorkflowStep {
     )
   }
 
-  async waitUntil(name: string, date: Date) {
+  async waitUntil(stepName: string, date: Date) {
     const now = Date.now()
     const targetTime = date.getTime()
     const durationMs = Math.max(0, targetTime - now)
-    return this.wait(name, durationMs)
+    return this.wait(stepName, durationMs)
   }
 
   private async getStepData<T extends WorkflowStepData['type']>(type: T, stepName: string) {

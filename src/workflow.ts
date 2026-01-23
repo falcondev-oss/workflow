@@ -1,3 +1,4 @@
+import type { Span } from '@opentelemetry/api'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
 import type {
   ConnectionOptions,
@@ -6,9 +7,10 @@ import type {
   QueueOptions,
   WorkerOptions,
 } from 'bullmq'
-import type { Except, SetOptional } from 'type-fest'
+import type { Except, IsUnknown, SetOptional } from 'type-fest'
 import type { Serialized } from './serializer'
 import type { WorkflowJobInternal, WorkflowQueueInternal } from './types'
+import { context, propagation, ROOT_CONTEXT, SpanKind } from '@opentelemetry/api'
 import { Queue, QueueEvents, Worker } from 'bullmq'
 import { WorkflowInputError } from './errors'
 import { WorkflowJob } from './job'
@@ -19,8 +21,8 @@ import { runWithTracing } from './tracer'
 
 export interface WorkflowOptions<RunInput, Input, Output> {
   id: string
-  input: StandardSchemaV1<RunInput, Input>
-  run: (context: WorkflowRunContext<Input>) => Promise<Output>
+  schema?: StandardSchemaV1<RunInput, Input>
+  run: (ctx: WorkflowRunContext<Input>) => Promise<Output>
   queueOptions?: SetOptional<QueueOptions, 'connection'>
   queueEventsOptions?: SetOptional<QueueEventsOptions, 'connection'>
   connection?: ConnectionOptions
@@ -45,27 +47,34 @@ export class Workflow<RunInput, Input, Output> {
         if (!jobId) throw new Error('Job ID is missing')
 
         const deserializedData = deserialize(job.data)
-        const parsedData = await this.opts.input['~standard'].validate(deserializedData.input)
-        if (parsedData.issues)
+        const parsedData =
+          this.opts.schema && (await this.opts.schema['~standard'].validate(deserializedData.input))
+        if (parsedData?.issues)
           throw new WorkflowInputError('Invalid workflow input', parsedData.issues)
 
         return runWithTracing(
-          `workflow:${this.opts.id}`,
+          `workflow:work:${this.opts.id}`,
           {
-            'workflow.id': this.opts.id,
-            'workflow.job_id': jobId,
+            attributes: {
+              'workflow.id': this.opts.id,
+              'workflow.job_id': jobId,
+            },
+            kind: SpanKind.CONSUMER,
           },
-          async () => {
+          async (span) => {
             const result = await this.opts.run({
-              input: parsedData.value,
+              // eslint-disable-next-line ts/no-unsafe-assignment
+              input: parsedData?.value as any,
               step: new WorkflowStep({
                 queue,
                 workflowJobId: jobId,
                 workflowId: this.opts.id,
               }),
+              span,
             })
             return serialize(result)
           },
+          propagation.extract(ROOT_CONTEXT, deserializedData.tracingHeaders),
         )
       },
       {
@@ -80,25 +89,40 @@ export class Workflow<RunInput, Input, Output> {
   }
 
   async run(input: RunInput, opts?: JobsOptions) {
-    const parsedInput = await this.opts.input['~standard'].validate(input)
-    if (parsedInput.issues)
+    const parsedInput = this.opts.schema && (await this.opts.schema['~standard'].validate(input))
+    if (parsedInput?.issues)
       throw new WorkflowInputError('Invalid workflow input', parsedInput.issues)
 
     const queue = await this.getOrCreateQueue()
+    return runWithTracing(
+      `workflow:run:${this.opts.id}`,
+      {
+        attributes: {
+          'workflow.id': this.opts.id,
+        },
+        kind: SpanKind.PRODUCER,
+      },
+      async () => {
+        const tracingHeaders = {}
+        propagation.inject(context.active(), tracingHeaders)
 
-    const job = await queue.add(
-      'workflow-job',
-      serialize({
-        input: parsedInput.value,
-        stepData: {},
-      }),
-      opts,
+        const job = await queue.add(
+          'workflow-job',
+          serialize({
+            // eslint-disable-next-line ts/no-unsafe-assignment
+            input: parsedInput?.value as any,
+            stepData: {},
+            tracingHeaders,
+          }),
+          opts,
+        )
+
+        return new WorkflowJob<Output>({
+          job,
+          queueEvents: await this.getOrCreateQueueEvents(),
+        })
+      },
     )
-
-    return new WorkflowJob<Output>({
-      job,
-      queueEvents: await this.getOrCreateQueueEvents(),
-    })
   }
 
   async runIn(input: RunInput, delayMs: number, opts?: Except<JobsOptions, 'delay'>) {
@@ -165,6 +189,7 @@ export class Workflow<RunInput, Input, Output> {
 }
 
 export interface WorkflowRunContext<Input> {
-  input: Input
+  input: IsUnknown<Input> extends true ? undefined : Input
   step: WorkflowStep
+  span: Span
 }
