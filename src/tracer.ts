@@ -11,22 +11,29 @@ export async function runWithTracing<T>(
   fn: (span: Span) => T,
   context?: Context,
 ) {
-  const span = getTracer().startSpan(spanName, options, context)
-  try {
-    const result = await fn(span)
-    span.setStatus({
-      code: SpanStatusCode.OK,
-    })
-    return result
-  } catch (err_) {
-    const err = err_ as Error
-    span.recordException(err)
-    span.setStatus({
-      code: SpanStatusCode.ERROR,
-      message: err.message,
-    })
-    throw err_
-  } finally {
-    span.end()
+  return context
+    ? getTracer().startActiveSpan(spanName, options, context, runWithSpan(fn))
+    : getTracer().startActiveSpan(spanName, options, runWithSpan(fn))
+}
+
+function runWithSpan<T>(fn: (span: Span) => T) {
+  return async (span: Span) => {
+    try {
+      const result = await fn(span)
+      span.setStatus({
+        code: SpanStatusCode.OK,
+      })
+      return result
+    } catch (err_) {
+      const err = err_ as Error
+      span.recordException(err)
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: err.message,
+      })
+      throw err_
+    } finally {
+      span.end()
+    }
   }
 }
