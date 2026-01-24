@@ -1,10 +1,16 @@
 import { createSingletonPromise } from '@antfu/utils'
 import IORedis from 'ioredis'
 
+export type WorkflowLogger = {
+  info?: (...data: any[]) => void
+  success?: (...data: any[]) => void
+}
+
 export const Settings = {
   defaultPrefix: 'falcondev-oss-workflow',
   defaultConnection: undefined as IORedis | undefined,
   defaultCronTimezone: undefined as string | undefined,
+  logger: undefined as WorkflowLogger | undefined,
 }
 
 export const defaultRedisConnection = createSingletonPromise(async () => {

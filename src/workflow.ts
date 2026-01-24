@@ -45,6 +45,7 @@ export class Workflow<RunInput, Input, Output> {
     const worker = new Worker<WorkflowJobInternal<Input, Output>['data'], Serialized<Output>>(
       this.opts.id,
       async (job) => {
+        Settings.logger?.info?.(`Processing workflow job ${job.id} of workflow ${this.opts.id}`)
         const jobId = job.id
         if (!jobId) throw new Error('Job ID is missing')
 
@@ -64,6 +65,7 @@ export class Workflow<RunInput, Input, Output> {
             kind: SpanKind.CONSUMER,
           },
           async (span) => {
+            const start = performance.now()
             const result = await this.opts.run({
               // eslint-disable-next-line ts/no-unsafe-assignment
               input: parsedData?.value as any,
@@ -74,6 +76,12 @@ export class Workflow<RunInput, Input, Output> {
               }),
               span,
             })
+
+            const end = performance.now()
+
+            Settings.logger?.success?.(
+              `Completed workflow job ${job.id} of workflow ${this.opts.id} in ${(end - start).toFixed(2)} ms`,
+            )
             return serialize(result)
           },
           propagation.extract(ROOT_CONTEXT, deserializedData.tracingHeaders),
@@ -86,6 +94,7 @@ export class Workflow<RunInput, Input, Output> {
       },
     )
     await worker.waitUntilReady()
+    Settings.logger?.info?.(`Worker started for workflow ${this.opts.id}`)
 
     return this
   }
