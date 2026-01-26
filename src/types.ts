@@ -4,7 +4,7 @@ import type { WorkflowStepData } from './step'
 
 export type WorkflowJobInternal<Input, Output> = Job<
   Serialized<{
-    input: Input
+    input: Input | undefined
     stepData: Record<string, WorkflowStepData>
     tracingHeaders: unknown
   }>,

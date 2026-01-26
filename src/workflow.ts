@@ -2,9 +2,11 @@ import type { Span } from '@opentelemetry/api'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
 import type {
   ConnectionOptions,
+  JobSchedulerTemplateOptions,
   JobsOptions,
   QueueEventsOptions,
   QueueOptions,
+  RepeatOptions,
   WorkerOptions,
 } from 'bullmq'
 import type { Except, IsUnknown, SetOptional } from 'type-fest'
@@ -131,8 +133,7 @@ export class Workflow<RunInput, Input, Output> {
         const job = await queue.add(
           'workflow-job',
           serialize({
-            // eslint-disable-next-line ts/no-unsafe-assignment
-            input: parsedInput?.value as any,
+            input: parsedInput?.value,
             stepData: {},
             tracingHeaders,
           }),
@@ -163,23 +164,59 @@ export class Workflow<RunInput, Input, Output> {
       : this.runIn(input, date.getTime() - Date.now(), opts)
   }
 
-  async repeat(
+  private async runSchedule(
+    schedulerId: string,
+    repeatOpts: Omit<RepeatOptions, 'key'>,
     input: RunInput,
-    cronOrInterval: string | number,
-    opts?: Except<JobsOptions, 'repeat'>,
+    opts?: JobSchedulerTemplateOptions,
   ) {
-    return this.run(input, {
-      repeat: {
-        tz: Settings.defaultCronTimezone,
-        ...(typeof cronOrInterval === 'string'
-          ? {
-              pattern: cronOrInterval,
-            }
-          : {
-              every: cronOrInterval,
-            }),
+    const parsedInput = this.opts.schema && (await this.opts.schema['~standard'].validate(input))
+    if (parsedInput?.issues)
+      throw new WorkflowInputError('Invalid workflow input', parsedInput.issues)
+
+    const queue = await this.getOrCreateQueue()
+    await queue.upsertJobScheduler(schedulerId, repeatOpts, {
+      name: 'workflow-job',
+      data: serialize({
+        input: parsedInput?.value,
+        stepData: {},
+        tracingHeaders: {},
+      }),
+      opts,
+    })
+  }
+
+  async runCron(
+    schedulerId: string,
+    cron: string,
+    input: RunInput,
+    opts?: JobSchedulerTemplateOptions,
+  ) {
+    return this.runSchedule(
+      schedulerId,
+      {
+        pattern: cron,
       },
-      ...opts,
+      input,
+      opts,
+    )
+  }
+
+  async runEvery(
+    schedulerId: string,
+    everyMs: number,
+    input: RunInput,
+    opts?: JobSchedulerTemplateOptions,
+  ) {
+    return this.runSchedule(
+      schedulerId,
+      {
+        every: everyMs,
+      },
+      input,
+      opts,
+    )
+  }
     })
   }
 
