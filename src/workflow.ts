@@ -27,6 +27,7 @@ export interface WorkflowOptions<RunInput, Input, Output> {
   schema?: StandardSchemaV1<RunInput, Input>
   run: (ctx: WorkflowRunContext<Input>) => Promise<Output>
   queueOptions?: SetOptional<QueueOptions, 'connection'>
+  workerOptions?: SetOptional<WorkerOptions, 'connection'>
   queueEventsOptions?: SetOptional<QueueEventsOptions, 'connection'>
   connection?: ConnectionOptions
 }
@@ -93,6 +94,7 @@ export class Workflow<RunInput, Input, Output> {
       {
         connection: this.opts.connection ?? (await defaultRedisConnection()),
         prefix: Settings.defaultPrefix,
+        ...this.opts.workerOptions,
         ...opts,
       },
     )
