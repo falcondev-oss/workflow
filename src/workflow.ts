@@ -217,6 +217,13 @@ export class Workflow<RunInput, Input, Output> {
       opts,
     )
   }
+
+  async exportPrometheusMetrics(globalVariables?: Record<string, string>) {
+    const queue = await this.getOrCreateQueue()
+    return queue.exportPrometheusMetrics({
+      workflowId: this.id,
+      workflowPrefix: Settings.defaultPrefix,
+      ...globalVariables,
     })
   }
 
