@@ -12,6 +12,7 @@ import type { Serialized } from './serializer'
 import type { WorkflowJobInternal, WorkflowQueueInternal } from './types'
 import { context, propagation, ROOT_CONTEXT, SpanKind } from '@opentelemetry/api'
 import { Queue, QueueEvents, Worker } from 'bullmq'
+import { asyncExitHook } from 'exit-hook'
 import { WorkflowInputError } from './errors'
 import { WorkflowJob } from './job'
 import { deserialize, serialize } from './serializer'
@@ -95,6 +96,16 @@ export class Workflow<RunInput, Input, Output> {
     )
     await worker.waitUntilReady()
     Settings.logger?.info?.(`Worker started for workflow ${this.opts.id}`)
+
+    asyncExitHook(
+      async (signal) => {
+        Settings.logger?.info?.(
+          `Received ${signal}, shutting down worker for workflow ${this.opts.id}...`,
+        )
+        await worker.close()
+      },
+      { wait: 10_000 },
+    )
 
     return this
   }

@@ -23,6 +23,9 @@ importers:
       bullmq:
         specifier: ^5.66.4
         version: 5.66.4
+      exit-hook:
+        specifier: ^5.0.1
+        version: 5.0.1
       ioredis:
         specifier: ^5.8.2
         version: 5.8.2
@@ -1734,6 +1737,10 @@ packages:
   esutils@2.0.3:
     resolution: {integrity: sha512-kVscqXk4OCp68SZ0dkgEKVi6/8ij300KBWTJq32P/dYeWTSwK41WyTxalN1eRmA5Z9UU/LX9D7FWSmV9SAYx6g==}
     engines: {node: '>=0.10.0'}
+
+  exit-hook@5.0.1:
+    resolution: {integrity: sha512-LHebYV6wSOObiWC894M36qqoWbGWFDZFJnCAch+JUYTyI5EJAlF3Lhv9sqLKoUDjTj3X6SsIxwy41mw2AqFfdA==}
+    engines: {node: '>=20'}
 
   exsolve@1.0.8:
     resolution: {integrity: sha512-LmDxfWXwcTArk8fUEnOfSZpHOJ6zOMUJKOtFLFqJLoKJetuQG874Uc7/Kki7zFLzYybmZhp1M7+98pfMqeX8yA==}
@@ -5185,6 +5192,8 @@ snapshots:
   estree-walker@2.0.2: {}
 
   esutils@2.0.3: {}
+
+  exit-hook@5.0.1: {}
 
   exsolve@1.0.8: {}
 
