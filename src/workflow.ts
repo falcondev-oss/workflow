@@ -57,7 +57,7 @@ export class Workflow<RunInput, Input, Output> {
           throw new WorkflowInputError('Invalid workflow input', parsedData.issues)
 
         return runWithTracing(
-          `workflow:work:${this.opts.id}`,
+          `workflow-worker/${this.opts.id}`,
           {
             attributes: {
               'workflow.id': this.opts.id,
@@ -117,7 +117,7 @@ export class Workflow<RunInput, Input, Output> {
 
     const queue = await this.getOrCreateQueue()
     return runWithTracing(
-      `workflow:run:${this.opts.id}`,
+      `workflow-producer/${this.opts.id}`,
       {
         attributes: {
           'workflow.id': this.opts.id,

@@ -59,7 +59,7 @@ export class WorkflowStep {
     return pRetry(
       async (attempt) => {
         const result = await runWithTracing(
-          `step:${name}`,
+          `workflow-worker/${this.workflowId}/step/${name}`,
           {
             attributes: {
               'workflow.id': this.workflowId,
@@ -118,7 +118,7 @@ export class WorkflowStep {
     await this.updateStepData(name, stepData)
 
     await runWithTracing(
-      `step:${name}`,
+      `workflow-worker/${this.workflowId}/step/${name}`,
       {
         attributes: {
           'workflow.id': this.workflowId,
