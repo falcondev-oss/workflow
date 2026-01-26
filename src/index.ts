@@ -1,3 +1,3 @@
 export * from './errors'
-export { Settings } from './settings'
+export { createRedisConnection, Settings } from './settings'
 export * from './workflow'
