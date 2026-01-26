@@ -177,6 +177,13 @@ export class Workflow<RunInput, Input, Output> {
       this.queue = new Queue(this.opts.id, {
         prefix: Settings.defaultPrefix,
         connection: this.opts.connection ?? (await defaultRedisConnection()),
+        defaultJobOptions: {
+          removeOnComplete: true,
+          removeOnFail: {
+            age: 24 * 60 * 60, // 1 day
+          },
+          ...this.opts.queueOptions?.defaultJobOptions,
+        },
         ...this.opts.queueOptions,
       })
     }
