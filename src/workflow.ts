@@ -26,7 +26,13 @@ export interface WorkflowOptions<RunInput, Input, Output> {
   id: string
   schema?: StandardSchemaV1<RunInput, Input>
   run: (ctx: WorkflowRunContext<Input>) => Promise<Output>
-  queueOptions?: SetOptional<QueueOptions, 'connection'>
+  queueOptions?: SetOptional<QueueOptions, 'connection'> & {
+    globalConcurrency?: number
+    globalRateLimit?: {
+      max: number
+      duration: number
+    }
+  }
   workerOptions?: SetOptional<WorkerOptions, 'connection'>
   queueEventsOptions?: SetOptional<QueueEventsOptions, 'connection'>
   connection?: ConnectionOptions
@@ -243,6 +249,17 @@ export class Workflow<RunInput, Input, Output> {
         },
         ...this.opts.queueOptions,
       })
+
+      if (this.opts.queueOptions?.globalConcurrency)
+        await this.queue.setGlobalConcurrency(this.opts.queueOptions.globalConcurrency)
+      else await this.queue.removeGlobalConcurrency()
+
+      if (this.opts.queueOptions?.globalRateLimit)
+        await this.queue.setGlobalRateLimit(
+          this.opts.queueOptions.globalRateLimit.max,
+          this.opts.queueOptions.globalRateLimit.duration,
+        )
+      else await this.queue.removeGlobalRateLimit()
     }
 
     await this.queue.waitUntilReady()
