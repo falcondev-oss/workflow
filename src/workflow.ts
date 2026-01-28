@@ -23,6 +23,7 @@ export interface WorkflowOptions<RunInput, Input, Output> {
   ) => string | undefined | Promise<string | undefined>
   queueOptions?: WorkflowQueueOptions
   workerOptions?: WorkflowWorkerOptions<Input>
+  jobOptions?: WorkflowJobRunOptions<Input>
   redis?: Redis
 }
 
@@ -145,6 +146,12 @@ export class Workflow<RunInput, Input, Output> {
         const tracingHeaders = {}
         propagation.inject(context.active(), tracingHeaders)
 
+        const orderMs =
+          opts?.orderMs ??
+          (opts?.priority === 'high' ? 0 : undefined) ??
+          this.opts.jobOptions?.orderMs ??
+          (this.opts.jobOptions?.priority === 'high' ? 0 : undefined)
+
         const job = await queue.add({
           groupId:
             (await this.opts.getGroupId?.(
@@ -155,8 +162,9 @@ export class Workflow<RunInput, Input, Output> {
             stepData: {},
             tracingHeaders,
           }),
-          orderMs: opts?.priority === 'high' ? 0 : undefined,
+          ...this.opts.jobOptions,
           ...opts,
+          orderMs,
         })
 
         return new WorkflowJob<Output>({
