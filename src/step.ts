@@ -2,7 +2,6 @@ import type { Span } from '@opentelemetry/api'
 import type { Options } from 'p-retry'
 import type { WorkflowQueueInternal } from './types'
 import { setTimeout } from 'node:timers/promises'
-import { UnrecoverableError } from 'bullmq'
 import pRetry from 'p-retry'
 import { deserialize, serialize } from './serializer'
 import { runWithTracing } from './tracer'
@@ -26,7 +25,7 @@ export class WorkflowStep {
   private stepNamePrefix
 
   constructor(opts: {
-    queue: WorkflowQueueInternal<any, any>
+    queue: WorkflowQueueInternal<unknown>
     workflowJobId: string
     workflowId: string
     stepNamePrefix?: string
@@ -49,7 +48,7 @@ export class WorkflowStep {
     const name = this.addNamePrefix(stepName)
 
     const stepData = await this.getStepData('do', name)
-    if (stepData?.result) return stepData.result as R
+    if (stepData && 'result' in stepData) return stepData.result as R
 
     const initialAttempt = stepData?.attempt ?? 0
     await this.updateStepData(name, {
@@ -90,7 +89,7 @@ export class WorkflowStep {
       },
       {
         ...options?.retry,
-        retries: (options?.retry?.retries ?? 0) - initialAttempt,
+        retries: Math.max((options?.retry?.retries ?? 0) - initialAttempt, 0),
         onFailedAttempt: async (ctx) => {
           await this.updateStepData(name, {
             type: 'do',
@@ -105,7 +104,6 @@ export class WorkflowStep {
   async wait(stepName: string, durationMs: number) {
     const name = this.addNamePrefix(stepName)
 
-    const job = await this.getWorkflowJob()
     const existingStepData = await this.getStepData('wait', name)
 
     const now = Date.now()
@@ -128,14 +126,7 @@ export class WorkflowStep {
       },
       async () => {
         const remainingMs = Math.max(0, stepData.startedAt + stepData.durationMs - now)
-
-        // update progress every 15s to avoid job being marked as stalled
-        const interval = setInterval(() => {
-          void job.updateProgress(name)
-        }, 15_000)
-
         await setTimeout(remainingMs)
-        clearInterval(interval)
       },
     )
   }
@@ -165,13 +156,12 @@ export class WorkflowStep {
     const jobData = deserialize(job.data)
     jobData.stepData[stepName] = data
 
-    await Promise.all([job.updateData(serialize(jobData)), job.updateProgress(stepName)])
+    await job.updateData(serialize(jobData))
   }
 
   private async getWorkflowJob() {
     const job = await this.queue.getJob(this.workflowJobId)
-    if (!job)
-      throw new UnrecoverableError(`Could not find workflow job with ID ${this.workflowJobId}`)
+    if (!job) throw new Error(`Could not find workflow job with ID ${this.workflowJobId}`)
     return job
   }
 }

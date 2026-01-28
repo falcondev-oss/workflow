@@ -1,21 +1,13 @@
-import type { Span } from '@opentelemetry/api'
+import type { Meter, Span } from '@opentelemetry/api'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
-import type {
-  ConnectionOptions,
-  JobSchedulerTemplateOptions,
-  JobsOptions,
-  QueueEventsOptions,
-  QueueOptions,
-  RepeatOptions,
-  WorkerOptions,
-} from 'bullmq'
+import type { AddOptions, QueueOptions, WorkerOptions } from 'groupmq'
+import type Redis from 'ioredis'
 import type { Except, IsUnknown, SetOptional } from 'type-fest'
-import type { Serialized } from './serializer'
-import type { WorkflowJobInternal, WorkflowQueueInternal } from './types'
+import type { WorkflowJobPayloadInternal, WorkflowQueueInternal } from './types'
+import { randomUUID } from 'node:crypto'
 import { context, propagation, ROOT_CONTEXT, SpanKind } from '@opentelemetry/api'
-import { Queue, QueueEvents, Worker } from 'bullmq'
 import { asyncExitHook } from 'exit-hook'
-import { WorkflowInputError } from './errors'
+import { Queue, Worker } from 'groupmq'
 import { WorkflowJob } from './job'
 import { deserialize, serialize } from './serializer'
 import { defaultRedisConnection, Settings } from './settings'
@@ -26,35 +18,48 @@ export interface WorkflowOptions<RunInput, Input, Output> {
   id: string
   schema?: StandardSchemaV1<RunInput, Input>
   run: (ctx: WorkflowRunContext<Input>) => Promise<Output>
-  queueOptions?: SetOptional<QueueOptions, 'connection'> & {
-    globalConcurrency?: number
-    globalRateLimit?: {
-      max: number
-      duration: number
-    }
+  getGroupId?: (
+    input: IsUnknown<Input> extends true ? undefined : Input,
+  ) => string | undefined | Promise<string | undefined>
+  queueOptions?: WorkflowQueueOptions
+  workerOptions?: WorkflowWorkerOptions<Input>
+  redis?: Redis
+}
+
+export type WorkflowJobRunOptions<Input> = SetOptional<
+  Except<AddOptions<WorkflowJobPayloadInternal<Input>>, 'data'>,
+  'groupId'
+> & {
+  priority?: 'high' | 'normal'
+}
+
+export type WorkflowQueueOptions = SetOptional<Except<QueueOptions, 'namespace'>, 'redis'>
+
+export type WorkflowWorkerOptions<Input> = Except<
+  WorkerOptions<WorkflowJobPayloadInternal<Input>>,
+  'queue' | 'handler' | 'name'
+> & {
+  metrics?: {
+    meter: Meter
+    prefix: string
   }
-  workerOptions?: SetOptional<WorkerOptions, 'connection'>
-  queueEventsOptions?: SetOptional<QueueEventsOptions, 'connection'>
-  connection?: ConnectionOptions
 }
 
 export class Workflow<RunInput, Input, Output> {
   id
   private opts
-  private queue?: WorkflowQueueInternal<Input, Output>
-  private queueEvents?: QueueEvents
+  private queue?: WorkflowQueueInternal<Input>
 
   constructor(opts: WorkflowOptions<RunInput, Input, Output>) {
     this.id = opts.id
     this.opts = opts
   }
 
-  async work(opts?: Omit<SetOptional<WorkerOptions, 'connection'>, 'autorun'>) {
+  async work(opts?: WorkflowWorkerOptions<Input>) {
     const queue = await this.getOrCreateQueue()
 
-    const worker = new Worker<WorkflowJobInternal<Input, Output>['data'], Serialized<Output>>(
-      this.opts.id,
-      async (job) => {
+    const worker = new Worker<WorkflowJobPayloadInternal<Input>>({
+      handler: async (job) => {
         Settings.logger?.info?.(`Processing workflow job ${job.id} of workflow ${this.opts.id}`)
         const jobId = job.id
         if (!jobId) throw new Error('Job ID is missing')
@@ -62,8 +67,7 @@ export class Workflow<RunInput, Input, Output> {
         const deserializedData = deserialize(job.data)
         const parsedData =
           this.opts.schema && (await this.opts.schema['~standard'].validate(deserializedData.input))
-        if (parsedData?.issues)
-          throw new WorkflowInputError('Invalid workflow input', parsedData.issues)
+        if (parsedData?.issues) throw new Error(`Invalid workflow input`)
 
         return runWithTracing(
           `workflow-worker/${this.opts.id}`,
@@ -97,15 +101,19 @@ export class Workflow<RunInput, Input, Output> {
           propagation.extract(ROOT_CONTEXT, deserializedData.tracingHeaders),
         )
       },
-      {
-        connection: this.opts.connection ?? (await defaultRedisConnection()),
-        prefix: Settings.defaultPrefix,
-        ...this.opts.workerOptions,
-        ...opts,
-      },
-    )
-    await worker.waitUntilReady()
-    Settings.logger?.info?.(`Worker started for workflow ${this.opts.id}`)
+      queue,
+      ...this.opts.workerOptions,
+      ...opts,
+    })
+    worker.on('ready', () => {
+      Settings.logger?.info?.(`Worker started for workflow ${this.opts.id}`)
+    })
+    worker.on('failed', (job) => {
+      Settings.logger?.info?.(`Workflow job ${job.id} of workflow ${this.opts.id} failed`)
+    })
+
+    const metricsOpts = opts?.metrics ?? this.opts.workerOptions?.metrics ?? Settings.metrics
+    if (metricsOpts) await this.setupMetrics(metricsOpts)
 
     asyncExitHook(
       async (signal) => {
@@ -120,10 +128,9 @@ export class Workflow<RunInput, Input, Output> {
     return this
   }
 
-  async run(input: RunInput, opts?: JobsOptions) {
+  async run(input: RunInput, opts?: WorkflowJobRunOptions<Input>) {
     const parsedInput = this.opts.schema && (await this.opts.schema['~standard'].validate(input))
-    if (parsedInput?.issues)
-      throw new WorkflowInputError('Invalid workflow input', parsedInput.issues)
+    if (parsedInput?.issues) throw new Error('Invalid workflow input')
 
     const queue = await this.getOrCreateQueue()
     return runWithTracing(
@@ -138,145 +145,137 @@ export class Workflow<RunInput, Input, Output> {
         const tracingHeaders = {}
         propagation.inject(context.active(), tracingHeaders)
 
-        const job = await queue.add(
-          'workflow-job',
-          serialize({
+        const job = await queue.add({
+          groupId:
+            (await this.opts.getGroupId?.(
+              parsedInput?.value as IsUnknown<Input> extends true ? undefined : Input,
+            )) ?? randomUUID(),
+          data: serialize({
             input: parsedInput?.value,
             stepData: {},
             tracingHeaders,
           }),
-          opts,
-        )
+          orderMs: opts?.priority === 'high' ? 0 : undefined,
+          ...opts,
+        })
 
         return new WorkflowJob<Output>({
           job,
-          queueEvents: await this.getOrCreateQueueEvents(),
         })
       },
     )
   }
 
-  async runIn(input: RunInput, delayMs: number, opts?: Except<JobsOptions, 'delay'>) {
+  async runIn(input: RunInput, delayMs: number, opts?: WorkflowJobRunOptions<Input>) {
     return this.run(input, {
       delay: delayMs,
       ...opts,
     })
   }
 
-  async runAt(input: RunInput, date: Date, opts?: Except<JobsOptions, 'delay'>) {
-    const now = Date.now()
-    const dateTime = date.getTime()
-
-    return dateTime < now
-      ? this.run(input, opts)
-      : this.runIn(input, date.getTime() - Date.now(), opts)
-  }
-
-  private async runSchedule(
-    schedulerId: string,
-    repeatOpts: Omit<RepeatOptions, 'key'>,
-    input: RunInput,
-    opts?: JobSchedulerTemplateOptions,
-  ) {
-    const parsedInput = this.opts.schema && (await this.opts.schema['~standard'].validate(input))
-    if (parsedInput?.issues)
-      throw new WorkflowInputError('Invalid workflow input', parsedInput.issues)
-
-    const queue = await this.getOrCreateQueue()
-    await queue.upsertJobScheduler(schedulerId, repeatOpts, {
-      name: 'workflow-job',
-      data: serialize({
-        input: parsedInput?.value,
-        stepData: {},
-        tracingHeaders: {},
-      }),
-      opts,
+  async runAt(input: RunInput, date: Date, opts?: WorkflowJobRunOptions<Input>) {
+    return this.run(input, {
+      runAt: date,
+      ...opts,
     })
   }
 
   async runCron(
-    schedulerId: string,
+    scheduleId: string,
     cron: string,
     input: RunInput,
-    opts?: JobSchedulerTemplateOptions,
+    opts?: WorkflowJobRunOptions<Input>,
   ) {
-    return this.runSchedule(
-      schedulerId,
-      {
+    return this.run(input, {
+      groupId: scheduleId,
+      repeat: {
         pattern: cron,
       },
-      input,
-      opts,
-    )
+      ...opts,
+    })
   }
 
   async runEvery(
-    schedulerId: string,
+    scheduleId: string,
     everyMs: number,
     input: RunInput,
-    opts?: JobSchedulerTemplateOptions,
+    opts?: WorkflowJobRunOptions<Input>,
   ) {
-    return this.runSchedule(
-      schedulerId,
-      {
+    return this.run(input, {
+      groupId: scheduleId,
+      repeat: {
         every: everyMs,
       },
-      input,
-      opts,
-    )
-  }
-
-  async exportPrometheusMetrics(globalVariables?: Record<string, string>) {
-    const queue = await this.getOrCreateQueue()
-    return queue.exportPrometheusMetrics({
-      workflowId: this.id,
-      workflowPrefix: Settings.defaultPrefix,
-      ...globalVariables,
+      ...opts,
     })
   }
 
   private async getOrCreateQueue() {
     if (!this.queue) {
-      this.queue = new Queue(this.opts.id, {
-        prefix: Settings.defaultPrefix,
-        connection: this.opts.connection ?? (await defaultRedisConnection()),
-        defaultJobOptions: {
-          removeOnComplete: true,
-          removeOnFail: {
-            age: 24 * 60 * 60, // 1 day
-          },
-          ...this.opts.queueOptions?.defaultJobOptions,
-        },
+      this.queue = new Queue({
+        namespace: this.opts.id,
+        redis: this.opts.redis ?? (await defaultRedisConnection()),
+        keepFailed: 100,
         ...this.opts.queueOptions,
       })
-
-      if (this.opts.queueOptions?.globalConcurrency)
-        await this.queue.setGlobalConcurrency(this.opts.queueOptions.globalConcurrency)
-      else await this.queue.removeGlobalConcurrency()
-
-      if (this.opts.queueOptions?.globalRateLimit)
-        await this.queue.setGlobalRateLimit(
-          this.opts.queueOptions.globalRateLimit.max,
-          this.opts.queueOptions.globalRateLimit.duration,
-        )
-      else await this.queue.removeGlobalRateLimit()
     }
 
-    await this.queue.waitUntilReady()
     return this.queue
   }
 
-  private async getOrCreateQueueEvents() {
-    if (!this.queueEvents) {
-      this.queueEvents = new QueueEvents(this.opts.id, {
-        prefix: Settings.defaultPrefix,
-        connection: this.opts.connection ?? (await defaultRedisConnection()),
-        ...this.opts.queueEventsOptions,
-      })
+  private async setupMetrics({ meter, prefix }: { meter: Meter; prefix: string }) {
+    const attributes = {
+      workflow_id: this.opts.id,
     }
 
-    await this.queueEvents.waitUntilReady()
-    return this.queueEvents
+    const queue = await this.getOrCreateQueue()
+
+    const completedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_completed_jobs`, {
+      description: 'Number of completed workflow jobs',
+    })
+    const activeJobsGauge = meter.createObservableGauge(`${prefix}_workflow_active_jobs`, {
+      description: 'Number of active workflow jobs',
+    })
+    const failedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_failed_jobs`, {
+      description: 'Number of failed workflow jobs',
+    })
+    const waitingJobsGauge = meter.createObservableGauge(`${prefix}_workflow_waiting_jobs`, {
+      description: 'Number of waiting workflow jobs',
+    })
+    const delayedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_delayed_jobs`, {
+      description: 'Number of delayed workflow jobs',
+    })
+    const groupCountGauge = meter.createObservableGauge(`${prefix}_workflow_groups`, {
+      description: 'Number of workflow job groups',
+    })
+
+    meter.addBatchObservableCallback(
+      async (observableResult) => {
+        try {
+          const [counts, groupCount] = await Promise.all([
+            queue.getJobCounts(),
+            queue.getUniqueGroupsCount(),
+          ])
+
+          observableResult.observe(completedJobsGauge, counts.completed, attributes)
+          observableResult.observe(activeJobsGauge, counts.active, attributes)
+          observableResult.observe(failedJobsGauge, counts.failed, attributes)
+          observableResult.observe(waitingJobsGauge, counts.waiting, attributes)
+          observableResult.observe(delayedJobsGauge, counts.delayed, attributes)
+          observableResult.observe(groupCountGauge, groupCount, attributes)
+        } catch (err) {
+          console.error('Error collecting workflow metrics:', err)
+        }
+      },
+      [
+        completedJobsGauge,
+        activeJobsGauge,
+        failedJobsGauge,
+        waitingJobsGauge,
+        delayedJobsGauge,
+        groupCountGauge,
+      ],
+    )
   }
 }
 

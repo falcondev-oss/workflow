@@ -1,3 +1,4 @@
+import type { Meter } from '@opentelemetry/api'
 import type { RedisOptions } from 'ioredis'
 import { createSingletonPromise } from '@antfu/utils'
 import IORedis from 'ioredis'
@@ -8,10 +9,9 @@ export type WorkflowLogger = {
 }
 
 export const Settings = {
-  defaultPrefix: 'falcondev-oss-workflow',
   defaultConnection: undefined as (() => Promise<IORedis> | IORedis) | undefined,
-  defaultCronTimezone: undefined as string | undefined,
   logger: undefined as WorkflowLogger | undefined,
+  metrics: undefined as { meter: Meter; prefix: string } | undefined,
 }
 
 const defaultRedisOptions: RedisOptions = {
@@ -29,7 +29,7 @@ export const defaultRedisConnection = createSingletonPromise(async () => {
   return redis
 })
 
-export async function createRedisConnection(opts: RedisOptions) {
+export async function createRedis(opts: RedisOptions) {
   const redis = new IORedis({
     ...defaultRedisOptions,
     ...opts,
