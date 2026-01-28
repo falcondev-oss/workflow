@@ -3,7 +3,7 @@
   "type": "module",
   "version": "0.7.0",
   "packageManager": "pnpm@10.17.1",
-  "description": "Simple type-safe queue worker with durable execution based on BullMQ.",
+  "description": "Simple type-safe queue worker with durable execution using Redis.",
   "license": "MIT",
   "repository": "github:falcondev-oss/workflow",
   "bugs": {
@@ -13,6 +13,8 @@
     "queue",
     "worker",
     "bullmq",
+    "redis",
+    "groupmq",
     "durable-execution",
     "tracing",
     "typescript"

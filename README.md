@@ -1,6 +1,6 @@
 # @falcondev-oss/workflow
 
-Simple type-safe queue worker with durable execution based on BullMQ.
+Simple type-safe queue worker with durable execution using Redis.
 
 ## Installation
 
