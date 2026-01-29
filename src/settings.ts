@@ -6,6 +6,7 @@ import IORedis from 'ioredis'
 export type WorkflowLogger = {
   info?: (...data: any[]) => void
   success?: (...data: any[]) => void
+  error?: (...data: any[]) => void
 }
 
 export const Settings = {

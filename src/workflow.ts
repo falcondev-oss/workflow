@@ -112,6 +112,9 @@ export class Workflow<RunInput, Input, Output> {
     worker.on('failed', (job) => {
       Settings.logger?.info?.(`Workflow job ${job.id} of workflow ${this.opts.id} failed`)
     })
+    worker.on('error', (error) => {
+      Settings.logger?.error?.(`Error during worker startup for workflow ${this.opts.id}:`, error)
+    })
 
     const metricsOpts = opts?.metrics ?? this.opts.workerOptions?.metrics ?? Settings.metrics
     if (metricsOpts) await this.setupMetrics(metricsOpts)
