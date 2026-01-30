@@ -47,16 +47,19 @@ export type WorkflowWorkerOptions<Input> = Except<
 }
 
 export class Workflow<RunInput, Input, Output> {
-  id
-  private opts
-  private queue?: WorkflowQueueInternal<Input>
+  'id'
+  private 'opts'
+  private 'queue'?: WorkflowQueueInternal<Input>
+  '~internal' = {
+    getOrCreateQueue: this.getOrCreateQueue.bind(this),
+  }
 
-  constructor(opts: WorkflowOptions<RunInput, Input, Output>) {
+  'constructor'(opts: WorkflowOptions<RunInput, Input, Output>) {
     this.id = opts.id
     this.opts = opts
   }
 
-  async work(opts?: WorkflowWorkerOptions<Input>) {
+  async 'work'(opts?: WorkflowWorkerOptions<Input>) {
     const queue = await this.getOrCreateQueue()
 
     const worker = new Worker<WorkflowJobPayloadInternal<Input>>({
@@ -127,10 +130,10 @@ export class Workflow<RunInput, Input, Output> {
       { wait: 10_000 },
     )
 
-    return this
+    return worker
   }
 
-  async run(input: RunInput, opts?: WorkflowJobRunOptions<Input>) {
+  async 'run'(input: RunInput, opts?: WorkflowJobRunOptions<Input>) {
     const parsedInput = this.opts.schema && (await this.opts.schema['~standard'].validate(input))
     if (parsedInput?.issues) throw new Error('Invalid workflow input')
 
@@ -175,21 +178,21 @@ export class Workflow<RunInput, Input, Output> {
     )
   }
 
-  async runIn(input: RunInput, delayMs: number, opts?: WorkflowJobRunOptions<Input>) {
+  async 'runIn'(input: RunInput, delayMs: number, opts?: WorkflowJobRunOptions<Input>) {
     return this.run(input, {
       delay: delayMs,
       ...opts,
     })
   }
 
-  async runAt(input: RunInput, date: Date, opts?: WorkflowJobRunOptions<Input>) {
+  async 'runAt'(input: RunInput, date: Date, opts?: WorkflowJobRunOptions<Input>) {
     return this.run(input, {
       runAt: date,
       ...opts,
     })
   }
 
-  async runCron(
+  async 'runCron'(
     scheduleId: string,
     cron: string,
     input: RunInput,
@@ -204,7 +207,7 @@ export class Workflow<RunInput, Input, Output> {
     })
   }
 
-  async runEvery(
+  async 'runEvery'(
     scheduleId: string,
     everyMs: number,
     input: RunInput,
@@ -219,7 +222,7 @@ export class Workflow<RunInput, Input, Output> {
     })
   }
 
-  private async getOrCreateQueue() {
+  private async 'getOrCreateQueue'() {
     if (!this.queue) {
       this.queue = new Queue({
         namespace: this.opts.id,
@@ -232,7 +235,7 @@ export class Workflow<RunInput, Input, Output> {
     return this.queue
   }
 
-  private async setupMetrics({ meter, prefix }: { meter: Meter; prefix: string }) {
+  private async 'setupMetrics'({ meter, prefix }: { meter: Meter; prefix: string }) {
     const attributes = {
       workflow_id: this.opts.id,
     }

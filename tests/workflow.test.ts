@@ -14,13 +14,14 @@ beforeAll(() => {
 describe('input', () => {
   test('primitive', async () => {
     const handler = vi.fn()
-    const workflow = await new Workflow({
+    const workflow = new Workflow({
       id: randomUUID(),
       schema: type({
         name: 'string',
       }),
       run: handler,
-    }).work()
+    })
+    await workflow.work()
     await workflow.run({ name: 'A' })
 
     await vi.waitFor(() =>
@@ -33,13 +34,14 @@ describe('input', () => {
   })
   test('non-pojos', async () => {
     const handler = vi.fn()
-    const workflow = await new Workflow({
+    const workflow = new Workflow({
       id: randomUUID(),
       schema: type({
         date: 'Date',
       }),
       run: handler,
-    }).work()
+    })
+    await workflow.work()
     await workflow.run({ date: new Date('2024-01-01T00:00:00.000Z') })
 
     await vi.waitFor(() =>
@@ -57,14 +59,15 @@ describe('step', () => {
   test('only runs once', async () => {
     const stepHandler = vi.fn()
     const handler = vi.fn()
-    const workflow = await new Workflow({
+    const workflow = new Workflow({
       id: randomUUID(),
       run: async ({ step }) => {
         await step.do('test-step', stepHandler)
         await handler()
         throw new Error('error')
       },
-    }).work({
+    })
+    await workflow.work({
       backoff: () => 0,
     })
 
@@ -81,14 +84,15 @@ describe('step', () => {
       date: new Date(),
     }))
     const handler = vi.fn()
-    const workflow = await new Workflow({
+    const workflow = new Workflow({
       id: randomUUID(),
       run: async ({ step }) => {
         const result = await step.do('test-step', stepHandler)
         await handler(result)
         throw new Error('error')
       },
-    }).work({
+    })
+    await workflow.work({
       backoff: () => 0,
     })
 
@@ -108,20 +112,21 @@ describe('step', () => {
 
 describe('groups', () => {
   test('random id if not specified', async () => {
-    const workflow = await new Workflow({
+    const workflow = new Workflow({
       id: randomUUID(),
       schema: type({
         name: 'string',
       }),
       run: async () => {},
-    }).work()
+    })
+    await workflow.work()
     const job = await workflow.run({ name: 'A' })
 
     expect(job.groupId).toMatch(/^[0-9a-f-]{36}$/i)
   })
 
   test('uses specified groupId getter', async () => {
-    const workflow = await new Workflow({
+    const workflow = new Workflow({
       id: randomUUID(),
       schema: type({
         name: 'string',
@@ -130,7 +135,8 @@ describe('groups', () => {
         return `group-for-${input.name}`
       },
       run: async () => {},
-    }).work()
+    })
+    await workflow.work()
     const job = await workflow.run({ name: 'A' })
 
     expect(job.groupId).toBe('group-for-A')
