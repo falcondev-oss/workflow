@@ -62,7 +62,7 @@ export class Workflow<RunInput, Input, Output> {
   async 'work'(opts?: WorkflowWorkerOptions<Input>) {
     const queue = await this.getOrCreateQueue()
 
-    const worker = new Worker<WorkflowJobPayloadInternal<Input>>({
+    const worker: Worker<WorkflowJobPayloadInternal<Input>> = new Worker({
       handler: async (job) => {
         Settings.logger?.info?.(`[${this.opts.id}] Processing job ${job.id} `)
         const jobId = job.id
