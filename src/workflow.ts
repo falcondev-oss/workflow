@@ -61,7 +61,7 @@ export class Workflow<RunInput, Input, Output> {
 
     const worker = new Worker<WorkflowJobPayloadInternal<Input>>({
       handler: async (job) => {
-        Settings.logger?.info?.(`Processing workflow job ${job.id} of workflow ${this.opts.id}`)
+        Settings.logger?.info?.(`[${this.opts.id}] Processing job ${job.id} `)
         const jobId = job.id
         if (!jobId) throw new Error('Job ID is missing')
 
@@ -95,7 +95,7 @@ export class Workflow<RunInput, Input, Output> {
             const end = performance.now()
 
             Settings.logger?.success?.(
-              `Completed workflow job ${job.id} of workflow ${this.opts.id} in ${(end - start).toFixed(2)} ms`,
+              `[${this.opts.id}] Completed job ${job.id} in ${(end - start).toFixed(2)} ms`,
             )
             return serialize(result)
           },
@@ -106,24 +106,22 @@ export class Workflow<RunInput, Input, Output> {
       ...this.opts.workerOptions,
       ...opts,
     })
-    worker.on('ready', () => {
-      Settings.logger?.info?.(`Worker started for workflow ${this.opts.id}`)
-    })
+
     worker.on('failed', (job) => {
-      Settings.logger?.info?.(`Workflow job ${job.id} of workflow ${this.opts.id} failed`)
+      Settings.logger?.info?.(`[${this.opts.id}] Job ${job.id} failed`)
     })
     worker.on('error', (error) => {
-      Settings.logger?.error?.(`Error during worker startup for workflow ${this.opts.id}:`, error)
+      Settings.logger?.error?.(`[${this.opts.id}] Error during worker startup:`, error)
     })
+
+    Settings.logger?.info?.(`[${this.opts.id}] Worker started`)
 
     const metricsOpts = opts?.metrics ?? this.opts.workerOptions?.metrics ?? Settings.metrics
     if (metricsOpts) await this.setupMetrics(metricsOpts)
 
     asyncExitHook(
       async (signal) => {
-        Settings.logger?.info?.(
-          `Received ${signal}, shutting down worker for workflow ${this.opts.id}...`,
-        )
+        Settings.logger?.info?.(`[${this.opts.id}] Received ${signal}, shutting down worker...`)
         await worker.close()
       },
       { wait: 10_000 },
