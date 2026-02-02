@@ -114,7 +114,7 @@ export class Workflow<RunInput, Input, Output> {
       Settings.logger?.info?.(`[${this.opts.id}] Job ${job.id} failed`)
     })
     worker.on('error', (error) => {
-      Settings.logger?.error?.(`[${this.opts.id}] Error during worker startup:`, error)
+      Settings.logger?.error?.(`[${this.opts.id}] Job error:`, error)
     })
 
     Settings.logger?.info?.(`[${this.opts.id}] Worker started`)
