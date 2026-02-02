@@ -4,6 +4,7 @@ import type { WorkflowQueueInternal } from './types'
 import { setTimeout } from 'node:timers/promises'
 import pRetry from 'p-retry'
 import { deserialize, serialize } from './serializer'
+import { Settings } from './settings'
 import { runWithTracing } from './tracer'
 
 export type WorkflowStepData =
@@ -48,13 +49,22 @@ export class WorkflowStep {
     const name = this.addNamePrefix(stepName)
 
     const stepData = await this.getStepData('do', name)
-    if (stepData && 'result' in stepData) return stepData.result as R
+    if (stepData && 'result' in stepData) {
+      Settings.logger?.debug?.(
+        `[${this.workflowId}/${this.workflowJobId}] Step '${name}' already completed, returning cached result`,
+      )
+      return stepData.result as R
+    }
 
     const initialAttempt = stepData?.attempt ?? 0
     await this.updateStepData(name, {
       type: 'do',
       attempt: initialAttempt,
     })
+
+    Settings.logger?.debug?.(
+      `[${this.workflowId}/${this.workflowJobId}] Running step '${name}' (attempt ${initialAttempt + 1})`,
+    )
     return pRetry(
       async (attempt) => {
         const result = await runWithTracing(
@@ -85,12 +95,20 @@ export class WorkflowStep {
           attempt: initialAttempt + attempt,
         })
 
+        Settings.logger?.debug?.(
+          `[${this.workflowId}/${this.workflowJobId}] Completed step '${name}'`,
+        )
+
         return result
       },
       {
         ...options?.retry,
         retries: Math.max((options?.retry?.retries ?? 0) - initialAttempt, 0),
         onFailedAttempt: async (ctx) => {
+          Settings.logger?.debug?.(
+            `[${this.workflowId}/${this.workflowJobId}] Step '${name}' error:`,
+            ctx.error,
+          )
           await this.updateStepData(name, {
             type: 'do',
             attempt: initialAttempt + ctx.attemptNumber,
@@ -125,6 +143,9 @@ export class WorkflowStep {
         },
       },
       async () => {
+        Settings.logger?.debug?.(
+          `[${this.workflowId}/${this.workflowJobId}] Waiting in step '${name}' for ${durationMs} ms`,
+        )
         const remainingMs = Math.max(0, stepData.startedAt + stepData.durationMs - now)
         await setTimeout(remainingMs)
       },
