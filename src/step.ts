@@ -2,6 +2,7 @@ import type { Span } from '@opentelemetry/api'
 import type { Options } from 'p-retry'
 import type { WorkflowQueueInternal } from './types'
 import { setTimeout } from 'node:timers/promises'
+import Mutex from 'p-mutex'
 import pRetry from 'p-retry'
 import { deserialize, serialize } from './serializer'
 import { Settings } from './settings'
@@ -24,6 +25,7 @@ export class WorkflowStep {
   private queue
   private workflowJobId
   private stepNamePrefix
+  private updateStepDataMutex = new Mutex()
 
   constructor(opts: {
     queue: WorkflowQueueInternal<unknown>
@@ -171,13 +173,17 @@ export class WorkflowStep {
     return stepData as Extract<WorkflowStepData, { type: T }> | undefined
   }
 
+  // TODO maybe update this to use lua script for atomic operation
   private async updateStepData(stepName: string, data: WorkflowStepData) {
-    const job = await this.getWorkflowJob()
+    // prevent concurrent updates to step data which could lead to race conditions and lost updates
+    await this.updateStepDataMutex.withLock(async () => {
+      const job = await this.getWorkflowJob()
 
-    const jobData = deserialize(job.data)
-    jobData.stepData[stepName] = data
+      const jobData = deserialize(job.data)
+      jobData.stepData[stepName] = data
 
-    await job.updateData(serialize(jobData))
+      await job.updateData(serialize(jobData))
+    })
   }
 
   private async getWorkflowJob() {

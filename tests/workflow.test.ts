@@ -4,6 +4,7 @@ import { beforeAll, describe, expect, test, vi } from 'vitest'
 import { createRedis, Settings, Workflow } from '../src'
 
 beforeAll(() => {
+  Settings.logger = console
   Settings.defaultConnection = async () =>
     createRedis({
       host: 'localhost',
@@ -57,12 +58,21 @@ describe('input', () => {
 
 describe('step', () => {
   test('only runs once', async () => {
-    const stepHandler = vi.fn()
+    const stepHandler1 = vi.fn()
+    const stepHandler2 = vi.fn()
+    const stepHandler3 = vi.fn()
     const handler = vi.fn()
     const workflow = new Workflow({
       id: randomUUID(),
+      queueOptions: {
+        maxAttempts: 10,
+      },
       run: async ({ step }) => {
-        await step.do('test-step', stepHandler)
+        await Promise.all([
+          step.do('test-step1', stepHandler1),
+          step.do('test-step2', stepHandler2),
+          step.do('test-step3', stepHandler3),
+        ])
         await handler()
         throw new Error('error')
       },
@@ -74,8 +84,10 @@ describe('step', () => {
     await workflow.run(undefined)
 
     await vi.waitFor(() => {
-      expect(stepHandler).toHaveBeenCalledOnce()
-      expect(handler).toHaveBeenCalledTimes(3)
+      expect(stepHandler1).toHaveBeenCalledOnce()
+      expect(stepHandler2).toHaveBeenCalledOnce()
+      expect(stepHandler3).toHaveBeenCalledOnce()
+      expect(handler).toHaveBeenCalledTimes(10)
     })
   })
   test('caches output', async () => {
