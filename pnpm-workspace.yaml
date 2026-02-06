@@ -1,4 +1,9 @@
+patchedDependencies:
+  groupmq: patches/groupmq.patch
 onlyBuiltDependencies:
+  - cpu-features
   - esbuild
   - msgpackr-extract
+  - protobufjs
+  - ssh2
   - unrs-resolver

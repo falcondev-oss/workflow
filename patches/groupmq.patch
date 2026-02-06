@@ -1,0 +1,14 @@
+diff --git a/dist/lua/reserve-batch.lua b/dist/lua/reserve-batch.lua
+index 095536b0120d685ea39b6809cf19c97dd1639b0a..550e2ef0542d64ada75aa72ad7f5d58aa7a3b89d 100644
+--- a/dist/lua/reserve-batch.lua
++++ b/dist/lua/reserve-batch.lua
+@@ -45,6 +45,9 @@ if (now - lastCheck) >= stalledCheckInterval then
+             local headScore = tonumber(head[2])
+             redis.call("ZADD", readyKey, headScore, gid)
+           end
++          -- Remove from group active list (BullMQ-style) - CRITICAL to unblock the group
++          local groupActiveKey = ns .. ":g:" .. gid .. ":active"
++          redis.call("LREM", groupActiveKey, 1, jobId)
+           redis.call("DEL", ns .. ":lock:" .. gid)
+           redis.call("DEL", procKey)
+           redis.call("ZREM", processingKey, jobId)

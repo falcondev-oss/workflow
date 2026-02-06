@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  groupmq:
+    hash: 0f055dcc6e397c02b849be5416debe7d948309b119c1f5282e0cfc6f2a063543
+    path: patches/groupmq.patch
+
 importers:
 
   .:
@@ -25,7 +30,7 @@ importers:
         version: 5.0.1
       groupmq:
         specifier: ^1.1.1-next.2
-        version: 1.1.1-next.2(ioredis@5.9.2)
+        version: 1.1.1-next.2(patch_hash=0f055dcc6e397c02b849be5416debe7d948309b119c1f5282e0cfc6f2a063543)(ioredis@5.9.2)
       ioredis:
         specifier: ^5.9.2
         version: 5.9.2
@@ -6638,7 +6643,7 @@ snapshots:
 
   graphemer@1.4.0: {}
 
-  groupmq@1.1.1-next.2(ioredis@5.9.2):
+  groupmq@1.1.1-next.2(patch_hash=0f055dcc6e397c02b849be5416debe7d948309b119c1f5282e0cfc6f2a063543)(ioredis@5.9.2):
     dependencies:
       cron-parser: 4.9.0
       ioredis: 5.9.2
