@@ -1,7 +1,7 @@
 {
   "name": "@falcondev-oss/workflow",
   "type": "module",
-  "version": "0.8.8",
+  "version": "0.8.9",
   "packageManager": "pnpm@10.28.2",
   "description": "Simple type-safe queue worker with durable execution using Redis.",
   "license": "MIT",
