@@ -7,3 +7,7 @@ onlyBuiltDependencies:
   - protobufjs
   - ssh2
   - unrs-resolver
+
+publicHoistPattern:
+  - eslint-plugin-*
+  - '@prettier/plugin-*'

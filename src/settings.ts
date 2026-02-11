@@ -31,11 +31,12 @@ export const defaultRedisConnection = createSingletonPromise(async () => {
   return redis
 })
 
-export async function createRedis(opts: RedisOptions) {
-  const redis = new IORedis({
+export async function createRedis(opts: RedisOptions & { url?: string }) {
+  const redisOpts = {
     ...defaultRedisOptions,
     ...opts,
-  })
+  }
+  const redis = opts.url ? new IORedis(opts.url, redisOpts) : new IORedis(redisOpts)
   await redis.connect()
   return redis
 }
