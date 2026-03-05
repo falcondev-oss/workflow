@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { sleep } from '@antfu/utils'
 import { type } from 'arktype'
 import { beforeAll, describe, expect, test, vi } from 'vitest'
 import { createRedis, Settings, Workflow } from '../src'
@@ -89,6 +90,36 @@ describe('step', () => {
       expect(stepHandler3).toHaveBeenCalledOnce()
       expect(handler).toHaveBeenCalledTimes(10)
     })
+  })
+  test('wait for running steps on job failure', async () => {
+    const stepHandler1 = vi.fn(async () => sleep(1000))
+    const stepHandler3 = vi.fn(async () => sleep(1000))
+    const workflow = new Workflow({
+      id: randomUUID(),
+      run: async ({ step }) => {
+        await Promise.all([
+          step.do('test-step1', stepHandler1),
+          step.do('test-step2', () => {
+            throw new Error('step error')
+          }),
+          step.do('test-step3', stepHandler3),
+        ])
+      },
+    })
+
+    const errorHandler = vi.fn()
+    await workflow.work({
+      backoff: () => 0,
+      onError: errorHandler,
+    })
+
+    await workflow.run(undefined)
+
+    await vi.waitFor(() => {
+      expect(errorHandler).toHaveBeenCalled()
+    }, 5000)
+    expect(stepHandler1).toHaveResolved()
+    expect(stepHandler3).toHaveResolved()
   })
   test('caches output', async () => {
     const stepHandler = vi.fn(() => ({

@@ -83,24 +83,41 @@ export class Workflow<RunInput, Input, Output> {
             kind: SpanKind.CONSUMER,
           },
           async (span) => {
+            const stepMeta = {
+              stepPromises: new Set<Promise<any>>(),
+              isCanceled: false,
+            }
             const start = performance.now()
-            const result = await this.opts.run({
-              // eslint-disable-next-line ts/no-unsafe-assignment
-              input: parsedData?.value as any,
-              step: new WorkflowStep({
-                queue,
-                workflowJobId: jobId,
-                workflowId: this.opts.id,
-              }),
-              span,
-            })
+            try {
+              const result = await this.opts.run({
+                // eslint-disable-next-line ts/no-unsafe-assignment
+                input: parsedData?.value as any,
+                step: new WorkflowStep({
+                  queue,
+                  workflowJobId: jobId,
+                  workflowId: this.opts.id,
+                  meta: stepMeta,
+                }),
+                span,
+              })
 
-            const end = performance.now()
+              const end = performance.now()
 
-            Settings.logger?.success?.(
-              `[${this.opts.id}] Completed job ${job.id} in ${(end - start).toFixed(2)} ms`,
-            )
-            return serialize(result)
+              Settings.logger?.success?.(
+                `[${this.opts.id}] Completed job ${job.id} in ${(end - start).toFixed(2)} ms`,
+              )
+              return serialize(result)
+            } catch (err) {
+              stepMeta.isCanceled = true
+              if (stepMeta.stepPromises.size > 0) {
+                Settings.logger?.warn?.(
+                  `[${this.opts.id}] Job failed but there are still ${stepMeta.stepPromises.size} running step(s), waiting for them to finish. Be careful when using 'Promise.all([step0, step1, ...])', as running steps are not canceled when one of them fails.`,
+                )
+                await Promise.allSettled(stepMeta.stepPromises)
+              }
+
+              throw err
+            }
           },
           propagation.extract(ROOT_CONTEXT, deserializedData.tracingHeaders),
         )

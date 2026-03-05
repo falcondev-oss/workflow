@@ -26,17 +26,23 @@ export class WorkflowStep {
   private workflowJobId
   private stepNamePrefix
   private updateStepDataMutex = new Mutex()
+  private meta
 
   constructor(opts: {
     queue: WorkflowQueueInternal<unknown>
     workflowJobId: string
     workflowId: string
     stepNamePrefix?: string
+    meta: {
+      stepPromises: Set<Promise<any>>
+      isCanceled: boolean
+    }
   }) {
     this.queue = opts.queue
     this.workflowJobId = opts.workflowJobId
     this.workflowId = opts.workflowId
     this.stepNamePrefix = opts.stepNamePrefix ? `${opts.stepNamePrefix}|` : ''
+    this.meta = opts.meta
   }
 
   private addNamePrefix(name: string) {
@@ -67,7 +73,7 @@ export class WorkflowStep {
     Settings.logger?.debug?.(
       `[${this.workflowId}/${this.workflowJobId}] Running step '${name}' (attempt ${initialAttempt + 1})`,
     )
-    return pRetry(
+    const promise = pRetry(
       async (attempt) => {
         const result = await runWithTracing(
           `workflow-worker/${this.workflowId}/step/${name}`,
@@ -86,6 +92,7 @@ export class WorkflowStep {
                 workflowId: this.workflowId,
                 workflowJobId: this.workflowJobId,
                 stepNamePrefix: name,
+                meta: this.meta,
               }),
               span,
             }),
@@ -117,8 +124,16 @@ export class WorkflowStep {
           })
           return options?.retry?.onFailedAttempt?.(ctx)
         },
+        shouldRetry: async (context) => {
+          if (this.meta.isCanceled) return false
+
+          return options?.retry?.shouldRetry?.(context) ?? true
+        },
       },
     )
+
+    this.meta.stepPromises.add(promise)
+    return promise.finally(() => this.meta.stepPromises.delete(promise))
   }
 
   async wait(stepName: string, durationMs: number) {

@@ -8,6 +8,7 @@ export type WorkflowLogger = {
   success?: (...data: any[]) => void
   error?: (...data: any[]) => void
   debug?: (...data: any[]) => void
+  warn?: (...data: any[]) => void
 }
 
 export const Settings = {
