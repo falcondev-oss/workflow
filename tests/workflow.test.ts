@@ -221,3 +221,35 @@ test('priority', async () => {
     )
   })
 })
+test('repeating', async () => {
+  const handler = vi.fn()
+  const workflow = new Workflow({
+    id: randomUUID(),
+    schema: type({
+      name: 'string',
+    }),
+    run: handler,
+  })
+
+  await workflow.runEvery('interval', 3000, {
+    name: 'a',
+  })
+  await workflow.runEvery('interval', 5000, {
+    name: 'b',
+  })
+  await workflow.work()
+
+  await vi.waitFor(() => {
+    expect(handler).toHaveBeenCalledOnce()
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: { name: 'b' },
+      }),
+    )
+    expect(handler).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: { name: 'a' },
+      }),
+    )
+  }, 8000)
+}, 10_000)

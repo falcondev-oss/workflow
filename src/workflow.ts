@@ -155,6 +155,21 @@ export class Workflow<RunInput, Input, Output> {
     if (parsedInput?.issues) throw new Error('Invalid workflow input')
 
     const queue = await this.getOrCreateQueue()
+
+    const groupId =
+      opts?.groupId ??
+      (await this.opts.getGroupId?.(
+        parsedInput?.value as IsUnknown<Input> extends true ? undefined : Input,
+      )) ??
+      randomUUID()
+    if (opts?.repeat) {
+      const didRemove = await queue.removeRepeatingJob(groupId)
+      if (didRemove)
+        Settings.logger?.debug?.(
+          `[${this.opts.id}] Removed existing repeating job with groupId '${groupId}' before adding new one with schedule ${JSON.stringify(opts.repeat)}`,
+        )
+    }
+
     return runWithTracing(
       `workflow-producer/${this.opts.id}`,
       {
@@ -174,10 +189,6 @@ export class Workflow<RunInput, Input, Output> {
           (this.opts.jobOptions?.priority === 'high' ? 0 : undefined)
 
         const job = await queue.add({
-          groupId:
-            (await this.opts.getGroupId?.(
-              parsedInput?.value as IsUnknown<Input> extends true ? undefined : Input,
-            )) ?? randomUUID(),
           data: serialize({
             input: parsedInput?.value,
             stepData: {},
@@ -185,6 +196,7 @@ export class Workflow<RunInput, Input, Output> {
           }),
           ...this.opts.jobOptions,
           ...opts,
+          groupId,
           orderMs,
         })
 
@@ -217,6 +229,7 @@ export class Workflow<RunInput, Input, Output> {
   ) {
     return this.run(input, {
       groupId: scheduleId,
+      jobId: scheduleId,
       repeat: {
         pattern: cron,
       },
@@ -232,6 +245,7 @@ export class Workflow<RunInput, Input, Output> {
   ) {
     return this.run(input, {
       groupId: scheduleId,
+      jobId: scheduleId,
       repeat: {
         every: everyMs,
       },
