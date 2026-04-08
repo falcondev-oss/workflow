@@ -221,38 +221,6 @@ export class Workflow<RunInput, Input, Output> {
     })
   }
 
-  async 'runCron'(
-    scheduleId: string,
-    cron: string,
-    input: RunInput,
-    opts?: WorkflowJobRunOptions<Input>,
-  ) {
-    return this.run(input, {
-      groupId: scheduleId,
-      jobId: scheduleId,
-      repeat: {
-        pattern: cron,
-      },
-      ...opts,
-    })
-  }
-
-  async 'runEvery'(
-    scheduleId: string,
-    everyMs: number,
-    input: RunInput,
-    opts?: WorkflowJobRunOptions<Input>,
-  ) {
-    return this.run(input, {
-      groupId: scheduleId,
-      jobId: scheduleId,
-      repeat: {
-        every: everyMs,
-      },
-      ...opts,
-    })
-  }
-
   private async 'getOrCreateQueue'() {
     if (!this.queue) {
       this.queue = new Queue({
