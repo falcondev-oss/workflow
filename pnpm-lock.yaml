@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   groupmq:
-    hash: 1f311e9b6cc731809ddc67335576540abb3c2e90f98c33be84e8bb3c8113391c
+    hash: 23aac9f01cddd8e6965912f28b5a74ef2450e99cd3274f8a3451aef4c59cef50
     path: patches/groupmq.patch
 
 importers:
@@ -30,7 +30,7 @@ importers:
         version: 5.0.1
       groupmq:
         specifier: ^1.1.1-next.2
-        version: 1.1.1-next.2(patch_hash=1f311e9b6cc731809ddc67335576540abb3c2e90f98c33be84e8bb3c8113391c)(ioredis@5.9.2)
+        version: 1.1.1-next.2(patch_hash=23aac9f01cddd8e6965912f28b5a74ef2450e99cd3274f8a3451aef4c59cef50)(ioredis@5.9.2)
       ioredis:
         specifier: ^5.9.2
         version: 5.9.2
@@ -6643,7 +6643,7 @@ snapshots:
 
   graphemer@1.4.0: {}
 
-  groupmq@1.1.1-next.2(patch_hash=1f311e9b6cc731809ddc67335576540abb3c2e90f98c33be84e8bb3c8113391c)(ioredis@5.9.2):
+  groupmq@1.1.1-next.2(patch_hash=23aac9f01cddd8e6965912f28b5a74ef2450e99cd3274f8a3451aef4c59cef50)(ioredis@5.9.2):
     dependencies:
       cron-parser: 4.9.0
       ioredis: 5.9.2

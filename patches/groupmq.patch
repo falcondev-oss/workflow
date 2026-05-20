@@ -1,8 +1,42 @@
 diff --git a/dist/index.cjs b/dist/index.cjs
-index 1f22ddcec5f837fbc1eff0c7bb215f261a83f0b7..65baefa980d4065c9214736db869630d092957e1 100644
+index 1f22ddcec5f837fbc1eff0c7bb215f261a83f0b7..0885cb88d9132927cb5ba8fd2b9bf5873dff26a8 100644
 --- a/dist/index.cjs
 +++ b/dist/index.cjs
-@@ -1629,7 +1629,7 @@ var Queue = class {
+@@ -440,13 +440,13 @@ function scriptPath(name) {
+ 	for (const candidate of candidates) if (node_fs.default.existsSync(candidate)) return candidate;
+ 	return candidates[0];
+ }
+-async function loadScript(client, name) {
++async function loadScript(client, name, ignoreCache) {
+ 	let map = cacheByClient.get(client);
+ 	if (!map) {
+ 		map = /* @__PURE__ */ new Map();
+ 		cacheByClient.set(client, map);
+ 	}
+-	const cached = map.get(name);
++	const cached = ignoreCache ? null : map.get(name);
+ 	if (cached) return cached;
+ 	const file = scriptPath(name);
+ 	const lua = node_fs.default.readFileSync(file, "utf8");
+@@ -454,9 +454,14 @@ async function loadScript(client, name) {
+ 	map.set(name, sha);
+ 	return sha;
+ }
+-async function evalScript(client, name, argv, numKeys) {
+-	const sha = await loadScript(client, name);
+-	return client.evalsha(sha, numKeys, ...argv);
++async function evalScript(client, name, argv, numKeys, isRetry) {
++	const sha = await loadScript(client, name, isRetry);
++	return client.evalsha(sha, numKeys, ...argv).catch((err) => {
++    if(err.name === 'ReplyError' && err.message.startsWith('NOSCRIPT') && !isRetry) {
++      return evalScript(client, name, argv, numKeys, true)
++    }
++    throw err
++  });
+ }
+ 
+ //#endregion
+@@ -1629,7 +1634,7 @@ var Queue = class {
  	async addRepeatingJob(opts) {
  		if (!opts.repeat) throw new Error("Repeat options are required for repeating jobs");
  		const now = Date.now();
@@ -11,7 +45,7 @@ index 1f22ddcec5f837fbc1eff0c7bb215f261a83f0b7..65baefa980d4065c9214736db869630d
  		let nextRunTime;
  		if ("every" in opts.repeat) nextRunTime = now + opts.repeat.every;
  		else nextRunTime = this.getNextCronTime(opts.repeat.pattern, now);
-@@ -1646,7 +1646,7 @@ var Queue = class {
+@@ -1646,7 +1651,7 @@ var Queue = class {
  		const repeatJobKey = `${this.ns}:repeat:${repeatKey}`;
  		await this.r.set(repeatJobKey, JSON.stringify(repeatJobData));
  		await this.r.zadd(`${this.ns}:repeat:schedule`, nextRunTime, repeatKey);
@@ -20,7 +54,7 @@ index 1f22ddcec5f837fbc1eff0c7bb215f261a83f0b7..65baefa980d4065c9214736db869630d
  		await this.r.set(lookupKey, repeatKey);
  		const repeatId = `repeat:${repeatKey}`;
  		const jobHashKey = `${this.ns}:job:${repeatId}`;
-@@ -1668,9 +1668,9 @@ var Queue = class {
+@@ -1668,9 +1673,9 @@ var Queue = class {
  	/**
  	* Remove a repeating job
  	*/
@@ -59,10 +93,44 @@ index 1e0c1c3db91c37d99fdd9f1eb71dae8dbb84743f..e383e4b40911397413f3156e62be16d4
  //#endregion
  //#region src/adapters/groupmq-bullboard-adapter.d.ts
 diff --git a/dist/index.js b/dist/index.js
-index 0b885b8c89cf49d0899ded6fe44b42880b4f749f..2c429f38b23e046aaaebbb261b6c9016004796ce 100644
+index 0b885b8c89cf49d0899ded6fe44b42880b4f749f..6776d6a125f41b4915892a544fb389f0cbac14c9 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -1624,7 +1624,7 @@ var Queue = class {
+@@ -435,13 +435,13 @@ function scriptPath(name) {
+ 	for (const candidate of candidates) if (fs.existsSync(candidate)) return candidate;
+ 	return candidates[0];
+ }
+-async function loadScript(client, name) {
++async function loadScript(client, name, ignoreCache) {
+ 	let map = cacheByClient.get(client);
+ 	if (!map) {
+ 		map = /* @__PURE__ */ new Map();
+ 		cacheByClient.set(client, map);
+ 	}
+-	const cached = map.get(name);
++	const cached = ignoreCache ? null : map.get(name);
+ 	if (cached) return cached;
+ 	const file = scriptPath(name);
+ 	const lua = fs.readFileSync(file, "utf8");
+@@ -449,9 +449,14 @@ async function loadScript(client, name) {
+ 	map.set(name, sha);
+ 	return sha;
+ }
+-async function evalScript(client, name, argv, numKeys) {
+-	const sha = await loadScript(client, name);
+-	return client.evalsha(sha, numKeys, ...argv);
++async function evalScript(client, name, argv, numKeys, isRetry) {
++	const sha = await loadScript(client, name, isRetry);
++	return client.evalsha(sha, numKeys, ...argv).catch((err) => {
++    if(err.name === 'ReplyError' && err.message.startsWith('NOSCRIPT') && !isRetry) {
++      return evalScript(client, name, argv, numKeys, true)
++    }
++    throw err
++  });
+ }
+ 
+ //#endregion
+@@ -1624,7 +1629,7 @@ var Queue = class {
  	async addRepeatingJob(opts) {
  		if (!opts.repeat) throw new Error("Repeat options are required for repeating jobs");
  		const now = Date.now();
@@ -71,7 +139,7 @@ index 0b885b8c89cf49d0899ded6fe44b42880b4f749f..2c429f38b23e046aaaebbb261b6c9016
  		let nextRunTime;
  		if ("every" in opts.repeat) nextRunTime = now + opts.repeat.every;
  		else nextRunTime = this.getNextCronTime(opts.repeat.pattern, now);
-@@ -1641,7 +1641,7 @@ var Queue = class {
+@@ -1641,7 +1646,7 @@ var Queue = class {
  		const repeatJobKey = `${this.ns}:repeat:${repeatKey}`;
  		await this.r.set(repeatJobKey, JSON.stringify(repeatJobData));
  		await this.r.zadd(`${this.ns}:repeat:schedule`, nextRunTime, repeatKey);
@@ -80,7 +148,7 @@ index 0b885b8c89cf49d0899ded6fe44b42880b4f749f..2c429f38b23e046aaaebbb261b6c9016
  		await this.r.set(lookupKey, repeatKey);
  		const repeatId = `repeat:${repeatKey}`;
  		const jobHashKey = `${this.ns}:job:${repeatId}`;
-@@ -1663,9 +1663,9 @@ var Queue = class {
+@@ -1663,9 +1668,9 @@ var Queue = class {
  	/**
  	* Remove a repeating job
  	*/
