@@ -528,3 +528,64 @@ test('add() rejects an out-of-range or non-integer priority', async () => {
     await ns.close()
   }
 })
+
+// ---------------------------------------------------------------------------
+// Mutable step data (ticket 05)
+// ---------------------------------------------------------------------------
+
+test('setStepData/getStepData round-trips an opaque string; null on miss', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() })
+
+  try {
+    const jobId = randomUUID()
+    expect(await queue.getStepData(jobId, 'step-a')).toBeNull() // never written
+
+    await queue.setStepData(jobId, 'step-a', 'opaque \n{"x":1}')
+    expect(await queue.getStepData(jobId, 'step-a')).toBe('opaque \n{"x":1}')
+    expect(await queue.getStepData(jobId, 'step-b')).toBeNull() // distinct field still missing
+  } finally {
+    await ns.close()
+  }
+})
+
+test('parallel setStepData on distinct steps both persist (no lost update)', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() })
+
+  try {
+    const jobId = randomUUID()
+    await Promise.all([
+      queue.setStepData(jobId, 'a', 'value-a'),
+      queue.setStepData(jobId, 'b', 'value-b'),
+    ])
+    expect(await queue.getStepData(jobId, 'a')).toBe('value-a')
+    expect(await queue.getStepData(jobId, 'b')).toBe('value-b')
+  } finally {
+    await ns.close()
+  }
+})
+
+test(':steps hash is deleted when the job completes', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+
+  queue.worker(async (job) => {
+    await queue.setStepData(job.id, 'step', 'checkpoint')
+    return 'done'
+  })
+
+  try {
+    const { id } = await queue.add('payload')
+    await queue.wait(id)
+
+    const stepsKey = `${prefix}:${wfId}:j:${id}:steps`
+    await vi.waitFor(async () => {
+      expect(await redis.exists(stepsKey)).toBe(0)
+    })
+  } finally {
+    await ns.close()
+  }
+})

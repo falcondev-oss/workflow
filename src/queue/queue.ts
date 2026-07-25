@@ -107,6 +107,16 @@ export class Queue {
     }
   }
 
+  /** Persist a step's data (opaque string) — a single atomic `HSET` on the `:steps` hash. */
+  async setStepData(jobId: string, stepName: string, value: string): Promise<void> {
+    await this.redis.hset(`${this.prefix}:${this.id}:j:${jobId}:steps`, stepName, value)
+  }
+
+  /** Read a step's data — a single `HGET`, `null` on miss. Opaque string, no deserialization. */
+  async getStepData(jobId: string, stepName: string): Promise<string | null> {
+    return this.redis.hget(`${this.prefix}:${this.id}:j:${jobId}:steps`, stepName)
+  }
+
   private parseResult(raw: string): string {
     const record = JSON.parse(raw) as { state: string; value?: string; reason?: string }
     if (record.state === 'failed') throw new Error(record.reason ?? 'job failed')
