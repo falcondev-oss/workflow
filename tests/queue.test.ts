@@ -450,3 +450,81 @@ test('contention invariant: K workers × M jobs, no leak, no cap ever exceeded',
     await ns.close()
   }
 })
+
+// ---------------------------------------------------------------------------
+// Numeric priority ordering (ticket 04)
+// ---------------------------------------------------------------------------
+
+// Ordering is observable only with a single worker at concurrency 1: it pops one job at
+// a time, so the sequence it sees is exactly the queue's chosen order. All jobs are added
+// *before* the worker exists, so the full waiting set is present when it starts draining.
+
+test('priority: higher runs first across groups; default 0 runs after any expedited job', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() }) // each add = its own group (default cap 1)
+
+  try {
+    // Enqueue in an order that does NOT match priority order, across distinct groups.
+    await queue.add('p0-a') // default priority 0
+    await queue.add('p5', { priority: 5 })
+    await queue.add('p10', { priority: 10 })
+    await queue.add('p0-b') // default priority 0
+
+    const order: string[] = []
+    queue.worker(
+      (job) => {
+        order.push(job.data)
+        return 'ok'
+      },
+      { concurrency: 1 },
+    )
+
+    // Highest priority first; equal-priority (both 0) fall back to FIFO-by-enqueue.
+    await vi.waitFor(() => {
+      expect(order).toEqual(['p10', 'p5', 'p0-a', 'p0-b'])
+    })
+  } finally {
+    await ns.close()
+  }
+})
+
+test('priority: equal-priority jobs run FIFO by promotion (enqueue) order', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() })
+
+  try {
+    const added = ['a', 'b', 'c', 'd', 'e']
+    for (const d of added) await queue.add(d, { priority: 7 }) // all equal priority
+
+    const order: string[] = []
+    queue.worker(
+      (job) => {
+        order.push(job.data)
+        return 'ok'
+      },
+      { concurrency: 1 },
+    )
+
+    await vi.waitFor(() => {
+      expect(order).toEqual(added) // tiebreak = FIFO by the counter stamped at promotion
+    })
+  } finally {
+    await ns.close()
+  }
+})
+
+test('add() rejects an out-of-range or non-integer priority', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() })
+
+  try {
+    await expect(queue.add('x', { priority: -1 })).rejects.toBeInstanceOf(RangeError)
+    await expect(queue.add('x', { priority: 2 ** 21 })).rejects.toBeInstanceOf(RangeError)
+    await expect(queue.add('x', { priority: 1.5 })).rejects.toBeInstanceOf(RangeError)
+    // Boundaries are accepted.
+    await queue.add('lo', { priority: 0 })
+    await queue.add('hi', { priority: 2 ** 21 - 1 })
+  } finally {
+    await ns.close()
+  }
+})

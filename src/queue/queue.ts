@@ -3,7 +3,7 @@ import type { QueueRedis } from './scripts'
 import type { AddOptions, QueueOptions, WaitOptions, WorkerOptions } from './types'
 import { randomUUID } from 'node:crypto'
 import { JobAlreadyExistsError, ResultExpiredError, TimeoutError } from './errors'
-import { UNLIMITED } from './scripts'
+import { PMAX, UNLIMITED } from './scripts'
 import { Worker } from './worker'
 
 /**
@@ -38,6 +38,11 @@ export class Queue {
   async add(data: string, opts?: AddOptions): Promise<{ id: string; groupId: string }> {
     const id = opts?.jobId ?? randomUUID()
     const groupId = opts?.groupId ?? randomUUID()
+    const priority = opts?.priority ?? 0
+    // Guard the range that keeps the packed score exact in a ZSET double (§6). An
+    // out-of-range or fractional priority would corrupt score packing / ordering.
+    if (!Number.isInteger(priority) || priority < 0 || priority > PMAX)
+      throw new RangeError(`priority must be an integer in 0…${PMAX}, got ${priority}`)
     try {
       await this.redis.enqueue(
         this.prefix,
@@ -46,7 +51,7 @@ export class Queue {
         id,
         data,
         groupId,
-        opts?.priority ?? 0,
+        priority,
         opts?.maxAttempts ?? 1,
         this.groupConcurrency,
       )
