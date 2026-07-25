@@ -99,9 +99,15 @@ end
  * logic can never drift between them.
  */
 const ADD_WAITING = `
-local function addWaiting(wf, jobKey, jobId, groupId, priority, groupCap)
-  local counter = redis.call("INCR", wf .. ":pc") % 4294967296
-  local score = (${PMAX} - priority) * 4294967296 + counter
+local function addWaiting(wf, jobKey, jobId, groupId, priority, groupCap, scoreArg)
+  -- Recovery requeues at the STORED packed score (front of its band); the enqueue/promotion
+  -- paths pass no score and stamp a fresh FIFO counter (§6). Either way the ready-set
+  -- maintenance below is the single shared source of truth, so recovery can't drift.
+  local score = scoreArg
+  if not score then
+    local counter = redis.call("INCR", wf .. ":pc") % 4294967296
+    score = (${PMAX} - priority) * 4294967296 + counter
+  end
   redis.call("HSET", jobKey, "state", "waiting")
   local groupJobs = wf .. ":g:" .. groupId .. ":jobs"
   local groupActive = wf .. ":g:" .. groupId .. ":active"
@@ -253,7 +259,8 @@ redis.call("ZADD", wfActive, deadline, jobId)
 redis.call("SADD", groupActive, jobId)
 redis.call("SADD", nsActive, wfId .. ":" .. jobId)
 redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
-redis.call("HSET", jobKey, "state", "active", "deadlineAt", deadline)
+-- Store the popped packed score so stalled-recovery can requeue at the front of its band.
+redis.call("HSET", jobKey, "state", "active", "deadlineAt", deadline, "score", popped[2])
 
 if redis.call("ZCARD", groupJobs) > 0 and redis.call("SCARD", groupActive) < groupCap then
   local next = redis.call("ZRANGE", groupJobs, 0, 0, "WITHSCORES")
@@ -369,12 +376,96 @@ finalizeFailed(prefix, wfId, jobId, reason, "", resultTtl, groupCap, keepFailed)
 return 1
 `
 
+/**
+ * Token-CAS heartbeat (§9): no-op returning 0 if `lock != myToken` (the claim was recovered
+ * and re-reserved elsewhere → the caller must abort). Else renew the lock PX *and* the
+ * `wf:active` deadline score in lockstep so they can never diverge, keeping a healthy
+ * long-running job out of the stalled-candidate window. The worker runs it on a derived
+ * `min(lockMs/3, 10s)` timer.
+ *
+ * ARGV: prefix, wfId, jobId, token, lockMs
+ */
+const HEARTBEAT = `
+local prefix = ARGV[1]
+local wfId = ARGV[2]
+local jobId = ARGV[3]
+local token = ARGV[4]
+local lockMs = tonumber(ARGV[5])
+
+local wf = prefix .. ":" .. wfId
+local jobKey = wf .. ":j:" .. jobId
+
+if redis.call("GET", jobKey .. ":lock") ~= token then
+  return 0
+end
+${NOW}
+redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
+redis.call("ZADD", wf .. ":active", now + lockMs, jobId)
+return 1
+`
+
+/**
+ * The single throttled stalled-recovery scan (§9), never folded into reserve. Gated by
+ * `SET wf:stalled-check <now> NX PX interval` so only one worker per interval scans; returns
+ * 0 immediately when the gate is held. Detection is a pure deadline-compare over the
+ * deadline-scored active ZSET (`ZRANGEBYSCORE wf:active 0 now`, batch-capped) — no `stalled`
+ * SET, no two-pass. Per candidate: a `state == "active"` fence (skips a job mid-`completing`,
+ * closing the complete-vs-recover race) → the shared `releaseActive` (frees every slot and
+ * unblocks the group for free) → `HINCRBY stalledCount`. Over budget ⇒ the SAME dead-letter
+ * path as `moveToFailed` (`finalizeFailed`, bypassing backoff/retry); otherwise requeue at the
+ * stored packed score via the shared `addWaiting`. `releaseActive` already kicks both wake lists.
+ *
+ * ARGV: prefix, wfId, groupCap, maxStalledCount, interval, batchSize, resultTtl, keepFailed
+ */
+const RECOVER_STALLED = `
+${RELEASE_ACTIVE}
+${FINALIZE_FAILED}
+${ADD_WAITING}
+local prefix = ARGV[1]
+local wfId = ARGV[2]
+local groupCap = tonumber(ARGV[3])
+local maxStalledCount = tonumber(ARGV[4])
+local interval = tonumber(ARGV[5])
+local batchSize = tonumber(ARGV[6])
+local resultTtl = tonumber(ARGV[7])
+local keepFailed = tonumber(ARGV[8])
+
+local wf = prefix .. ":" .. wfId
+${NOW}
+
+if redis.call("SET", wf .. ":stalled-check", now, "NX", "PX", interval) == false then
+  return 0
+end
+
+local candidates = redis.call("ZRANGEBYSCORE", wf .. ":active", 0, now, "LIMIT", 0, batchSize)
+local recovered = 0
+for i = 1, #candidates do
+  local jobId = candidates[i]
+  local jobKey = wf .. ":j:" .. jobId
+  if redis.call("HGET", jobKey, "state") == "active" then
+    releaseActive(prefix, wfId, jobId, groupCap)
+    local stalledCount = redis.call("HINCRBY", jobKey, "stalledCount", 1)
+    if stalledCount > maxStalledCount then
+      finalizeFailed(prefix, wfId, jobId, "stalled more than allowable limit", "", resultTtl, groupCap, keepFailed)
+    else
+      local groupId = redis.call("HGET", jobKey, "groupId")
+      local score = tonumber(redis.call("HGET", jobKey, "score"))
+      addWaiting(wf, jobKey, jobId, groupId, 0, groupCap, score)
+    end
+    recovered = recovered + 1
+  end
+end
+return recovered
+`
+
 export interface QueueCommands {
   enqueue: (...args: (string | number)[]) => Promise<number>
   reserve: (...args: (string | number)[]) => Promise<(string | number)[]>
   complete: (...args: (string | number)[]) => Promise<number>
   fail: (...args: (string | number)[]) => Promise<number>
   moveToFailed: (...args: (string | number)[]) => Promise<number>
+  heartbeat: (...args: (string | number)[]) => Promise<number>
+  recoverStalled: (...args: (string | number)[]) => Promise<number>
 }
 
 /** A redis connection with the queue's custom commands registered. */
@@ -390,6 +481,8 @@ export function registerScripts(redis: Redis): QueueRedis {
     redis.defineCommand('complete', { numberOfKeys: 0, lua: COMPLETE })
     redis.defineCommand('fail', { numberOfKeys: 0, lua: FAIL })
     redis.defineCommand('moveToFailed', { numberOfKeys: 0, lua: MOVE_TO_FAILED })
+    redis.defineCommand('heartbeat', { numberOfKeys: 0, lua: HEARTBEAT })
+    redis.defineCommand('recoverStalled', { numberOfKeys: 0, lua: RECOVER_STALLED })
     registered.add(redis)
   }
   return redis as QueueRedis

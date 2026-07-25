@@ -42,6 +42,10 @@ export interface WorkerOptions {
   concurrency?: number
   /** Lock/heartbeat TTL (ms) held while a job runs. Default: 30_000. */
   lockMs?: number
+  /** Times a job may be recovered from a stall before being dead-lettered. Default: 1. */
+  maxStalledCount?: number
+  /** Min interval (ms) between stalled-recovery scans across all workers. Default: 30_000. */
+  stalledInterval?: number
   /** Backstop `BRPOP` re-poll timeout (seconds). Default: 5. */
   safetyTimeout?: number
   /** Max due delayed jobs promoted per `reserve` call; drains larger backlogs in chunks. Default: 500. */

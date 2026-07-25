@@ -27,6 +27,9 @@ type ReserveResult =
 export class Worker {
   private readonly concurrency: number
   private readonly lockMs: number
+  private readonly heartbeatInterval: number
+  private readonly maxStalledCount: number
+  private readonly stalledInterval: number
   private readonly safetyTimeout: number
   private readonly promoteBatchSize: number
   private readonly backoff: (attempt: number) => number
@@ -50,6 +53,11 @@ export class Worker {
   ) {
     this.concurrency = opts?.concurrency ?? 1
     this.lockMs = opts?.lockMs ?? 30_000
+    // Derived, not exposed (§9): renew ~3× within lockMs, capped at 10s so long locks still
+    // renew often enough that a single missed tick can't stall a healthy job.
+    this.heartbeatInterval = Math.min(this.lockMs / 3, 10_000)
+    this.maxStalledCount = opts?.maxStalledCount ?? 1
+    this.stalledInterval = opts?.stalledInterval ?? 30_000
     this.safetyTimeout = opts?.safetyTimeout ?? 5
     this.promoteBatchSize = opts?.promoteBatchSize ?? 500
     this.backoff = opts?.backoff ?? expBackoff()
@@ -87,6 +95,27 @@ export class Worker {
       const timeout =
         msToNext < 0 ? this.safetyTimeout : Math.min(msToNext / 1000, this.safetyTimeout)
       await this.blockingRedis.brpop(this.wfWake, this.nsWake, timeout)
+      // Wake-loop re-poll is the idle-worker stalled-recovery trigger (§9) — no dedicated
+      // poller. The scan is throttled in Lua, so firing every re-poll is cheap.
+      if (!this.closing) void this.recoverStalled()
+    }
+  }
+
+  /** Fire the throttled stalled-recovery scan (a no-op in Redis if another scan is in-flight). */
+  private async recoverStalled(): Promise<void> {
+    try {
+      await this.redis.recoverStalled(
+        this.queue.prefix,
+        this.queue.id,
+        this.queue.groupConcurrency,
+        this.maxStalledCount,
+        this.stalledInterval,
+        this.promoteBatchSize,
+        this.queue.resultTtl,
+        this.keepFailed,
+      )
+    } catch (err) {
+      this.onError(err)
     }
   }
 
@@ -127,8 +156,13 @@ export class Worker {
 
   private async process(claim: Claim): Promise<void> {
     const controller = new AbortController()
+    const stopHeartbeat = this.startHeartbeat(claim, controller)
     try {
       const result = await this.handler(claim.job, { signal: controller.signal })
+      // Abort-on-lost-claim (§9/§12): the heartbeat aborted because the claim was recovered
+      // and re-reserved elsewhere — drop the job without committing. The token-guard on
+      // complete/fail makes those no-ops anyway, but skipping avoids the wasted round-trip.
+      if (controller.signal.aborted) return
       const record = JSON.stringify({ state: 'completed', value: result })
       await this.redis.complete(
         this.queue.prefix,
@@ -140,8 +174,50 @@ export class Worker {
         this.queue.groupConcurrency,
       )
     } catch (err) {
+      if (controller.signal.aborted) return
       await this.fail(claim, err)
+    } finally {
+      stopHeartbeat()
     }
+  }
+
+  /**
+   * Renew the claim on a derived timer (§9). A token-CAS renew returning 0 (the claim was
+   * recovered + re-reserved elsewhere) or erroring past `lockMs` aborts `ctx.signal` and stops
+   * the timer, so a cooperative handler can bail and `process` drops the job. Each successful
+   * tick also fires the throttled stalled scan — the busy-worker recovery trigger (§9).
+   * Returns a stop function.
+   */
+  private startHeartbeat(claim: Claim, controller: AbortController): () => void {
+    let lastRenew = Date.now()
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          const ok = await this.redis.heartbeat(
+            this.queue.prefix,
+            this.queue.id,
+            claim.job.id,
+            claim.token,
+            this.lockMs,
+          )
+          if (ok === 0) {
+            controller.abort()
+            clearInterval(timer)
+            return
+          }
+          lastRenew = Date.now()
+          void this.recoverStalled()
+        } catch (err) {
+          // A transient renew error is tolerated until the lock could actually have expired.
+          if (Date.now() - lastRenew >= this.lockMs) {
+            controller.abort()
+            clearInterval(timer)
+          }
+          this.onError(err)
+        }
+      })()
+    }, this.heartbeatInterval)
+    return () => clearInterval(timer)
   }
 
   /**

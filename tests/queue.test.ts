@@ -923,3 +923,241 @@ test('keepFailed count-trims the failed ZSET and DELs evicted job hashes', async
     await ns.close()
   }
 })
+
+// ---------------------------------------------------------------------------
+// Stalled-job recovery, heartbeat & abort-on-lost-claim (ticket 08)
+// ---------------------------------------------------------------------------
+
+// No fake clock: a stalled worker is simulated by BACK-DATING the stored `wf:active` deadline
+// score so the deadline-compare scan (`ZRANGEBYSCORE 0 now`) sees the claim as expired.
+
+test('a stalled active job (deadline back-dated) is recovered and re-runs', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const wfActive = `${prefix}:${wfId}:active`
+
+  let calls = 0
+  const started = makeGate()
+  const gate = makeGate()
+  queue.worker(
+    async () => {
+      calls++
+      if (calls === 1) {
+        started.open()
+        await gate.wait() // first invocation "hangs" as if its process died
+      }
+      return `ok:${calls}`
+    },
+    { safetyTimeout: 0.2, stalledInterval: 100 }, // fast wake-loop re-poll + throttle
+  )
+
+  try {
+    const { id } = await queue.add('x')
+    await started.wait() // first invocation is running ⇒ state=active in wf:active
+
+    // Deadline in the past ⇒ a candidate for the scan. The 10s heartbeat can't renew within
+    // the test window, so the worker's own throttled wake-loop scan recovers it.
+    await redis.zadd(wfActive, Date.now() - 60_000, id)
+    await vi.waitFor(async () => {
+      expect(await redis.hget(`${prefix}:${wfId}:j:${id}`, 'stalledCount')).toBe('1')
+    })
+
+    gate.open() // let the dead invocation "return" (its commit no-ops — the token was released)
+    expect(await queue.wait(id)).toBe('ok:2') // requeued job re-runs and commits
+    expect(calls).toBe(2)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('heartbeat renewal keeps a healthy long-running job out of the stalled window', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const wfActive = `${prefix}:${wfId}:active`
+
+  let calls = 0
+  const started = makeGate()
+  const gate = makeGate()
+  queue.worker(
+    async () => {
+      calls++
+      if (calls === 1) {
+        started.open()
+        await gate.wait()
+      }
+      return 'ok'
+    },
+    // Short lock ⇒ heartbeat every ~100ms and scans every 50ms. A broken heartbeat would let
+    // the deadline fall into the past and the job would be recovered + re-run.
+    { lockMs: 300, safetyTimeout: 0.1, stalledInterval: 50 },
+  )
+
+  try {
+    const { id } = await queue.add('x')
+    await started.wait()
+
+    // Work well past lockMs while the handler is still busy; the heartbeat must keep the
+    // deadline in the future so every throttled scan finds no candidate.
+    await sleep(900)
+    expect(Number(await redis.zscore(wfActive, id))).toBeGreaterThan(Date.now())
+    expect(calls).toBe(1) // never falsely recovered / re-run
+    expect(await redis.hget(`${prefix}:${wfId}:j:${id}`, 'stalledCount')).toBe('0')
+
+    gate.open()
+    expect(await queue.wait(id)).toBe('ok')
+    expect(calls).toBe(1)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('recovery requeues at the original score (front of band) and unblocks the group', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId, groupConcurrency: 1 })
+  const wfActive = `${prefix}:${wfId}:active`
+
+  const order: string[] = []
+  const startedA = makeGate()
+  const gate = makeGate()
+  let blocked = false
+  queue.worker(
+    async (job) => {
+      order.push(job.data)
+      if (job.data === 'A' && !blocked) {
+        blocked = true
+        startedA.open()
+        await gate.wait() // A's first invocation "dies"
+      }
+      return 'ok'
+    },
+    { concurrency: 1, safetyTimeout: 0.2, stalledInterval: 100 },
+  )
+
+  try {
+    const { id: aId } = await queue.add('A', { groupId: 'g' })
+    await queue.add('B', { groupId: 'g' }) // stuck behind A (group cap 1)
+    await startedA.wait() // A in flight; B cannot run — the group is wedged on the dead A
+
+    await redis.zadd(wfActive, Date.now() - 60_000, aId) // A's deadline expires
+    await vi.waitFor(async () => {
+      expect(await redis.hget(`${prefix}:${wfId}:j:${aId}`, 'stalledCount')).toBe('1')
+    })
+    gate.open()
+
+    // A requeued at its ORIGINAL score (front of its band) ⇒ it re-runs before B; the group
+    // is unblocked so B runs too. A fresh counter would have ordered A behind B (['A','B','A']).
+    await vi.waitFor(() => {
+      expect(order).toEqual(['A', 'A', 'B'])
+    })
+  } finally {
+    await ns.close()
+  }
+})
+
+test('a job in state=completing is fenced from recovery', async () => {
+  const prefix = randomUUID()
+  const nsId = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
+  const jobId = randomUUID()
+  const jobKey = `${prefix}:${wfId}:j:${jobId}`
+
+  try {
+    // A job mid-complete: state=completing (the fence set before releaseActive) with an already
+    // expired deadline. Recovery must skip it, closing the complete-vs-recover race.
+    // prettier-ignore
+    await redis.hset(jobKey, 'state', 'completing', 'groupId', 'g', 'nsId', nsId, 'stalledCount', '0', 'score', '123')
+    await redis.zadd(`${prefix}:${wfId}:active`, Date.now() - 60_000, jobId)
+
+    const recovered = await ns.redis.recoverStalled(prefix, wfId, 1, 1, 1000, 500, 300, 100)
+    expect(recovered).toBe(0)
+    expect(await redis.hget(jobKey, 'stalledCount')).toBe('0') // budget untouched
+    expect(await redis.hget(jobKey, 'state')).toBe('completing') // state unchanged
+    expect(await redis.zscore(`${prefix}:${wfId}:g:g:jobs`, jobId)).toBeNull() // not requeued
+  } finally {
+    await ns.close()
+  }
+})
+
+test('a job past maxStalledCount is dead-lettered instead of requeued', async () => {
+  const prefix = randomUUID()
+  const nsId = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
+  const jobId = randomUUID()
+  const jobKey = `${prefix}:${wfId}:j:${jobId}`
+  const wfActive = `${prefix}:${wfId}:active`
+
+  try {
+    // Already at the budget (maxStalledCount 1); the next stall (→ 2) exceeds it.
+    // prettier-ignore
+    await redis.hset(jobKey, 'state', 'active', 'groupId', 'g', 'nsId', nsId, 'stalledCount', '1', 'score', '123', 'maxAttempts', '1')
+    await redis.zadd(wfActive, Date.now() - 60_000, jobId)
+
+    const recovered = await ns.redis.recoverStalled(prefix, wfId, 1, 1, 1000, 500, 300, 100)
+    expect(recovered).toBe(1)
+
+    // Routed through the shared moveToFailed/finalizeFailed dead-letter path (bypasses retry).
+    expect(await redis.zscore(`${prefix}:${wfId}:failed`, jobId)).not.toBeNull()
+    expect(await redis.hget(jobKey, 'state')).toBe('failed')
+    expect(await redis.hget(jobKey, 'failedReason')).toBe('stalled more than allowable limit')
+    expect(await redis.hget(jobKey, 'stalledCount')).toBe('2')
+    expect(await redis.zcard(wfActive)).toBe(0) // claim released
+    expect(await redis.zscore(`${prefix}:${wfId}:g:g:jobs`, jobId)).toBeNull() // not requeued
+  } finally {
+    await ns.close()
+  }
+})
+
+test('abort-on-lost-claim: a worker whose token is stolen aborts ctx.signal and does not commit', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+
+  let aborted = false
+  const started = makeGate()
+  queue.worker(
+    async (_job, ctx) => {
+      started.open()
+      await Promise.race([
+        new Promise<void>((resolve) => {
+          if (ctx.signal.aborted) resolve()
+          else ctx.signal.addEventListener('abort', () => resolve())
+        }),
+        sleep(3000), // fail-safe so a broken abort surfaces as a failed assertion, not a hang
+      ])
+      aborted = ctx.signal.aborted
+      return 'should-not-commit'
+    },
+    // Short lock ⇒ heartbeat ~100ms for quick lost-claim detection; long re-poll so no
+    // background scan recovers the (post-theft) claim mid-test.
+    { lockMs: 300, safetyTimeout: 30 },
+  )
+
+  try {
+    const { id } = await queue.add('x')
+    await started.wait()
+
+    // Steal the claim: overwrite the lock with a foreign token, as recovery + re-reserve would.
+    const lockKey = `${prefix}:${wfId}:j:${id}:lock`
+    await redis.set(lockKey, 'foreign-token')
+
+    await vi.waitFor(() => {
+      expect(aborted).toBe(true) // heartbeat CAS returned 0 ⇒ worker aborted ctx.signal
+    })
+    // The old worker dropped the job without committing (no result written).
+    expect(await redis.exists(`${prefix}:${wfId}:result:${id}`)).toBe(0)
+    // The commit stays token-safe: the foreign holder can still finalize the claim.
+    const record = JSON.stringify({ state: 'completed', value: 'by-recoverer' })
+    expect(await ns.redis.complete(prefix, wfId, id, 'foreign-token', record, 300, 1)).toBe(1)
+  } finally {
+    await ns.close()
+  }
+})
