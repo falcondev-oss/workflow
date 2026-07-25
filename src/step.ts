@@ -1,9 +1,6 @@
 import type { Span } from '@opentelemetry/api'
-import type { Options } from 'p-retry'
 import type { WorkflowQueueInternal } from './types'
 import { setTimeout } from 'node:timers/promises'
-import Mutex from 'p-mutex'
-import pRetry from 'p-retry'
 import { deserialize, serialize } from './serializer'
 import { Settings } from './settings'
 import { runWithTracing } from './tracer'
@@ -12,7 +9,6 @@ export type WorkflowStepData =
   | {
       type: 'do'
       result?: unknown
-      attempt: number
     }
   | {
       type: 'wait'
@@ -25,37 +21,34 @@ export class WorkflowStep {
   private queue
   private workflowJobId
   private stepNamePrefix
-  private updateStepDataMutex = new Mutex()
-  private meta
+  private signal
+  private stepPromises
 
   constructor(opts: {
-    queue: WorkflowQueueInternal<unknown>
+    queue: WorkflowQueueInternal
     workflowJobId: string
     workflowId: string
     stepNamePrefix?: string
-    meta: {
-      stepPromises: Set<Promise<any>>
-      isCanceled: boolean
-    }
+    signal: AbortSignal
+    stepPromises: Set<Promise<any>>
   }) {
     this.queue = opts.queue
     this.workflowJobId = opts.workflowJobId
     this.workflowId = opts.workflowId
     this.stepNamePrefix = opts.stepNamePrefix ? `${opts.stepNamePrefix}|` : ''
-    this.meta = opts.meta
+    this.signal = opts.signal
+    this.stepPromises = opts.stepPromises
   }
 
   private addNamePrefix(name: string) {
     return `${this.stepNamePrefix}${name}`
   }
 
-  async do<R>(
-    stepName: string,
-    run: (ctx: { step: WorkflowStep; span: Span }) => R,
-    options?: WorkflowStepOptions,
-  ) {
+  async do<R>(stepName: string, run: (ctx: { step: WorkflowStep; span: Span }) => R) {
     const name = this.addNamePrefix(stepName)
 
+    // Memoize on completion only: a stored `result` field means the step finished on a prior
+    // attempt, so a job-level retry replays it from cache and only re-runs the failed step.
     const stepData = await this.getStepData('do', name)
     if (stepData && 'result' in stepData) {
       Settings.logger?.debug?.(
@@ -64,45 +57,33 @@ export class WorkflowStep {
       return stepData.result as R
     }
 
-    const initialAttempt = stepData?.attempt ?? 0
-    await this.updateStepData(name, {
-      type: 'do',
-      attempt: initialAttempt,
-    })
+    // Cooperative cancellation: bail before starting new work if the claim was lost.
+    this.signal.throwIfAborted()
 
-    Settings.logger?.debug?.(
-      `[${this.workflowId}/${this.workflowJobId}] Running step '${name}' (attempt ${initialAttempt + 1})`,
-    )
-    const promise = pRetry(
-      async (attempt) => {
-        const result = await runWithTracing(
-          `workflow-worker/${this.workflowId}/step/${name}`,
-          {
-            attributes: {
-              'workflow.id': this.workflowId,
-              'workflow.job_id': this.workflowJobId,
-              'workflow.step_name': name,
-              'workflow.step.attempt': attempt,
-            },
-          },
-          async (span) =>
-            run({
-              step: new WorkflowStep({
-                queue: this.queue,
-                workflowId: this.workflowId,
-                workflowJobId: this.workflowJobId,
-                stepNamePrefix: name,
-                meta: this.meta,
-              }),
-              span,
-            }),
-        )
-
-        await this.updateStepData(name, {
-          type: 'do',
-          result,
-          attempt: initialAttempt + attempt,
+    Settings.logger?.debug?.(`[${this.workflowId}/${this.workflowJobId}] Running step '${name}'`)
+    const promise = runWithTracing(
+      `workflow-worker/${this.workflowId}/step/${name}`,
+      {
+        attributes: {
+          'workflow.id': this.workflowId,
+          'workflow.job_id': this.workflowJobId,
+          'workflow.step_name': name,
+        },
+      },
+      async (span) => {
+        const result = await run({
+          step: new WorkflowStep({
+            queue: this.queue,
+            workflowId: this.workflowId,
+            workflowJobId: this.workflowJobId,
+            stepNamePrefix: name,
+            signal: this.signal,
+            stepPromises: this.stepPromises,
+          }),
+          span,
         })
+
+        await this.updateStepData(name, { type: 'do', result })
 
         Settings.logger?.debug?.(
           `[${this.workflowId}/${this.workflowJobId}] Completed step '${name}'`,
@@ -110,30 +91,10 @@ export class WorkflowStep {
 
         return result
       },
-      {
-        ...options?.retry,
-        retries: Math.max((options?.retry?.retries ?? 0) - initialAttempt, 0),
-        onFailedAttempt: async (ctx) => {
-          Settings.logger?.debug?.(
-            `[${this.workflowId}/${this.workflowJobId}] Step '${name}' error:`,
-            ctx.error,
-          )
-          await this.updateStepData(name, {
-            type: 'do',
-            attempt: initialAttempt + ctx.attemptNumber,
-          })
-          return options?.retry?.onFailedAttempt?.(ctx)
-        },
-        shouldRetry: async (context) => {
-          if (this.meta.isCanceled) return false
-
-          return options?.retry?.shouldRetry?.(context) ?? true
-        },
-      },
     )
 
-    this.meta.stepPromises.add(promise)
-    return promise.finally(() => this.meta.stepPromises.delete(promise))
+    this.stepPromises.add(promise)
+    return promise.finally(() => this.stepPromises.delete(promise))
   }
 
   async wait(stepName: string, durationMs: number) {
@@ -143,12 +104,12 @@ export class WorkflowStep {
 
     const now = Date.now()
     const stepData = existingStepData ?? {
-      type: 'wait',
+      type: 'wait' as const,
       durationMs,
       startedAt: now,
     }
 
-    await this.updateStepData(name, stepData)
+    if (!existingStepData) await this.updateStepData(name, stepData)
 
     await runWithTracing(
       `workflow-worker/${this.workflowId}/step/${name}`,
@@ -163,8 +124,10 @@ export class WorkflowStep {
         Settings.logger?.debug?.(
           `[${this.workflowId}/${this.workflowJobId}] Waiting in step '${name}' for ${durationMs} ms`,
         )
-        const remainingMs = Math.max(0, stepData.startedAt + stepData.durationMs - now)
-        await setTimeout(remainingMs)
+        // Durable sleep survives resume: remaining time is computed from the persisted start.
+        // Signal-aware so a lost claim aborts the sleep instead of holding slots until it elapses.
+        const remainingMs = Math.max(0, stepData.startedAt + stepData.durationMs - Date.now())
+        await setTimeout(remainingMs, undefined, { signal: this.signal })
       },
     )
   }
@@ -177,37 +140,18 @@ export class WorkflowStep {
   }
 
   private async getStepData<T extends WorkflowStepData['type']>(type: T, stepName: string) {
-    const job = await this.getWorkflowJob()
+    const raw = await this.queue.getStepData(this.workflowJobId, stepName)
+    if (raw === null) return
 
-    const jobData = deserialize(job.data)
-    const stepData = jobData.stepData[stepName]
-
-    if (stepData && stepData.type !== type)
+    const stepData = deserialize<WorkflowStepData>(raw)
+    if (stepData.type !== type)
       throw new Error(`Step "${stepName}" is of type "${stepData.type}", expected "${type}"`)
 
-    return stepData as Extract<WorkflowStepData, { type: T }> | undefined
+    return stepData as Extract<WorkflowStepData, { type: T }>
   }
 
-  // TODO maybe update this to use lua script for atomic operation
+  /** Per-field superjson persist — a single atomic `HSET` on the job's `:steps` hash. */
   private async updateStepData(stepName: string, data: WorkflowStepData) {
-    // prevent concurrent updates to step data which could lead to race conditions and lost updates
-    await this.updateStepDataMutex.withLock(async () => {
-      const job = await this.getWorkflowJob()
-
-      const jobData = deserialize(job.data)
-      jobData.stepData[stepName] = data
-
-      await job.updateData(serialize(jobData))
-    })
+    await this.queue.setStepData(this.workflowJobId, stepName, serialize(data))
   }
-
-  private async getWorkflowJob() {
-    const job = await this.queue.getJob(this.workflowJobId)
-    if (!job) throw new Error(`Could not find workflow job with ID ${this.workflowJobId}`)
-    return job
-  }
-}
-
-export interface WorkflowStepOptions {
-  retry?: Options
 }

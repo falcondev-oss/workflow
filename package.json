@@ -14,7 +14,6 @@
     "worker",
     "bullmq",
     "redis",
-    "groupmq",
     "durable-execution",
     "tracing",
     "typescript"
@@ -44,10 +43,7 @@
     "@types/node": "^25.1.0",
     "croner": "^10.0.1",
     "exit-hook": "^5.0.1",
-    "groupmq": "^1.1.1-next.2",
     "ioredis": "^5.9.2",
-    "p-mutex": "^1.0.0",
-    "p-retry": "^7.1.1",
     "superjson": "^2.2.6",
     "type-fest": "^5.4.2"
   },

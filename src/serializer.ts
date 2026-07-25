@@ -1,13 +1,10 @@
-import type { SuperJSONResult } from 'superjson'
-import type { Tagged } from 'type-fest'
-import { deserialize as _deserialize, serialize as _serialize } from 'superjson'
+import { parse, stringify } from 'superjson'
 
-export type Serialized<T> = Tagged<SuperJSONResult, 'data', T>
-
-export function serialize<T>(data: T): Serialized<T> {
-  return _serialize(data) as Serialized<T>
+/** superjson → opaque string. The queue backbone is string-only; all encoding lives here. */
+export function serialize<T>(data: T): string {
+  return stringify(data)
 }
 
-export function deserialize<T>(data: Serialized<T>): T {
-  return _deserialize(data)
+export function deserialize<T>(data: string): T {
+  return parse<T>(data)
 }

@@ -1,5 +1,3 @@
-patchedDependencies:
-  groupmq: patches/groupmq.patch
 onlyBuiltDependencies:
   - cpu-features
   - esbuild
