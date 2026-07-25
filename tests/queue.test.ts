@@ -3,7 +3,13 @@ import { randomUUID } from 'node:crypto'
 import { sleep } from '@antfu/utils'
 import { beforeAll, expect, test, vi } from 'vitest'
 import { createRedis } from '../src'
-import { JobAlreadyExistsError, Namespace } from '../src/queue'
+import {
+  expBackoff,
+  JobAlreadyExistsError,
+  Namespace,
+  ResultExpiredError,
+  TimeoutError,
+} from '../src/queue'
 
 let redis: Redis
 beforeAll(async () => {
@@ -628,9 +634,9 @@ test('runAt and runIn are mutually exclusive', async () => {
   const queue = ns.queue({ id: randomUUID() })
 
   try {
-    await expect(
-      queue.add('x', { runAt: Date.now() + 1000, runIn: 1000 }),
-    ).rejects.toThrow(/mutually exclusive/)
+    await expect(queue.add('x', { runAt: Date.now() + 1000, runIn: 1000 })).rejects.toThrow(
+      /mutually exclusive/,
+    )
   } finally {
     await ns.close()
   }
@@ -744,6 +750,175 @@ test('an idle worker picks up a delayed job when it comes due (block is the time
     const result = await queue.wait(id)
     expect(result).toBe('ok')
     expect(seen).toHaveBeenCalledExactlyOnceWith('soon')
+  } finally {
+    await ns.close()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Retries, backoff, dead-letter, retention & wait() contract (ticket 07)
+// ---------------------------------------------------------------------------
+
+test('expBackoff jitters within [0, ceiling] and caps the ceiling', () => {
+  const b = expBackoff({ base: 100, factor: 2, cap: 1000 })
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    const ceiling = Math.min(1000, 100 * 2 ** (attempt - 1))
+    for (let i = 0; i < 50; i++) {
+      const d = b(attempt)
+      expect(d).toBeGreaterThanOrEqual(0)
+      expect(d).toBeLessThanOrEqual(ceiling)
+    }
+  }
+})
+
+test('wait() throws the job failure, carrying its reason', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() })
+  queue.worker(() => {
+    throw new Error('boom')
+  })
+
+  try {
+    const { id } = await queue.add('x')
+    await expect(queue.wait(id)).rejects.toThrow('boom')
+  } finally {
+    await ns.close()
+  }
+})
+
+test('wait() rejects with TimeoutError when the deadline elapses', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() }) // no worker ⇒ never finishes
+
+  try {
+    const { id } = await queue.add('x')
+    await expect(queue.wait(id, { timeoutMs: 100 })).rejects.toBeInstanceOf(TimeoutError)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('wait() rejects with ResultExpiredError when notified but the result is gone', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId }) // no worker, so no result record is ever written
+
+  try {
+    const jobId = randomUUID()
+    const waiting = queue.wait(jobId) // subscribes, reads null, then blocks on the publish
+    // Race the subscribe registration: publish `done` (no result key) until the waiter observes it.
+    const channel = `${prefix}:${wfId}:done:${jobId}`
+    const pump = setInterval(() => void redis.publish(channel, '1'), 20)
+    await expect(waiting).rejects.toBeInstanceOf(ResultExpiredError)
+    clearInterval(pump)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('a retryable failure requeues via delayed, releasing all slots, then re-runs', async () => {
+  const prefix = randomUUID()
+  const nsId = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const delayedKey = `${prefix}:${wfId}:delayed`
+  const wfWake = `${prefix}:${wfId}:wake`
+
+  const attempts: number[] = []
+  queue.worker(
+    (job) => {
+      attempts.push(job.attemptsMade)
+      if (job.attemptsMade === 0) throw new Error('transient')
+      return 'ok'
+    },
+    // Long backoff so the delayed/slot-released window is observable; back-date to re-run.
+    { backoff: () => 10_000, safetyTimeout: 0.2 },
+  )
+
+  try {
+    const { id } = await queue.add('x', { maxAttempts: 2 })
+
+    // The first failure requeues the job into `delayed` (not terminal).
+    await vi.waitFor(async () => {
+      expect(await redis.zscore(delayedKey, id)).not.toBeNull()
+    })
+    // During backoff every concurrency slot is freed — only the delayed parking remains.
+    const counts = await activeCounts(prefix, wfId, nsId)
+    expect(counts.wfActive).toBe(0)
+    expect(counts.nsActive).toBe(0)
+    expect(counts.groupActive).toBe(0)
+    expect(counts.ready).toBe(0)
+    expect(attempts).toEqual([0])
+
+    // Make it due and kick the worker; it promotes, re-runs (attemptsMade now 1), and completes.
+    await redis.zadd(delayedKey, Date.now() - 1000, id)
+    await redis.lpush(wfWake, '1')
+    expect(await queue.wait(id)).toBe('ok')
+    expect(attempts).toEqual([0, 1])
+  } finally {
+    await ns.close()
+  }
+})
+
+test('maxAttempts exhaustion dead-letters to the failed ZSET', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  queue.worker(() => {
+    throw new Error('always')
+  })
+
+  try {
+    const { id } = await queue.add('x') // maxAttempts default 1 ⇒ first failure is terminal
+    await expect(queue.wait(id)).rejects.toThrow('always')
+
+    expect(await redis.zscore(`${prefix}:${wfId}:failed`, id)).not.toBeNull()
+    const hash = await redis.hgetall(`${prefix}:${wfId}:j:${id}`)
+    expect(hash.state).toBe('failed')
+    expect(hash.failedReason).toBe('always')
+    expect(hash.attempts).toBe('1') // incremented in Lua, not JS
+    expect(hash.stalledCount).toBe('0') // separate budget, untouched
+    // The claim was released and step data cleared.
+    expect(await redis.zcard(`${prefix}:${wfId}:active`)).toBe(0)
+    expect(await redis.exists(`${prefix}:${wfId}:j:${id}:steps`)).toBe(0)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('keepFailed count-trims the failed ZSET and DELs evicted job hashes', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  queue.worker(
+    () => {
+      throw new Error('nope')
+    },
+    { concurrency: 1, keepFailed: 2 },
+  )
+
+  try {
+    // Fail 4 jobs one at a time (sequenced via wait) ⇒ strictly increasing `finishedOn`.
+    const ids: string[] = []
+    for (let i = 0; i < 4; i++) {
+      const { id } = await queue.add(`j${i}`)
+      ids.push(id)
+      await queue.wait(id).catch(() => {})
+    }
+
+    const failedKey = `${prefix}:${wfId}:failed`
+    await vi.waitFor(async () => {
+      expect(await redis.zcard(failedKey)).toBe(2) // only the newest 2 retained
+    })
+    // Oldest two evicted from the ZSET and their hashes DEL'd; newest two kept.
+    expect(await redis.exists(`${prefix}:${wfId}:j:${ids[0]}`)).toBe(0)
+    expect(await redis.exists(`${prefix}:${wfId}:j:${ids[1]}`)).toBe(0)
+    expect(await redis.zscore(failedKey, ids[2]!)).not.toBeNull()
+    expect(await redis.zscore(failedKey, ids[3]!)).not.toBeNull()
   } finally {
     await ns.close()
   }

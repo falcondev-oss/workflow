@@ -48,7 +48,11 @@ export interface WorkerOptions {
   promoteBatchSize?: number
   /** Default `maxAttempts` for jobs of this workflow. Default: 1. */
   maxAttempts?: number
-  /** Called with a thrown handler error (best-effort). Defaults to `Settings.logger`. */
+  /** Retry backoff — ms before the given (1-based) attempt. Per-workflow only. Default: `expBackoff()`. */
+  backoff?: (attempt: number) => number
+  /** Max retained failed jobs (count-trimmed by `finishedOn`). Default: 100. */
+  keepFailed?: number
+  /** Called with a worker-internal error (best-effort). Defaults to `Settings.logger`. */
   onError?: (error: unknown) => void
 }
 

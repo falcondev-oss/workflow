@@ -1,3 +1,5 @@
+export { expBackoff } from './backoff'
+export type { ExpBackoffOptions } from './backoff'
 export { JobAlreadyExistsError, ResultExpiredError, TimeoutError } from './errors'
 export { Namespace } from './namespace'
 export { Queue } from './queue'

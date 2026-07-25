@@ -4,6 +4,7 @@ import type { QueueRedis } from './scripts'
 import type { JobContext, ReservedJob, WorkerOptions } from './types'
 import { randomUUID } from 'node:crypto'
 import { Settings } from '../settings'
+import { expBackoff } from './backoff'
 
 export type WorkerHandler = (job: ReservedJob, ctx: JobContext) => Promise<string> | string
 
@@ -28,6 +29,8 @@ export class Worker {
   private readonly lockMs: number
   private readonly safetyTimeout: number
   private readonly promoteBatchSize: number
+  private readonly backoff: (attempt: number) => number
+  private readonly keepFailed: number
   private readonly onError: (error: unknown) => void
 
   private readonly blockingRedis: Redis
@@ -49,6 +52,8 @@ export class Worker {
     this.lockMs = opts?.lockMs ?? 30_000
     this.safetyTimeout = opts?.safetyTimeout ?? 5
     this.promoteBatchSize = opts?.promoteBatchSize ?? 500
+    this.backoff = opts?.backoff ?? expBackoff()
+    this.keepFailed = opts?.keepFailed ?? 100
     this.onError = opts?.onError ?? ((error) => Settings.logger?.error?.(error))
 
     this.redis = queue.redis
@@ -135,9 +140,34 @@ export class Worker {
         this.queue.groupConcurrency,
       )
     } catch (err) {
-      // Retry/fail is a later ticket. Surface the error; the claim is released by
-      // stalled-recovery (also later) once the lock TTL lapses.
-      this.onError(err)
+      await this.fail(claim, err)
+    }
+  }
+
+  /**
+   * Route a handler throw through the token-guarded `fail` script: it increments `attempts`
+   * and either requeues via the delayed ZSET after `backoff` (releasing all slots) or
+   * dead-letters. `attemptsMade` counts prior attempts, so the attempt that just failed is
+   * `attemptsMade + 1`. Backoff `runAt` is computed here (JS) and stored verbatim as the score.
+   */
+  private async fail(claim: Claim, err: unknown): Promise<void> {
+    const error = err instanceof Error ? err : new Error(String(err))
+    const runAt = Date.now() + this.backoff(claim.job.attemptsMade + 1)
+    try {
+      await this.redis.fail(
+        this.queue.prefix,
+        this.queue.id,
+        claim.job.id,
+        claim.token,
+        error.message,
+        error.stack ?? '',
+        runAt,
+        this.queue.resultTtl,
+        this.queue.groupConcurrency,
+        this.keepFailed,
+      )
+    } catch (failErr) {
+      this.onError(failErr)
     }
   }
 

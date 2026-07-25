@@ -122,8 +122,17 @@ export class Queue {
   }
 
   private parseResult(raw: string): string {
-    const record = JSON.parse(raw) as { state: string; value?: string; reason?: string }
-    if (record.state === 'failed') throw new Error(record.reason ?? 'job failed')
+    const record = JSON.parse(raw) as {
+      state: string
+      value?: string
+      reason?: string
+      stack?: string
+    }
+    if (record.state === 'failed') {
+      const error = new Error(record.reason ?? 'job failed')
+      if (record.stack) error.stack = record.stack
+      throw error
+    }
     return record.value ?? ''
   }
 

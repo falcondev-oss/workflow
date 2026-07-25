@@ -57,6 +57,41 @@ end
 `
 
 /**
+ * Terminal-failure finalize, shared (included, not copied) by `fail`'s exhausted branch and
+ * `moveToFailed` so a dead-letter entry is only ever written in one place. Sets `state=failed`
+ * ahead of `releaseActive` (fences the fail-vs-recover race, mirroring `complete`), frees the
+ * claim, deletes step data, appends to the `failed` retention ZSET scored by `finishedOn` and
+ * count-trims it (`DEL`ing evicted job hashes), writes the TTL result record, and publishes
+ * `done`. The failed job hash is kept (not `DEL`'d) for debug history until trimmed out.
+ * Assumes `releaseActive` is already in scope.
+ */
+const FINALIZE_FAILED = `
+local function finalizeFailed(prefix, wfId, jobId, reason, stack, resultTtl, groupCap, keepFailed)
+  local wf = prefix .. ":" .. wfId
+  local jobKey = wf .. ":j:" .. jobId
+  local __t = redis.call("TIME")
+  local now = tonumber(__t[1]) * 1000 + math.floor(tonumber(__t[2]) / 1000)
+
+  redis.call("HSET", jobKey, "state", "failed", "failedReason", reason, "stacktrace", stack, "finishedOn", now)
+  releaseActive(prefix, wfId, jobId, groupCap)
+  redis.call("DEL", jobKey .. ":steps")
+
+  local failedKey = wf .. ":failed"
+  redis.call("ZADD", failedKey, now, jobId)
+  local excess = redis.call("ZCARD", failedKey) - keepFailed
+  if excess > 0 then
+    local evicted = redis.call("ZRANGE", failedKey, 0, excess - 1)
+    for i = 1, #evicted do redis.call("DEL", wf .. ":j:" .. evicted[i]) end
+    redis.call("ZREMRANGEBYRANK", failedKey, 0, excess - 1)
+  end
+
+  redis.call("SET", wf .. ":result:" .. jobId,
+    cjson.encode({ state = "failed", reason = reason, stack = stack }), "EX", resultTtl)
+  redis.call("PUBLISH", wf .. ":done:" .. jobId, "1")
+end
+`
+
+/**
  * Move a job into the waiting structure: stamp the FIFO tiebreak counter (`INCR pc` at
  * promotion time, §6), pack the priority score, `ZADD` the group ZSET, and re-evaluate
  * `ready`. The single source of truth for "a job becomes runnable" — shared (included, not
@@ -266,10 +301,80 @@ redis.call("PUBLISH", wf .. ":done:" .. jobId, "1")
 return 1
 `
 
+/**
+ * Token-guarded finalize on a handler throw: no-op if `lock != myToken` (recovery took the
+ * claim). Else `HINCRBY attempts 1` (the single attempt counter, never in JS; `stalledCount`
+ * is untouched). Retryable (`attempts < maxAttempts`) → set `state=delayed`, `releaseActive`
+ * (frees ALL concurrency slots + kicks both wake lists during backoff), and `ZADD delayed` at
+ * the JS-computed `runAt` score so `reserve` promotes it when due. Exhausted → `finalizeFailed`.
+ *
+ * Returns 0 (stale token no-op), 1 (terminal dead-letter), or 2 (requeued for retry).
+ * ARGV: prefix, wfId, jobId, token, reason, stack, runAt, resultTtl, groupCap, keepFailed
+ */
+const FAIL = `
+${RELEASE_ACTIVE}
+${FINALIZE_FAILED}
+local prefix = ARGV[1]
+local wfId = ARGV[2]
+local jobId = ARGV[3]
+local token = ARGV[4]
+local reason = ARGV[5]
+local stack = ARGV[6]
+local runAt = tonumber(ARGV[7])
+local resultTtl = tonumber(ARGV[8])
+local groupCap = tonumber(ARGV[9])
+local keepFailed = tonumber(ARGV[10])
+
+local wf = prefix .. ":" .. wfId
+local jobKey = wf .. ":j:" .. jobId
+
+if redis.call("GET", jobKey .. ":lock") ~= token then
+  return 0
+end
+
+local attempts = redis.call("HINCRBY", jobKey, "attempts", 1)
+local maxAttempts = tonumber(redis.call("HGET", jobKey, "maxAttempts"))
+
+if attempts < maxAttempts then
+  redis.call("HSET", jobKey, "state", "delayed", "runAt", runAt)
+  releaseActive(prefix, wfId, jobId, groupCap)
+  redis.call("ZADD", wf .. ":delayed", runAt, jobId)
+  return 2
+end
+
+finalizeFailed(prefix, wfId, jobId, reason, stack, resultTtl, groupCap, keepFailed)
+return 1
+`
+
+/**
+ * `fail`-terminal minus the token-equality guard and minus backoff — an unconditional
+ * dead-letter for callers that already hold the right to finalize (stalled-recovery over its
+ * budget, ticket 08). Anti-drift: recovery never hand-writes a failed-set entry, it routes
+ * through the same `finalizeFailed`.
+ *
+ * ARGV: prefix, wfId, jobId, reason, resultTtl, groupCap, keepFailed
+ */
+const MOVE_TO_FAILED = `
+${RELEASE_ACTIVE}
+${FINALIZE_FAILED}
+local prefix = ARGV[1]
+local wfId = ARGV[2]
+local jobId = ARGV[3]
+local reason = ARGV[4]
+local resultTtl = tonumber(ARGV[5])
+local groupCap = tonumber(ARGV[6])
+local keepFailed = tonumber(ARGV[7])
+
+finalizeFailed(prefix, wfId, jobId, reason, "", resultTtl, groupCap, keepFailed)
+return 1
+`
+
 export interface QueueCommands {
   enqueue: (...args: (string | number)[]) => Promise<number>
   reserve: (...args: (string | number)[]) => Promise<(string | number)[]>
   complete: (...args: (string | number)[]) => Promise<number>
+  fail: (...args: (string | number)[]) => Promise<number>
+  moveToFailed: (...args: (string | number)[]) => Promise<number>
 }
 
 /** A redis connection with the queue's custom commands registered. */
@@ -283,6 +388,8 @@ export function registerScripts(redis: Redis): QueueRedis {
     redis.defineCommand('enqueue', { numberOfKeys: 0, lua: ENQUEUE })
     redis.defineCommand('reserve', { numberOfKeys: 0, lua: RESERVE })
     redis.defineCommand('complete', { numberOfKeys: 0, lua: COMPLETE })
+    redis.defineCommand('fail', { numberOfKeys: 0, lua: FAIL })
+    redis.defineCommand('moveToFailed', { numberOfKeys: 0, lua: MOVE_TO_FAILED })
     registered.add(redis)
   }
   return redis as QueueRedis
