@@ -43,6 +43,8 @@ export class Queue {
     // out-of-range or fractional priority would corrupt score packing / ordering.
     if (!Number.isInteger(priority) || priority < 0 || priority > PMAX)
       throw new RangeError(`priority must be an integer in 0…${PMAX}, got ${priority}`)
+    if (opts?.runAt !== undefined && opts?.runIn !== undefined)
+      throw new Error('`runAt` and `runIn` are mutually exclusive')
     try {
       await this.redis.enqueue(
         this.prefix,
@@ -54,6 +56,8 @@ export class Queue {
         priority,
         opts?.maxAttempts ?? 1,
         this.groupConcurrency,
+        opts?.runAt ?? -1,
+        opts?.runIn ?? -1,
       )
     } catch (err) {
       if (err instanceof Error && err.message.includes('JobAlreadyExists'))

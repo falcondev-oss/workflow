@@ -589,3 +589,162 @@ test(':steps hash is deleted when the job completes', async () => {
     await ns.close()
   }
 })
+
+// ---------------------------------------------------------------------------
+// Delayed / scheduled jobs (ticket 06)
+// ---------------------------------------------------------------------------
+
+test('runAt stores the absolute score; runIn resolves against the Redis clock', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId }) // no worker: delayed jobs just sit in the ZSET
+  const delayedKey = `${prefix}:${wfId}:delayed`
+
+  try {
+    // Absolute runAt is stored verbatim as the score.
+    const runAt = Date.now() + 3_600_000
+    const { id: a } = await queue.add('at', { runAt })
+    expect(Number(await redis.zscore(delayedKey, a))).toBe(runAt)
+
+    // runIn resolves to `redisNow + runIn`; bracket it with generous skew tolerance.
+    const before = Date.now()
+    const { id: b } = await queue.add('in', { runIn: 3_600_000 })
+    const after = Date.now()
+    const score = Number(await redis.zscore(delayedKey, b))
+    expect(score).toBeGreaterThanOrEqual(before + 3_600_000 - 2000)
+    expect(score).toBeLessThanOrEqual(after + 3_600_000 + 2000)
+
+    // Both are parked as delayed, neither entered the waiting structure.
+    expect(await redis.zcard(delayedKey)).toBe(2)
+    expect(await redis.zcard(`${prefix}:${wfId}:ready`)).toBe(0)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('runAt and runIn are mutually exclusive', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() })
+
+  try {
+    await expect(
+      queue.add('x', { runAt: Date.now() + 1000, runIn: 1000 }),
+    ).rejects.toThrow(/mutually exclusive/)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('a past runAt skips the delayed ZSET and enqueues straight into waiting', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId }) // no worker: observe the raw enqueue placement
+
+  try {
+    const { id, groupId } = await queue.add('past', { runAt: Date.now() - 1000 })
+    // Never entered `delayed`; it is immediately runnable in its group's waiting ZSET.
+    expect(await redis.zcard(`${prefix}:${wfId}:delayed`)).toBe(0)
+    expect(await redis.zscore(`${prefix}:${wfId}:g:${groupId}:jobs`, id)).not.toBeNull()
+    expect(await redis.zcard(`${prefix}:${wfId}:ready`)).toBe(1)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('promotion order is FIFO-by-due-time, not enqueue order', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId }) // each add its own group ⇒ pure priority/FIFO index
+  const delayedKey = `${prefix}:${wfId}:delayed`
+
+  try {
+    // Enqueue far in the future so nothing auto-promotes, then back-date the stored scores
+    // (no fake clock) so due order (y < z < x) differs from enqueue order (x, y, z).
+    const ids: Record<string, string> = {}
+    for (const d of ['x', 'y', 'z']) {
+      const { id } = await queue.add(d, { runAt: Date.now() + 3_600_000 })
+      ids[d] = id
+    }
+    const base = Date.now() - 10_000
+    await redis.zadd(delayedKey, base + 3, ids.x!) // due last
+    await redis.zadd(delayedKey, base + 1, ids.y!) // due first
+    await redis.zadd(delayedKey, base + 2, ids.z!) // due second
+
+    // Single worker at concurrency 1 observes exactly the promotion (= due) order.
+    const order: string[] = []
+    queue.worker(
+      (job) => {
+        order.push(job.data)
+        return 'ok'
+      },
+      { concurrency: 1 },
+    )
+
+    await vi.waitFor(() => {
+      expect(order).toEqual(['y', 'z', 'x'])
+    })
+  } finally {
+    await ns.close()
+  }
+})
+
+test('per-call promote cap drains a larger backlog in chunks', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const delayedKey = `${prefix}:${wfId}:delayed`
+  const N = 10
+
+  try {
+    // Enqueue future, then back-date every score so all N are due at once — more than the
+    // promote cap, so a single reserve cannot promote them all.
+    const base = Date.now() - 10_000
+    for (let i = 0; i < N; i++) {
+      const { id } = await queue.add(`d${i}`, { runAt: Date.now() + 3_600_000 })
+      await redis.zadd(delayedKey, base + i, id)
+    }
+
+    const seen = new Set<string>()
+    queue.worker(
+      (job) => {
+        seen.add(job.data)
+        return 'ok'
+      },
+      { concurrency: 2, promoteBatchSize: 3 }, // cap 3 << 10 ⇒ must re-reserve to drain
+    )
+
+    // All eventually run (the worker re-reserves to promote the next chunk), and the
+    // delayed ZSET fully empties.
+    await vi.waitFor(() => {
+      expect(seen.size).toBe(N)
+    })
+    expect(await redis.zcard(delayedKey)).toBe(0)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('an idle worker picks up a delayed job when it comes due (block is the timer)', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() })
+
+  const seen = vi.fn()
+  queue.worker((job) => {
+    seen(job.data)
+    return 'ok'
+  })
+
+  try {
+    // Worker is idle-blocked; a short-delay job must be promoted and run without a poller.
+    const { id } = await queue.add('soon', { runIn: 300 })
+    const result = await queue.wait(id)
+    expect(result).toBe('ok')
+    expect(seen).toHaveBeenCalledExactlyOnceWith('soon')
+  } finally {
+    await ns.close()
+  }
+})

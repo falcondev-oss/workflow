@@ -12,6 +12,11 @@ interface Claim {
   token: string
 }
 
+type ReserveResult =
+  | { kind: 'job'; claim: Claim }
+  | { kind: 'empty'; msToNext: number }
+  | { kind: 'maxed' }
+
 /**
  * Runs jobs for one workflow. A JS-local semaphore (`concurrency`) is the per-worker cap —
  * no Redis round-trip. The loop drains reserve until empty/maxed, then blocks on
@@ -22,6 +27,7 @@ export class Worker {
   private readonly concurrency: number
   private readonly lockMs: number
   private readonly safetyTimeout: number
+  private readonly promoteBatchSize: number
   private readonly onError: (error: unknown) => void
 
   private readonly blockingRedis: Redis
@@ -42,6 +48,7 @@ export class Worker {
     this.concurrency = opts?.concurrency ?? 1
     this.lockMs = opts?.lockMs ?? 30_000
     this.safetyTimeout = opts?.safetyTimeout ?? 5
+    this.promoteBatchSize = opts?.promoteBatchSize ?? 500
     this.onError = opts?.onError ?? ((error) => Settings.logger?.error?.(error))
 
     this.redis = queue.redis
@@ -55,19 +62,30 @@ export class Worker {
   private async loop(): Promise<void> {
     if (this.blockingRedis.status === 'wait') await this.blockingRedis.connect()
     while (!this.closing) {
-      // Drain: reserve until a slot is unavailable or there is no runnable work.
+      // Drain: reserve until a slot is unavailable or there is no runnable work. `msToNext`
+      // is the reserve-reported ms until the next delayed job is due, carried out to the block.
+      let msToNext = -1
       while (!this.closing && this.inFlight < this.concurrency) {
-        const claim = await this.reserve()
-        if (!claim) break
-        this.start(claim)
+        const res = await this.reserve()
+        if (res.kind === 'job') {
+          this.start(res.claim)
+          continue
+        }
+        if (res.kind === 'empty') msToNext = res.msToNext
+        break
       }
       if (this.closing) break
-      // Block until woken (new work / freed slot) or the safety re-poll fires.
-      await this.blockingRedis.brpop(this.wfWake, this.nsWake, this.safetyTimeout)
+      // Due work remained past the promote cap — re-reserve at once to drain the next chunk.
+      if (msToNext === 0) continue
+      // Block until woken (new work / freed slot / enqueued delay), the next delayed job
+      // comes due, or the safety re-poll fires — whichever is sooner. The block is the timer.
+      const timeout =
+        msToNext < 0 ? this.safetyTimeout : Math.min(msToNext / 1000, this.safetyTimeout)
+      await this.blockingRedis.brpop(this.wfWake, this.nsWake, timeout)
     }
   }
 
-  private async reserve(): Promise<Claim | undefined> {
+  private async reserve(): Promise<ReserveResult> {
     const token = randomUUID()
     const res = await this.redis.reserve(
       this.queue.prefix,
@@ -78,9 +96,11 @@ export class Worker {
       this.queue.groupConcurrency,
       this.lockMs,
       token,
+      this.promoteBatchSize,
     )
-    if (res[0] !== 'job') return undefined
-    const [, id, groupId, data, attempts, priority] = res
+    if (res[0] === 'maxed') return { kind: 'maxed' }
+    if (res[0] === 'empty') return { kind: 'empty', msToNext: Number(res[1]) }
+    const [, id, groupId, data, attempts, priority] = res as string[]
     const job: ReservedJob = Object.freeze({
       id: id!,
       groupId: groupId!,
@@ -88,7 +108,7 @@ export class Worker {
       attemptsMade: Number(attempts),
       priority: Number(priority),
     })
-    return { job, token }
+    return { kind: 'job', claim: { job, token } }
   }
 
   private start(claim: Claim): void {

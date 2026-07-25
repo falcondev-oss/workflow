@@ -27,6 +27,10 @@ export interface AddOptions {
   groupId?: string
   /** Numeric priority, 0…2^21-1, higher runs first. Default: 0. */
   priority?: number
+  /** Absolute epoch-ms instant to run at → delayed ZSET. Mutually exclusive with `runIn`. */
+  runAt?: number
+  /** Delay in ms before running (`runAt = redisNow + runIn`). Mutually exclusive with `runAt`. */
+  runIn?: number
   /** Per-job override of the worker's `maxAttempts` default. */
   maxAttempts?: number
   /** Explicit job id. Default: a random UUID. */
@@ -40,6 +44,8 @@ export interface WorkerOptions {
   lockMs?: number
   /** Backstop `BRPOP` re-poll timeout (seconds). Default: 5. */
   safetyTimeout?: number
+  /** Max due delayed jobs promoted per `reserve` call; drains larger backlogs in chunks. Default: 500. */
+  promoteBatchSize?: number
   /** Default `maxAttempts` for jobs of this workflow. Default: 1. */
   maxAttempts?: number
   /** Called with a thrown handler error (best-effort). Defaults to `Settings.logger`. */

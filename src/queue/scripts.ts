@@ -57,13 +57,41 @@ end
 `
 
 /**
- * Add an immediate job. `EXISTS` guard on the job hash (in-script, no TOCTOU) →
- * `JobAlreadyExists`. Stamps the FIFO tiebreak counter, writes the packed score into the
- * group ZSET, re-evaluates `ready`, and kicks the wake list.
+ * Move a job into the waiting structure: stamp the FIFO tiebreak counter (`INCR pc` at
+ * promotion time, §6), pack the priority score, `ZADD` the group ZSET, and re-evaluate
+ * `ready`. The single source of truth for "a job becomes runnable" — shared (included, not
+ * copied) by `enqueue`'s immediate path and `reserve`'s delayed-promotion, so the ready
+ * logic can never drift between them.
+ */
+const ADD_WAITING = `
+local function addWaiting(wf, jobKey, jobId, groupId, priority, groupCap)
+  local counter = redis.call("INCR", wf .. ":pc") % 4294967296
+  local score = (${PMAX} - priority) * 4294967296 + counter
+  redis.call("HSET", jobKey, "state", "waiting")
+  local groupJobs = wf .. ":g:" .. groupId .. ":jobs"
+  local groupActive = wf .. ":g:" .. groupId .. ":active"
+  redis.call("ZADD", groupJobs, score, jobId)
+  redis.call("SADD", wf .. ":groups", groupId)
+  if redis.call("SCARD", groupActive) < groupCap then
+    local head = redis.call("ZRANGE", groupJobs, 0, 0, "WITHSCORES")
+    redis.call("ZADD", wf .. ":ready", head[2], groupId)
+  end
+end
+`
+
+/**
+ * Add a job. `EXISTS` guard on the job hash (in-script, no TOCTOU) → `JobAlreadyExists`.
+ * The effective `runAt` is resolved against Redis `TIME` (§2): `runIn` → `now + runIn`,
+ * absolute `runAt` verbatim. `runAt > now` lands in the `delayed` ZSET scored by `runAt`;
+ * otherwise (`runAt <= now`, or neither given) the job goes straight into waiting via the
+ * shared `addWaiting`. Either way it `LPUSH`es `wake` once so an idle worker re-computes to
+ * the nearer due time.
  *
- * ARGV: prefix, wfId, nsId, jobId, data, groupId, priority, maxAttempts, groupCap
+ * ARGV: prefix, wfId, nsId, jobId, data, groupId, priority, maxAttempts, groupCap, runAt, runIn
+ * (`runAt`/`runIn` use `-1` as the "unset" sentinel; they are mutually exclusive.)
  */
 const ENQUEUE = `
+${ADD_WAITING}
 local prefix = ARGV[1]
 local wfId = ARGV[2]
 local nsId = ARGV[3]
@@ -73,6 +101,8 @@ local groupId = ARGV[6]
 local priority = tonumber(ARGV[7])
 local maxAttempts = ARGV[8]
 local groupCap = tonumber(ARGV[9])
+local runAtArg = tonumber(ARGV[10])
+local runInArg = tonumber(ARGV[11])
 
 local wf = prefix .. ":" .. wfId
 local jobKey = wf .. ":j:" .. jobId
@@ -81,22 +111,26 @@ if redis.call("EXISTS", jobKey) == 1 then
   return redis.error_reply("JobAlreadyExists")
 end
 ${NOW}
-local counter = redis.call("INCR", wf .. ":pc") % 4294967296
-local score = (${PMAX} - priority) * 4294967296 + counter
 
-redis.call("HSET", jobKey,
-  "data", data, "state", "waiting", "attempts", 0,
-  "maxAttempts", maxAttempts, "stalledCount", 0, "priority", priority,
-  "groupId", groupId, "nsId", nsId, "createdAt", now)
+local runAt = 0
+if runInArg >= 0 then
+  runAt = now + runInArg
+elseif runAtArg >= 0 then
+  runAt = runAtArg
+end
 
-local groupJobs = wf .. ":g:" .. groupId .. ":jobs"
-local groupActive = wf .. ":g:" .. groupId .. ":active"
-redis.call("ZADD", groupJobs, score, jobId)
-redis.call("SADD", wf .. ":groups", groupId)
-
-if redis.call("SCARD", groupActive) < groupCap then
-  local head = redis.call("ZRANGE", groupJobs, 0, 0, "WITHSCORES")
-  redis.call("ZADD", wf .. ":ready", head[2], groupId)
+if runAt > now then
+  redis.call("HSET", jobKey,
+    "data", data, "state", "delayed", "attempts", 0,
+    "maxAttempts", maxAttempts, "stalledCount", 0, "priority", priority,
+    "groupId", groupId, "nsId", nsId, "createdAt", now, "runAt", runAt)
+  redis.call("ZADD", wf .. ":delayed", runAt, jobId)
+else
+  redis.call("HSET", jobKey,
+    "data", data, "attempts", 0,
+    "maxAttempts", maxAttempts, "stalledCount", 0, "priority", priority,
+    "groupId", groupId, "nsId", nsId, "createdAt", now)
+  addWaiting(wf, jobKey, jobId, groupId, priority, groupCap)
 end
 
 local wake = wf .. ":wake"
@@ -106,14 +140,23 @@ return 1
 `
 
 /**
- * The hot path (ported from `prototypes/reserve.lua`). O(1) top-gates → pop head group of
+ * The hot path (ported from `prototypes/reserve.lua`). Delayed-job promotion is embedded at
+ * the top (§7): due jobs (`ZRANGEBYSCORE delayed -inf now`, batch-capped) are `ZREM`'d and
+ * moved into waiting via the shared `addWaiting` — atomic under Lua's single thread ⇒
+ * exactly-once across concurrent workers, and promoting in `runAt` order stamps `pc`
+ * ascending-by-due-time (FIFO-by-ready-time, §6). Then O(1) top-gates → pop head group of
  * `ready` → `ZPOPMIN` its head job → all-or-nothing claim into the three active structures
- * + lock + `state=active` → ready-set maintenance. Returns `{"maxed"}`, `{"empty"}`, or
- * `{"job", jobId, groupId, data, attempts, priority}`.
+ * + lock + `state=active` → ready-set maintenance.
  *
- * ARGV: prefix, wfId, nsId, nsCap, wfCap, groupCap, lockMs, token
+ * Returns `{"maxed"}`, `{"empty", msToNext}`, or
+ * `{"job", jobId, groupId, data, attempts, priority}`. `msToNext` is the ms until the next
+ * due delayed job (`-1` if none, `0` if due work remains past the promote cap) — an idle
+ * worker uses it as its `BRPOP wake` timeout, so the block itself is the delayed-job timer.
+ *
+ * ARGV: prefix, wfId, nsId, nsCap, wfCap, groupCap, lockMs, token, promoteCap
  */
 const RESERVE = `
+${ADD_WAITING}
 local prefix = ARGV[1]
 local wfId = ARGV[2]
 local nsId = ARGV[3]
@@ -122,17 +165,40 @@ local wfCap = tonumber(ARGV[5])
 local groupCap = tonumber(ARGV[6])
 local lockMs = tonumber(ARGV[7])
 local token = ARGV[8]
+local promoteCap = tonumber(ARGV[9])
 
 local wf = prefix .. ":" .. wfId
 local nsActive = prefix .. ":ns:" .. nsId .. ":active"
 local wfActive = wf .. ":active"
 local readyKey = wf .. ":ready"
+local delayedKey = wf .. ":delayed"
+${NOW}
+
+-- Promote due delayed jobs (batch-capped). ZRANGEBYSCORE ascending ⇒ promote in runAt order.
+local due = redis.call("ZRANGEBYSCORE", delayedKey, "-inf", now, "LIMIT", 0, promoteCap)
+for i = 1, #due do
+  local dj = due[i]
+  redis.call("ZREM", delayedKey, dj)
+  local djKey = wf .. ":j:" .. dj
+  local meta = redis.call("HMGET", djKey, "groupId", "priority")
+  addWaiting(wf, djKey, dj, meta[1], tonumber(meta[2]), groupCap)
+end
+
+-- ms until the next delayed job is due (for an idle worker BRPOP timeout). Returns 0 when
+-- work is already due but was left behind by the promote cap, so the worker re-reserves now.
+local function msToNext()
+  local next = redis.call("ZRANGE", delayedKey, 0, 0, "WITHSCORES")
+  if #next == 0 then return -1 end
+  local d = tonumber(next[2]) - now
+  if d < 0 then return 0 end
+  return d
+end
 
 if redis.call("SCARD", nsActive) >= nsCap then return { "maxed" } end
 if redis.call("ZCARD", wfActive) >= wfCap then return { "maxed" } end
 
 local head = redis.call("ZRANGE", readyKey, 0, 0)
-if #head == 0 then return { "empty" } end
+if #head == 0 then return { "empty", msToNext() } end
 local gid = head[1]
 
 local groupJobs = wf .. ":g:" .. gid .. ":jobs"
@@ -141,12 +207,11 @@ local groupActive = wf .. ":g:" .. gid .. ":active"
 local popped = redis.call("ZPOPMIN", groupJobs)
 if #popped == 0 then
   redis.call("ZREM", readyKey, gid)
-  return { "empty" }
+  return { "empty", msToNext() }
 end
 local jobId = popped[1]
 
 local jobKey = wf .. ":j:" .. jobId
-${NOW}
 local deadline = now + lockMs
 
 redis.call("ZADD", wfActive, deadline, jobId)
@@ -203,7 +268,7 @@ return 1
 
 export interface QueueCommands {
   enqueue: (...args: (string | number)[]) => Promise<number>
-  reserve: (...args: (string | number)[]) => Promise<string[]>
+  reserve: (...args: (string | number)[]) => Promise<(string | number)[]>
   complete: (...args: (string | number)[]) => Promise<number>
 }
 
