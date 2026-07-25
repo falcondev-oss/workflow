@@ -9,6 +9,8 @@ export type {
   NamespaceOptions,
   QueueOptions,
   ReservedJob,
+  ScheduleInfo,
+  ScheduleOptions,
   WaitOptions,
   WorkerOptions,
 } from './types'

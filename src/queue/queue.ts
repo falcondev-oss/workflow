@@ -1,8 +1,16 @@
 import type { Namespace } from './namespace'
 import type { QueueRedis } from './scripts'
-import type { AddOptions, QueueOptions, WaitOptions, WorkerOptions } from './types'
+import type {
+  AddOptions,
+  QueueOptions,
+  ScheduleInfo,
+  ScheduleOptions,
+  WaitOptions,
+  WorkerOptions,
+} from './types'
 import { randomUUID } from 'node:crypto'
 import { JobAlreadyExistsError, ResultExpiredError, TimeoutError } from './errors'
+import { localTimeZone, nextRunMs } from './schedule'
 import { PMAX, UNLIMITED } from './scripts'
 import { Worker } from './worker'
 
@@ -39,10 +47,8 @@ export class Queue {
     const id = opts?.jobId ?? randomUUID()
     const groupId = opts?.groupId ?? randomUUID()
     const priority = opts?.priority ?? 0
-    // Guard the range that keeps the packed score exact in a ZSET double (§6). An
-    // out-of-range or fractional priority would corrupt score packing / ordering.
-    if (!Number.isInteger(priority) || priority < 0 || priority > PMAX)
-      throw new RangeError(`priority must be an integer in 0…${PMAX}, got ${priority}`)
+    // An out-of-range or fractional priority would corrupt score packing / ordering (§6).
+    this.validatePriority(priority)
     if (opts?.runAt !== undefined && opts?.runIn !== undefined)
       throw new Error('`runAt` and `runIn` are mutually exclusive')
     try {
@@ -134,6 +140,77 @@ export class Queue {
       throw error
     }
     return record.value ?? ''
+  }
+
+  /**
+   * Register (or idempotently replace) a recurring cron schedule keyed by `(wfId, scheduleId)`.
+   * Structurally cannot duplicate: the `schedule:<id>` hash and the single `schedules:due` member
+   * are addressed by `scheduleId`, so upserting the same id twice overwrites in place — one hash,
+   * one due entry — with no `removeRepeatingJob` dance. The timezone is captured from the queuer's
+   * local IANA zone unless overridden. `lastJobId`/`lastFireAt` are preserved across upserts.
+   */
+  async upsertSchedule(scheduleId: string, opts: ScheduleOptions): Promise<void> {
+    const tz = opts.tz ?? localTimeZone()
+    const priority = opts.priority ?? 0
+    this.validatePriority(priority)
+    const next = nextRunMs(opts.pattern, tz)
+    if (next === null) throw new Error(`cron pattern has no next occurrence: ${opts.pattern}`)
+    const scheduleKey = `${this.prefix}:${this.id}:schedule:${scheduleId}`
+    const dueKey = `${this.prefix}:${this.id}:schedules:due`
+    await this.redis
+      .multi()
+      .hset(scheduleKey, {
+        pattern: opts.pattern,
+        tz,
+        data: opts.data,
+        priority,
+        groupId: opts.groupId ?? scheduleId,
+        skipIfRunning: (opts.skipIfRunning ?? true) ? '1' : '0',
+        active: '1',
+      })
+      .zadd(dueKey, next, scheduleId)
+      .exec()
+  }
+
+  /** Remove a schedule by id: drops its due entry and its record hash. Idempotent. */
+  async removeSchedule(scheduleId: string): Promise<void> {
+    const scheduleKey = `${this.prefix}:${this.id}:schedule:${scheduleId}`
+    const dueKey = `${this.prefix}:${this.id}:schedules:due`
+    await this.redis.multi().del(scheduleKey).zrem(dueKey, scheduleId).exec()
+  }
+
+  /** List registered schedules with their next-fire time and last-fire bookkeeping. */
+  async getSchedules(): Promise<ScheduleInfo[]> {
+    const dueKey = `${this.prefix}:${this.id}:schedules:due`
+    const entries = await this.redis.zrange(dueKey, 0, -1, 'WITHSCORES')
+    const schedules: ScheduleInfo[] = []
+    for (let i = 0; i < entries.length; i += 2) {
+      const scheduleId = entries[i]!
+      const nextRun = Number(entries[i + 1])
+      const scheduleKey = `${this.prefix}:${this.id}:schedule:${scheduleId}`
+      const [pattern, tz, lastFireAt, lastJobId] = await this.redis.hmget(
+        scheduleKey,
+        'pattern',
+        'tz',
+        'lastFireAt',
+        'lastJobId',
+      )
+      schedules.push({
+        scheduleId,
+        pattern: pattern ?? '',
+        tz: tz ?? '',
+        nextRun,
+        lastFireAt: lastFireAt ? Number(lastFireAt) : null,
+        lastJobId: lastJobId ?? null,
+      })
+    }
+    return schedules
+  }
+
+  /** Guard the range that keeps the packed score exact in a ZSET double (§6). */
+  private validatePriority(priority: number): void {
+    if (!Number.isInteger(priority) || priority < 0 || priority > PMAX)
+      throw new RangeError(`priority must be an integer in 0…${PMAX}, got ${priority}`)
   }
 
   /** Releases queue-owned handles: closes workers and unsubscribes any `wait()` channels. */

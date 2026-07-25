@@ -1161,3 +1161,205 @@ test('abort-on-lost-claim: a worker whose token is stolen aborts ctx.signal and 
     await ns.close()
   }
 })
+
+// ---------------------------------------------------------------------------
+// Cron scheduling (ticket 09)
+// ---------------------------------------------------------------------------
+// No fake clock: firing is driven deterministically by BACK-DATING the `schedules:due`
+// score so a schedule is immediately due, never by waiting for a real cron tick.
+
+test('upsertSchedule is idempotent: upserting the same id twice leaves one due entry + one hash', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+
+  try {
+    await queue.upsertSchedule('nightly', { pattern: '* * * * *', data: 'a', tz: 'UTC' })
+    await queue.upsertSchedule('nightly', { pattern: '*/5 * * * *', data: 'b', tz: 'UTC' })
+
+    // Keyed by (wfId, scheduleId): the second upsert replaces in place — no duplication.
+    expect(await redis.zcard(`${prefix}:${wfId}:schedules:due`)).toBe(1)
+    const scheduleKeys = await redis.keys(`${prefix}:${wfId}:schedule:*`)
+    expect(scheduleKeys).toHaveLength(1)
+
+    const schedules = await queue.getSchedules()
+    expect(schedules).toHaveLength(1)
+    expect(schedules[0]!.scheduleId).toBe('nightly')
+    expect(schedules[0]!.pattern).toBe('*/5 * * * *') // replaced, not duplicated
+    expect(schedules[0]!.tz).toBe('UTC')
+    expect(schedules[0]!.nextRun).toBeGreaterThan(Date.now())
+    expect(schedules[0]!.lastFireAt).toBeNull()
+    expect(schedules[0]!.lastJobId).toBeNull()
+  } finally {
+    await ns.close()
+  }
+})
+
+test('cron end-to-end: a worker tick fires a due schedule into a running occurrence', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const dueKey = `${prefix}:${wfId}:schedules:due`
+
+  const runs = vi.fn()
+  const seenGroups = new Set<string>()
+
+  try {
+    await queue.upsertSchedule('sched', { pattern: '* * * * *', data: 'tick', tz: 'UTC' })
+    // Back-date the due score so the schedule is immediately due on the worker's next tick.
+    await redis.zadd(dueKey, Date.now() - 60_000, 'sched')
+
+    queue.worker(
+      (job) => {
+        seenGroups.add(job.groupId)
+        runs(job.data)
+        return 'ok'
+      },
+      { safetyTimeout: 0.1 },
+    )
+
+    await vi.waitFor(() => {
+      expect(runs).toHaveBeenCalledTimes(1)
+    })
+    await sleep(200)
+    expect(runs).toHaveBeenCalledTimes(1) // the wake-loop tick fired the occurrence once
+    expect(runs).toHaveBeenCalledWith('tick')
+    expect(seenGroups).toEqual(new Set(['sched'])) // default groupId = scheduleId
+
+    // Re-armed forward to the next occurrence — a single future due entry.
+    expect(await redis.zcard(dueKey)).toBe(1)
+    expect(Number(await redis.zscore(dueKey, 'sched'))).toBeGreaterThan(Date.now())
+  } finally {
+    await ns.close()
+  }
+})
+
+test('cron fires exactly once under concurrent fire (CAS on score): one fired, one stale', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const nsId = randomUUID()
+  const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const dueKey = `${prefix}:${wfId}:schedules:due`
+  const groupJobs = `${prefix}:${wfId}:g:sched:jobs`
+
+  try {
+    await queue.upsertSchedule('sched', { pattern: '* * * * *', data: 'tick', tz: 'UTC' })
+    // Two workers that both read the SAME due entry compute the same `expectedScore` and fire
+    // concurrently. Redis serializes the two atomic scripts: the first CAS wins and advances the
+    // score, so the second finds `ZSCORE != expectedScore` and no-ops ⇒ exactly-once, no lock.
+    const expected = Date.now() - 60_000
+    await redis.zadd(dueKey, expected, 'sched')
+    const next = Date.now() + 60_000
+
+    const [a, b] = await Promise.all([
+      ns.redis.fireSchedule(prefix, wfId, nsId, 'sched', expected, next, 'occ-a', 1, 1),
+      ns.redis.fireSchedule(prefix, wfId, nsId, 'sched', expected, next, 'occ-b', 1, 1),
+    ])
+
+    // Exactly one enqueued the occurrence; the other saw the re-armed score and bailed stale.
+    expect([a[0], b[0]].sort()).toEqual(['fired', 'stale'])
+    expect(await redis.zcard(groupJobs)).toBe(1) // a single occurrence waiting, never two
+    // Re-armed exactly once, forward to the next occurrence.
+    expect(await redis.zcard(dueKey)).toBe(1)
+    expect(Number(await redis.zscore(dueKey, 'sched'))).toBe(next)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('a long-overdue cron fires once then jumps forward (missed-run = skip, no stampede)', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const dueKey = `${prefix}:${wfId}:schedules:due`
+
+  const runs = vi.fn()
+  try {
+    await queue.upsertSchedule('overdue', { pattern: '* * * * *', data: 'x', tz: 'UTC' })
+    // A whole hour of missed minute-occurrences — a backlog that must NOT stampede.
+    await redis.zadd(dueKey, Date.now() - 3_600_000, 'overdue')
+
+    queue.worker(
+      () => {
+        runs()
+        return 'ok'
+      },
+      { safetyTimeout: 0.1 },
+    )
+
+    await vi.waitFor(() => {
+      expect(runs).toHaveBeenCalledTimes(1)
+    })
+    await sleep(200)
+    // `nextRun(now)` collapses the backlog: one fire, not ~60, and re-armed into the future.
+    expect(runs).toHaveBeenCalledTimes(1)
+    expect(Number(await redis.zscore(dueKey, 'overdue'))).toBeGreaterThan(Date.now())
+  } finally {
+    await ns.close()
+  }
+})
+
+test('skip-if-running: an occurrence is not enqueued while lastJobId is non-terminal, but re-arms', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const nsId = randomUUID()
+  const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const dueKey = `${prefix}:${wfId}:schedules:due`
+  const scheduleKey = `${prefix}:${wfId}:schedule:sched`
+  const groupJobs = `${prefix}:${wfId}:g:sched:jobs`
+
+  try {
+    await queue.upsertSchedule('sched', { pattern: '* * * * *', data: 'x', tz: 'UTC' })
+    // Pretend the previous occurrence is still in flight (a non-terminal active job hash).
+    await redis.hset(scheduleKey, 'lastJobId', 'prev-job')
+    await redis.hset(`${prefix}:${wfId}:j:prev-job`, 'state', 'active')
+
+    const past = Date.now() - 60_000
+    await redis.zadd(dueKey, past, 'sched')
+    const nextScore = Date.now() + 60_000
+
+    // Direct CAS call (deterministic, no worker): the previous job is running ⇒ skip enqueue,
+    // but the score still advances so the schedule stays armed.
+    const skipped = await ns.redis.fireSchedule(
+      prefix,
+      wfId,
+      nsId,
+      'sched',
+      past,
+      nextScore,
+      'occ-1',
+      1,
+      1,
+    )
+    expect(skipped[0]).toBe('skipped')
+    expect(Number(await redis.zscore(dueKey, 'sched'))).toBe(nextScore) // re-armed anyway
+    expect(await redis.hget(scheduleKey, 'lastJobId')).toBe('prev-job') // unchanged, nothing enqueued
+    expect(await redis.zcard(groupJobs)).toBe(0) // no occurrence waiting
+
+    // Once the previous job is terminal (completed ⇒ its hash is DEL'd), the next fire enqueues.
+    await redis.del(`${prefix}:${wfId}:j:prev-job`)
+    const nextScore2 = nextScore + 60_000
+    const fired = await ns.redis.fireSchedule(
+      prefix,
+      wfId,
+      nsId,
+      'sched',
+      nextScore,
+      nextScore2,
+      'occ-2',
+      1,
+      1,
+    )
+    expect(fired[0]).toBe('fired')
+    expect(fired[1]).toBe('occ-2')
+    expect(await redis.hget(scheduleKey, 'lastJobId')).toBe('occ-2')
+    expect(await redis.zscore(groupJobs, 'occ-2')).not.toBeNull() // enqueued into its group
+  } finally {
+    await ns.close()
+  }
+})

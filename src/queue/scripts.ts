@@ -121,18 +121,39 @@ end
 `
 
 /**
+ * Write a fresh job hash and drop it straight into waiting via the shared `addWaiting`, then
+ * kick `wake`. The single source of truth for "enqueue an immediately-runnable job" — shared
+ * (included, not copied) by `enqueue`'s immediate branch and `fireSchedule`'s occurrence, so a
+ * cron occurrence is enqueued through the *exact* same path as a plain `add`, never a parallel
+ * one. Assumes `addWaiting` is already in scope.
+ */
+const ENQUEUE_NOW = `
+local function enqueueNow(prefix, wf, jobKey, jobId, data, groupId, priority, maxAttempts, nsId, groupCap, now)
+  redis.call("HSET", jobKey,
+    "data", data, "attempts", 0,
+    "maxAttempts", maxAttempts, "stalledCount", 0, "priority", priority,
+    "groupId", groupId, "nsId", nsId, "createdAt", now)
+  addWaiting(wf, jobKey, jobId, groupId, priority, groupCap)
+  local wake = wf .. ":wake"
+  redis.call("LPUSH", wake, "1")
+  redis.call("LTRIM", wake, 0, 0)
+end
+`
+
+/**
  * Add a job. `EXISTS` guard on the job hash (in-script, no TOCTOU) → `JobAlreadyExists`.
  * The effective `runAt` is resolved against Redis `TIME` (§2): `runIn` → `now + runIn`,
- * absolute `runAt` verbatim. `runAt > now` lands in the `delayed` ZSET scored by `runAt`;
- * otherwise (`runAt <= now`, or neither given) the job goes straight into waiting via the
- * shared `addWaiting`. Either way it `LPUSH`es `wake` once so an idle worker re-computes to
- * the nearer due time.
+ * absolute `runAt` verbatim. `runAt > now` lands in the `delayed` ZSET scored by `runAt`
+ * (kicking `wake` so an idle worker re-computes to the nearer due time); otherwise
+ * (`runAt <= now`, or neither given) the job goes straight into waiting via the shared
+ * `enqueueNow`.
  *
  * ARGV: prefix, wfId, nsId, jobId, data, groupId, priority, maxAttempts, groupCap, runAt, runIn
  * (`runAt`/`runIn` use `-1` as the "unset" sentinel; they are mutually exclusive.)
  */
 const ENQUEUE = `
 ${ADD_WAITING}
+${ENQUEUE_NOW}
 local prefix = ARGV[1]
 local wfId = ARGV[2]
 local nsId = ARGV[3]
@@ -166,17 +187,12 @@ if runAt > now then
     "maxAttempts", maxAttempts, "stalledCount", 0, "priority", priority,
     "groupId", groupId, "nsId", nsId, "createdAt", now, "runAt", runAt)
   redis.call("ZADD", wf .. ":delayed", runAt, jobId)
+  local wake = wf .. ":wake"
+  redis.call("LPUSH", wake, "1")
+  redis.call("LTRIM", wake, 0, 0)
 else
-  redis.call("HSET", jobKey,
-    "data", data, "attempts", 0,
-    "maxAttempts", maxAttempts, "stalledCount", 0, "priority", priority,
-    "groupId", groupId, "nsId", nsId, "createdAt", now)
-  addWaiting(wf, jobKey, jobId, groupId, priority, groupCap)
+  enqueueNow(prefix, wf, jobKey, jobId, data, groupId, priority, maxAttempts, nsId, groupCap, now)
 end
-
-local wake = wf .. ":wake"
-redis.call("LPUSH", wake, "1")
-redis.call("LTRIM", wake, 0, 0)
 return 1
 `
 
@@ -458,6 +474,69 @@ end
 return recovered
 `
 
+/**
+ * Cron firing = "JS computes next, Lua commits via CAS-on-score" (§8). The JS wake-loop tick
+ * reads a due schedule, computes `nextScore = croner.nextRun(now)`, and calls this with the
+ * score it saw (`expectedScore`). The CAS bails unless `ZSCORE due scheduleId == expectedScore`,
+ * so a racing worker that already fired (and advanced the score) is a no-op ⇒ **exactly-once
+ * across N workers with no distributed lock**. Because the next score is computed in JS *before*
+ * the call, a crash before it is a no-op retry and a crash after is fully done — never a
+ * half-fired state.
+ *
+ * On a winning CAS: re-arm `ZADD due nextScore` (atomic with the enqueue). Skip-if-running (§8):
+ * if enabled and the record's `lastJobId` is still non-terminal (its hash exists and is not
+ * `failed` — a completed occurrence's hash is `DEL`'d, a failed one carries `state=failed`),
+ * advance the score but do NOT enqueue. Otherwise enqueue the occurrence via the shared
+ * `enqueueNow` (the exact `add` path, never a parallel one) and stamp `lastJobId`/`lastFireAt`.
+ * Missed-run collapses to one fire because the JS tick passed `nextRun(now)`, not the overdue
+ * time.
+ *
+ * Returns `{"stale"}`, `{"skipped"}`, or `{"fired", jobId}`.
+ * ARGV: prefix, wfId, nsId, scheduleId, expectedScore, nextScore, jobId, maxAttempts, groupCap
+ */
+const FIRE_SCHEDULE = `
+${ADD_WAITING}
+${ENQUEUE_NOW}
+local prefix = ARGV[1]
+local wfId = ARGV[2]
+local nsId = ARGV[3]
+local scheduleId = ARGV[4]
+local expectedScore = ARGV[5]
+local nextScore = tonumber(ARGV[6])
+local jobId = ARGV[7]
+local maxAttempts = ARGV[8]
+local groupCap = tonumber(ARGV[9])
+
+local wf = prefix .. ":" .. wfId
+local dueKey = wf .. ":schedules:due"
+local scheduleKey = wf .. ":schedule:" .. scheduleId
+
+local cur = redis.call("ZSCORE", dueKey, scheduleId)
+if cur == false or cur ~= expectedScore then
+  return { "stale" }
+end
+
+redis.call("ZADD", dueKey, nextScore, scheduleId)
+
+local vals = redis.call("HMGET", scheduleKey, "data", "priority", "groupId", "skipIfRunning", "lastJobId")
+local data = vals[1]
+local priority = tonumber(vals[2])
+local groupId = vals[3]
+local skipIfRunning = vals[4]
+local lastJobId = vals[5]
+
+if skipIfRunning == "1" and lastJobId and lastJobId ~= "" then
+  local lastKey = wf .. ":j:" .. lastJobId
+  if redis.call("EXISTS", lastKey) == 1 and redis.call("HGET", lastKey, "state") ~= "failed" then
+    return { "skipped" }
+  end
+end
+${NOW}
+enqueueNow(prefix, wf, wf .. ":j:" .. jobId, jobId, data, groupId, priority, maxAttempts, nsId, groupCap, now)
+redis.call("HSET", scheduleKey, "lastJobId", jobId, "lastFireAt", now)
+return { "fired", jobId }
+`
+
 export interface QueueCommands {
   enqueue: (...args: (string | number)[]) => Promise<number>
   reserve: (...args: (string | number)[]) => Promise<(string | number)[]>
@@ -466,6 +545,7 @@ export interface QueueCommands {
   moveToFailed: (...args: (string | number)[]) => Promise<number>
   heartbeat: (...args: (string | number)[]) => Promise<number>
   recoverStalled: (...args: (string | number)[]) => Promise<number>
+  fireSchedule: (...args: (string | number)[]) => Promise<(string | number)[]>
 }
 
 /** A redis connection with the queue's custom commands registered. */
@@ -483,6 +563,7 @@ export function registerScripts(redis: Redis): QueueRedis {
     redis.defineCommand('moveToFailed', { numberOfKeys: 0, lua: MOVE_TO_FAILED })
     redis.defineCommand('heartbeat', { numberOfKeys: 0, lua: HEARTBEAT })
     redis.defineCommand('recoverStalled', { numberOfKeys: 0, lua: RECOVER_STALLED })
+    redis.defineCommand('fireSchedule', { numberOfKeys: 0, lua: FIRE_SCHEDULE })
     registered.add(redis)
   }
   return redis as QueueRedis

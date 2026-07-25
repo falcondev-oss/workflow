@@ -5,6 +5,7 @@ import type { JobContext, ReservedJob, WorkerOptions } from './types'
 import { randomUUID } from 'node:crypto'
 import { Settings } from '../settings'
 import { expBackoff } from './backoff'
+import { localTimeZone, nextRunMs } from './schedule'
 
 export type WorkerHandler = (job: ReservedJob, ctx: JobContext) => Promise<string> | string
 
@@ -40,6 +41,7 @@ export class Worker {
   private readonly redis: QueueRedis
   private readonly wfWake: string
   private readonly nsWake: string
+  private readonly scheduleDueKey: string
 
   private inFlight = 0
   private closing = false
@@ -68,6 +70,7 @@ export class Worker {
     this.blockingRedis = queue.redis.duplicate()
     this.wfWake = `${queue.prefix}:${queue.id}:wake`
     this.nsWake = `${queue.prefix}:ns:${queue.ns.id}:wake`
+    this.scheduleDueKey = `${queue.prefix}:${queue.id}:schedules:due`
 
     this.loopPromise = this.loop()
   }
@@ -75,6 +78,10 @@ export class Worker {
   private async loop(): Promise<void> {
     if (this.blockingRedis.status === 'wait') await this.blockingRedis.connect()
     while (!this.closing) {
+      // Fire any due cron occurrences into waiting before draining — no separate poller; the
+      // tick folds into this same wake loop (§8). Firing kicks `wake`, so the drain below picks
+      // the occurrence up in this iteration.
+      await this.tickSchedules()
       // Drain: reserve until a slot is unavailable or there is no runnable work. `msToNext`
       // is the reserve-reported ms until the next delayed job is due, carried out to the block.
       let msToNext = -1
@@ -90,15 +97,66 @@ export class Worker {
       if (this.closing) break
       // Due work remained past the promote cap — re-reserve at once to drain the next chunk.
       if (msToNext === 0) continue
-      // Block until woken (new work / freed slot / enqueued delay), the next delayed job
-      // comes due, or the safety re-poll fires — whichever is sooner. The block is the timer.
+      // Fold the nearest due schedule into the wake timeout so an idle worker wakes to fire it.
+      const msSchedule = await this.msToNextSchedule()
+      if (msSchedule === 0) continue // a schedule is already due — loop back to fire it now
+      // Block until woken (new work / freed slot / enqueued delay), the next delayed job or
+      // schedule comes due, or the safety re-poll fires — whichever is sooner. The block is the
+      // timer for both delayed jobs and schedules.
+      const nearest = [msToNext, msSchedule].filter((m) => m >= 0)
       const timeout =
-        msToNext < 0 ? this.safetyTimeout : Math.min(msToNext / 1000, this.safetyTimeout)
+        nearest.length === 0
+          ? this.safetyTimeout
+          : Math.min(Math.min(...nearest) / 1000, this.safetyTimeout)
       await this.blockingRedis.brpop(this.wfWake, this.nsWake, timeout)
       // Wake-loop re-poll is the idle-worker stalled-recovery trigger (§9) — no dedicated
       // poller. The scan is throttled in Lua, so firing every re-poll is cheap.
       if (!this.closing) void this.recoverStalled()
     }
+  }
+
+  /**
+   * The thin JS cron tick (§8), folded into the wake loop — no poller. Reads due schedules
+   * (`ZRANGEBYSCORE schedules:due -inf now`), computes each one's `nextRun(now)` via Croner, and
+   * calls the `fireSchedule` CAS script with the score it saw. CAS-on-score = exactly-once across
+   * N workers; computing next in JS *before* the call = crash-safe. A backlog after downtime
+   * collapses to one fire because `nextRun(now)` jumps forward. Errors are best-effort logged.
+   */
+  private async tickSchedules(): Promise<void> {
+    try {
+      const now = Date.now()
+      const due = await this.redis.zrangebyscore(this.scheduleDueKey, '-inf', now, 'WITHSCORES')
+      for (let i = 0; i < due.length && !this.closing; i += 2) {
+        const scheduleId = due[i]!
+        const expectedScore = due[i + 1]!
+        const scheduleKey = `${this.queue.prefix}:${this.queue.id}:schedule:${scheduleId}`
+        const [pattern, tz] = await this.redis.hmget(scheduleKey, 'pattern', 'tz')
+        if (!pattern) continue // removed concurrently
+        const next = nextRunMs(pattern, tz ?? localTimeZone(), new Date())
+        if (next === null) continue // no future occurrence
+        await this.redis.fireSchedule(
+          this.queue.prefix,
+          this.queue.id,
+          this.queue.ns.id,
+          scheduleId,
+          expectedScore,
+          next,
+          randomUUID(),
+          1,
+          this.queue.groupConcurrency,
+        )
+      }
+    } catch (err) {
+      this.onError(err)
+    }
+  }
+
+  /** Ms until the nearest schedule is due (`-1` none, `0` already due). Folds into the block. */
+  private async msToNextSchedule(): Promise<number> {
+    const next = await this.redis.zrange(this.scheduleDueKey, 0, 0, 'WITHSCORES')
+    if (next.length === 0) return -1
+    const d = Number(next[1]) - Date.now()
+    return d < 0 ? 0 : d
   }
 
   /** Fire the throttled stalled-recovery scan (a no-op in Redis if another scan is in-flight). */

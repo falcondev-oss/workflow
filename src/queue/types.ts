@@ -60,6 +60,33 @@ export interface WorkerOptions {
   onError?: (error: unknown) => void
 }
 
+export interface ScheduleOptions {
+  /** Cron pattern (Croner syntax). No `every` interval — pattern only. */
+  pattern: string
+  /** Opaque data string enqueued for every occurrence. */
+  data: string
+  /** IANA timezone. Default: the queuer's local zone captured at register time. */
+  tz?: string
+  /** Numeric priority for occurrences, 0…2^21-1. Default: 0. */
+  priority?: number
+  /** Group id for occurrences. Default: the `scheduleId` (serializes occurrences via group cap). */
+  groupId?: string
+  /** Skip an occurrence while the previous one is still running. Default: true. */
+  skipIfRunning?: boolean
+}
+
+export interface ScheduleInfo {
+  scheduleId: string
+  pattern: string
+  tz: string
+  /** Next-fire epoch ms (the `schedules:due` score). */
+  nextRun: number
+  /** Epoch ms the last occurrence was enqueued; `null` if it has never fired. */
+  lastFireAt: number | null
+  /** Job id of the last enqueued occurrence; `null` if it has never fired. */
+  lastJobId: string | null
+}
+
 export interface WaitOptions {
   /** Reject with `TimeoutError` after this many ms. No default (waits forever). */
   timeoutMs?: number
