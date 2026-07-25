@@ -56,8 +56,10 @@ export interface WorkerOptions {
   backoff?: (attempt: number) => number
   /** Max retained failed jobs (count-trimmed by `finishedOn`). Default: 100. */
   keepFailed?: number
-  /** Called with a worker-internal error (best-effort). Defaults to `Settings.logger`. */
+  /** Called with a worker-internal/unexpected error (best-effort). Defaults to `Settings.logger`. */
   onError?: (error: unknown) => void
+  /** Called with the job + error each time a handler throws and the job fails (best-effort). Defaults to `Settings.logger`. */
+  onFailed?: (job: ReservedJob, error: unknown) => void
 }
 
 export interface ScheduleOptions {
@@ -85,6 +87,16 @@ export interface ScheduleInfo {
   lastFireAt: number | null
   /** Job id of the last enqueued occurrence; `null` if it has never fired. */
   lastJobId: string | null
+}
+
+/** Pull-based queue-depth gauges (§11), read on demand — never maintained by counters. */
+export interface QueueMetrics {
+  /** Jobs currently claimed and running (`ZCARD wf:active`). */
+  active: number
+  /** Jobs waiting to run, summed over the active-groups set (`Σ ZCARD wf:g:*:jobs`). */
+  waiting: number
+  /** Jobs parked for a future `runAt` (`ZCARD wf:delayed`). */
+  delayed: number
 }
 
 export interface WaitOptions {

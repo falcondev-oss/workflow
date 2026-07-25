@@ -1,4 +1,5 @@
 import type Redis from 'ioredis'
+import type { ReservedJob } from '../src/queue'
 import { randomUUID } from 'node:crypto'
 import { sleep } from '@antfu/utils'
 import { beforeAll, expect, test, vi } from 'vitest'
@@ -1360,6 +1361,106 @@ test('skip-if-running: an occurrence is not enqueued while lastJobId is non-term
     expect(await redis.hget(scheduleKey, 'lastJobId')).toBe('occ-2')
     expect(await redis.zscore(groupJobs, 'occ-2')).not.toBeNull() // enqueued into its group
   } finally {
+    await ns.close()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Events & metrics (ticket 10)
+// ---------------------------------------------------------------------------
+
+test('getMetrics reports active/waiting/delayed; a drained group leaves the groups set', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const started = makeGate()
+  const gate = makeGate()
+
+  // A single-slot worker holds exactly one job active (gated) and never picks up the rest.
+  queue.worker(
+    async () => {
+      started.open()
+      await gate.wait()
+      return 'ok'
+    },
+    { concurrency: 1 },
+  )
+
+  try {
+    // This job is reserved and held active: reserving pops the last job from its group's waiting
+    // ZSET, so the shared maintenance must SREM it from the `groups` set (drained, no over-count).
+    await queue.add('active', { groupId: 'active-grp' })
+    await started.wait()
+
+    // Waiting work across two groups (worker is full ⇒ stays waiting), plus two future delayed jobs.
+    await queue.add('g1-a', { groupId: 'g1' })
+    await queue.add('g1-b', { groupId: 'g1' })
+    await queue.add('g2-a', { groupId: 'g2' })
+    await queue.add('d1', { runAt: Date.now() + 3_600_000 })
+    await queue.add('d2', { runAt: Date.now() + 3_600_000 })
+
+    await vi.waitFor(async () => {
+      expect(await queue.getMetrics()).toEqual({ active: 1, waiting: 3, delayed: 2 })
+    })
+
+    // The drained active group is gone from the metrics set; only the two waiting groups remain
+    // (delayed jobs never enter it). A missing SREM would leave `active-grp` here.
+    const groups = await redis.smembers(`${prefix}:${wfId}:groups`)
+    expect(groups.sort()).toEqual(['g1', 'g2'])
+  } finally {
+    gate.open()
+    await ns.close()
+  }
+})
+
+test('onFailed is invoked with the job and error each time a handler throws', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() })
+  const onFailed = vi.fn<(job: ReservedJob, error: unknown) => void>()
+
+  queue.worker(
+    () => {
+      throw new Error('boom')
+    },
+    { onFailed },
+  )
+
+  try {
+    const { id } = await queue.add('x')
+    await expect(queue.wait(id)).rejects.toThrow('boom')
+
+    await vi.waitFor(() => {
+      expect(onFailed).toHaveBeenCalledTimes(1)
+    })
+    const [job, error] = onFailed.mock.calls[0]!
+    expect(job.id).toBe(id)
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toBe('boom')
+  } finally {
+    await ns.close()
+  }
+})
+
+test('onError is invoked when a worker-internal operation throws', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() })
+  const onError = vi.fn<(error: unknown) => void>()
+
+  // Force the wake-loop's throttled stalled-recovery scan to throw — a worker-internal error path.
+  vi.spyOn(ns.redis, 'recoverStalled').mockRejectedValue(new Error('scan failed'))
+
+  queue.worker(() => 'ok', { onError, safetyTimeout: 0.1 })
+
+  try {
+    await vi.waitFor(() => {
+      expect(onError).toHaveBeenCalled()
+    })
+    const error = onError.mock.calls[0]![0]
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toBe('scan failed')
+  } finally {
+    vi.restoreAllMocks()
     await ns.close()
   }
 })

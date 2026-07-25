@@ -20,10 +20,38 @@ local now = tonumber(__t[1]) * 1000 + math.floor(tonumber(__t[2]) / 1000)
 `
 
 /**
+ * The single source of truth for a group's derived membership: the `ready` ZSET-of-groups
+ * (runnable = has waiting jobs AND under the group cap) and the lightweight `groups` metrics
+ * SET (§11 — member exactly while the group has waiting jobs). Both are keyed off the one
+ * `ZCARD groupJobs` read, so the metrics SET cannot drift from the `ready` set or over-count:
+ * every path that adds/pops a waiting job (`addWaiting`, `reserve`'s pop, `releaseActive`) funnels
+ * through here. It is a MEMBERSHIP set, never an INCR/DECR count. Assumes nothing else in scope.
+ */
+const MAINTAIN_GROUP = `
+local function maintainGroup(wf, groupId, groupCap)
+  local groupJobs = wf .. ":g:" .. groupId .. ":jobs"
+  local readyKey = wf .. ":ready"
+  local groupsKey = wf .. ":groups"
+  if redis.call("ZCARD", groupJobs) > 0 then
+    redis.call("SADD", groupsKey, groupId)
+    if redis.call("SCARD", wf .. ":g:" .. groupId .. ":active") < groupCap then
+      local head = redis.call("ZRANGE", groupJobs, 0, 0, "WITHSCORES")
+      redis.call("ZADD", readyKey, head[2], groupId)
+    else
+      redis.call("ZREM", readyKey, groupId)
+    end
+  else
+    redis.call("SREM", groupsKey, groupId)
+    redis.call("ZREM", readyKey, groupId)
+  end
+end
+`
+
+/**
  * The single source of truth for freeing a claim. Reads `groupId`+`nsId` off the job
  * hash and mirrors reserve's writes: removes the job from the three active structures,
- * deletes the lock, re-evaluates the group's `ready` membership, and kicks both wake
- * lists. Shared (included, not copied) by every finalize path.
+ * deletes the lock, re-evaluates the group's `ready`/`groups` membership, and kicks both wake
+ * lists. Shared (included, not copied) by every finalize path. Assumes `maintainGroup` is in scope.
  */
 const RELEASE_ACTIVE = `
 local function releaseActive(prefix, wfId, jobId, groupCap)
@@ -31,21 +59,13 @@ local function releaseActive(prefix, wfId, jobId, groupCap)
   local jobKey = wf .. ":j:" .. jobId
   local groupId = redis.call("HGET", jobKey, "groupId")
   local nsId = redis.call("HGET", jobKey, "nsId")
-  local groupJobs = wf .. ":g:" .. groupId .. ":jobs"
-  local groupActive = wf .. ":g:" .. groupId .. ":active"
-  local readyKey = wf .. ":ready"
 
   redis.call("ZREM", wf .. ":active", jobId)
-  redis.call("SREM", groupActive, jobId)
+  redis.call("SREM", wf .. ":g:" .. groupId .. ":active", jobId)
   redis.call("SREM", prefix .. ":ns:" .. nsId .. ":active", wfId .. ":" .. jobId)
   redis.call("DEL", jobKey .. ":lock")
 
-  if redis.call("ZCARD", groupJobs) > 0 and redis.call("SCARD", groupActive) < groupCap then
-    local head = redis.call("ZRANGE", groupJobs, 0, 0, "WITHSCORES")
-    redis.call("ZADD", readyKey, head[2], groupId)
-  else
-    redis.call("ZREM", readyKey, groupId)
-  end
+  maintainGroup(wf, groupId, groupCap)
 
   local wfWake = wf .. ":wake"
   redis.call("LPUSH", wfWake, "1")
@@ -109,14 +129,8 @@ local function addWaiting(wf, jobKey, jobId, groupId, priority, groupCap, scoreA
     score = (${PMAX} - priority) * 4294967296 + counter
   end
   redis.call("HSET", jobKey, "state", "waiting")
-  local groupJobs = wf .. ":g:" .. groupId .. ":jobs"
-  local groupActive = wf .. ":g:" .. groupId .. ":active"
-  redis.call("ZADD", groupJobs, score, jobId)
-  redis.call("SADD", wf .. ":groups", groupId)
-  if redis.call("SCARD", groupActive) < groupCap then
-    local head = redis.call("ZRANGE", groupJobs, 0, 0, "WITHSCORES")
-    redis.call("ZADD", wf .. ":ready", head[2], groupId)
-  end
+  redis.call("ZADD", wf .. ":g:" .. groupId .. ":jobs", score, jobId)
+  maintainGroup(wf, groupId, groupCap)
 end
 `
 
@@ -152,6 +166,7 @@ end
  * (`runAt`/`runIn` use `-1` as the "unset" sentinel; they are mutually exclusive.)
  */
 const ENQUEUE = `
+${MAINTAIN_GROUP}
 ${ADD_WAITING}
 ${ENQUEUE_NOW}
 local prefix = ARGV[1]
@@ -213,6 +228,7 @@ return 1
  * ARGV: prefix, wfId, nsId, nsCap, wfCap, groupCap, lockMs, token, promoteCap
  */
 const RESERVE = `
+${MAINTAIN_GROUP}
 ${ADD_WAITING}
 local prefix = ARGV[1]
 local wfId = ARGV[2]
@@ -263,7 +279,7 @@ local groupActive = wf .. ":g:" .. gid .. ":active"
 
 local popped = redis.call("ZPOPMIN", groupJobs)
 if #popped == 0 then
-  redis.call("ZREM", readyKey, gid)
+  maintainGroup(wf, gid, groupCap)
   return { "empty", msToNext() }
 end
 local jobId = popped[1]
@@ -278,12 +294,7 @@ redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
 -- Store the popped packed score so stalled-recovery can requeue at the front of its band.
 redis.call("HSET", jobKey, "state", "active", "deadlineAt", deadline, "score", popped[2])
 
-if redis.call("ZCARD", groupJobs) > 0 and redis.call("SCARD", groupActive) < groupCap then
-  local next = redis.call("ZRANGE", groupJobs, 0, 0, "WITHSCORES")
-  redis.call("ZADD", readyKey, next[2], gid)
-else
-  redis.call("ZREM", readyKey, gid)
-end
+maintainGroup(wf, gid, groupCap)
 
 local vals = redis.call("HMGET", jobKey, "data", "priority", "attempts")
 return { "job", jobId, gid, vals[1], vals[3], vals[2] }
@@ -298,6 +309,7 @@ return { "job", jobId, gid, vals[1], vals[3], vals[2] }
  * ARGV: prefix, wfId, jobId, token, result, resultTtl, groupCap
  */
 const COMPLETE = `
+${MAINTAIN_GROUP}
 ${RELEASE_ACTIVE}
 local prefix = ARGV[1]
 local wfId = ARGV[2]
@@ -335,6 +347,7 @@ return 1
  * ARGV: prefix, wfId, jobId, token, reason, stack, runAt, resultTtl, groupCap, keepFailed
  */
 const FAIL = `
+${MAINTAIN_GROUP}
 ${RELEASE_ACTIVE}
 ${FINALIZE_FAILED}
 local prefix = ARGV[1]
@@ -378,6 +391,7 @@ return 1
  * ARGV: prefix, wfId, jobId, reason, resultTtl, groupCap, keepFailed
  */
 const MOVE_TO_FAILED = `
+${MAINTAIN_GROUP}
 ${RELEASE_ACTIVE}
 ${FINALIZE_FAILED}
 local prefix = ARGV[1]
@@ -434,6 +448,7 @@ return 1
  * ARGV: prefix, wfId, groupCap, maxStalledCount, interval, batchSize, resultTtl, keepFailed
  */
 const RECOVER_STALLED = `
+${MAINTAIN_GROUP}
 ${RELEASE_ACTIVE}
 ${FINALIZE_FAILED}
 ${ADD_WAITING}
@@ -495,6 +510,7 @@ return recovered
  * ARGV: prefix, wfId, nsId, scheduleId, expectedScore, nextScore, jobId, maxAttempts, groupCap
  */
 const FIRE_SCHEDULE = `
+${MAINTAIN_GROUP}
 ${ADD_WAITING}
 ${ENQUEUE_NOW}
 local prefix = ARGV[1]

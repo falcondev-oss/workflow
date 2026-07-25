@@ -2,6 +2,7 @@ import type { Namespace } from './namespace'
 import type { QueueRedis } from './scripts'
 import type {
   AddOptions,
+  QueueMetrics,
   QueueOptions,
   ScheduleInfo,
   ScheduleOptions,
@@ -205,6 +206,30 @@ export class Queue {
       })
     }
     return schedules
+  }
+
+  /**
+   * Pull-based queue-depth gauges (§11) for the lib's OTel `addBatchObservableCallback` to
+   * poll — the module holds no OTel and no counters. `active`/`delayed` are O(1) `ZCARD`s;
+   * `waiting` sums the per-group waiting ZSETs over the lightweight `groups` membership SET
+   * (O(groups), only at pull time), which the shared Lua keeps in exact step with the waiting
+   * jobs so a drained group is never enumerated.
+   */
+  async getMetrics(): Promise<QueueMetrics> {
+    const wf = `${this.prefix}:${this.id}`
+    const [active, delayed, groups] = await Promise.all([
+      this.redis.zcard(`${wf}:active`),
+      this.redis.zcard(`${wf}:delayed`),
+      this.redis.smembers(`${wf}:groups`),
+    ])
+    let waiting = 0
+    if (groups.length > 0) {
+      const pipeline = this.redis.pipeline()
+      for (const groupId of groups) pipeline.zcard(`${wf}:g:${groupId}:jobs`)
+      const results = await pipeline.exec()
+      for (const [, count] of results ?? []) waiting += Number(count ?? 0)
+    }
+    return { active, waiting, delayed }
   }
 
   /** Guard the range that keeps the packed score exact in a ZSET double (§6). */

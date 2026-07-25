@@ -36,6 +36,7 @@ export class Worker {
   private readonly backoff: (attempt: number) => number
   private readonly keepFailed: number
   private readonly onError: (error: unknown) => void
+  private readonly onFailed: (job: ReservedJob, error: unknown) => void
 
   private readonly blockingRedis: Redis
   private readonly redis: QueueRedis
@@ -65,6 +66,7 @@ export class Worker {
     this.backoff = opts?.backoff ?? expBackoff()
     this.keepFailed = opts?.keepFailed ?? 100
     this.onError = opts?.onError ?? ((error) => Settings.logger?.error?.(error))
+    this.onFailed = opts?.onFailed ?? ((_job, error) => Settings.logger?.error?.(error))
 
     this.redis = queue.redis
     this.blockingRedis = queue.redis.duplicate()
@@ -286,6 +288,9 @@ export class Worker {
    */
   private async fail(claim: Claim, err: unknown): Promise<void> {
     const error = err instanceof Error ? err : new Error(String(err))
+    // Best-effort local failure notification (§11) — fires on every handler failure (retryable or
+    // terminal), mirroring today's `worker.on('failed', job)`. No pub/sub, no `.on(...)` registry.
+    this.onFailed(claim.job, error)
     const runAt = Date.now() + this.backoff(claim.job.attemptsMade + 1)
     try {
       await this.redis.fail(

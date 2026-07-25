@@ -7,6 +7,7 @@ export type {
   AddOptions,
   JobContext,
   NamespaceOptions,
+  QueueMetrics,
   QueueOptions,
   ReservedJob,
   ScheduleInfo,
