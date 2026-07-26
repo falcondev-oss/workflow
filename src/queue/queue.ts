@@ -48,7 +48,7 @@ export class Queue {
     const id = opts?.jobId ?? randomUUID()
     const groupId = opts?.groupId ?? randomUUID()
     const priority = opts?.priority ?? 0
-    // An out-of-range or fractional priority would corrupt score packing / ordering (§6).
+    // An out-of-range or fractional priority would corrupt score packing / ordering.
     this.validatePriority(priority)
     if (opts?.runAt !== undefined && opts?.runIn !== undefined)
       throw new Error('`runAt` and `runIn` are mutually exclusive')
@@ -209,11 +209,10 @@ export class Queue {
   }
 
   /**
-   * Pull-based queue-depth gauges (§11) for the lib's OTel `addBatchObservableCallback` to
-   * poll — the module holds no OTel and no counters. `active`/`delayed` are O(1) `ZCARD`s;
-   * `waiting` sums the per-group waiting ZSETs over the lightweight `groups` membership SET
-   * (O(groups), only at pull time), which the shared Lua keeps in exact step with the waiting
-   * jobs so a drained group is never enumerated.
+   * Point-in-time queue-depth gauges, read on demand — no counters are maintained. `active` and
+   * `delayed` are O(1) `ZCARD`s; `waiting` sums the per-group waiting ZSETs over the `groups`
+   * membership SET (O(groups)), which is kept in exact step with the waiting jobs so a drained
+   * group is never enumerated.
    */
   async getMetrics(): Promise<QueueMetrics> {
     const wf = `${this.prefix}:${this.id}`
@@ -232,7 +231,7 @@ export class Queue {
     return { active, waiting, delayed }
   }
 
-  /** Guard the range that keeps the packed score exact in a ZSET double (§6). */
+  /** Guard the range that keeps the packed score exact in a ZSET double. */
   private validatePriority(priority: number): void {
     if (!Number.isInteger(priority) || priority < 0 || priority > PMAX)
       throw new RangeError(`priority must be an integer in 0…${PMAX}, got ${priority}`)

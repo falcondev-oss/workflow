@@ -56,7 +56,7 @@ export class Worker {
   ) {
     this.concurrency = opts?.concurrency ?? 1
     this.lockMs = opts?.lockMs ?? 30_000
-    // Derived, not exposed (§9): renew ~3× within lockMs, capped at 10s so long locks still
+    // Derived, not exposed: renew ~3× within lockMs, capped at 10s so long locks still
     // renew often enough that a single missed tick can't stall a healthy job.
     this.heartbeatInterval = Math.min(this.lockMs / 3, 10_000)
     this.maxStalledCount = opts?.maxStalledCount ?? 1
@@ -81,7 +81,7 @@ export class Worker {
     if (this.blockingRedis.status === 'wait') await this.blockingRedis.connect()
     while (!this.closing) {
       // Fire any due cron occurrences into waiting before draining — no separate poller; the
-      // tick folds into this same wake loop (§8). Firing kicks `wake`, so the drain below picks
+      // tick folds into this same wake loop. Firing kicks `wake`, so the drain below picks
       // the occurrence up in this iteration.
       await this.tickSchedules()
       // Drain: reserve until a slot is unavailable or there is no runnable work. `msToNext`
@@ -111,14 +111,14 @@ export class Worker {
           ? this.safetyTimeout
           : Math.min(Math.min(...nearest) / 1000, this.safetyTimeout)
       await this.blockingRedis.brpop(this.wfWake, this.nsWake, timeout)
-      // Wake-loop re-poll is the idle-worker stalled-recovery trigger (§9) — no dedicated
+      // Wake-loop re-poll is the idle-worker stalled-recovery trigger — no dedicated
       // poller. The scan is throttled in Lua, so firing every re-poll is cheap.
       if (!this.closing) void this.recoverStalled()
     }
   }
 
   /**
-   * The thin JS cron tick (§8), folded into the wake loop — no poller. Reads due schedules
+   * The thin JS cron tick, folded into the wake loop — no poller. Reads due schedules
    * (`ZRANGEBYSCORE schedules:due -inf now`), computes each one's `nextRun(now)` via Croner, and
    * calls the `fireSchedule` CAS script with the score it saw. CAS-on-score = exactly-once across
    * N workers; computing next in JS *before* the call = crash-safe. A backlog after downtime
@@ -219,7 +219,7 @@ export class Worker {
     const stopHeartbeat = this.startHeartbeat(claim, controller)
     try {
       const result = await this.handler(claim.job, { signal: controller.signal })
-      // Abort-on-lost-claim (§9/§12): the heartbeat aborted because the claim was recovered
+      // Abort-on-lost-claim: the heartbeat aborted because the claim was recovered
       // and re-reserved elsewhere — drop the job without committing. The token-guard on
       // complete/fail makes those no-ops anyway, but skipping avoids the wasted round-trip.
       if (controller.signal.aborted) return
@@ -242,10 +242,10 @@ export class Worker {
   }
 
   /**
-   * Renew the claim on a derived timer (§9). A token-CAS renew returning 0 (the claim was
+   * Renew the claim on a derived timer. A token-CAS renew returning 0 (the claim was
    * recovered + re-reserved elsewhere) or erroring past `lockMs` aborts `ctx.signal` and stops
    * the timer, so a cooperative handler can bail and `process` drops the job. Each successful
-   * tick also fires the throttled stalled scan — the busy-worker recovery trigger (§9).
+   * tick also fires the throttled stalled scan — the busy-worker recovery trigger.
    * Returns a stop function.
    */
   private startHeartbeat(claim: Claim, controller: AbortController): () => void {
@@ -288,8 +288,8 @@ export class Worker {
    */
   private async fail(claim: Claim, err: unknown): Promise<void> {
     const error = err instanceof Error ? err : new Error(String(err))
-    // Best-effort local failure notification (§11) — fires on every handler failure (retryable or
-    // terminal), mirroring today's `worker.on('failed', job)`. No pub/sub, no `.on(...)` registry.
+    // Best-effort local failure notification — fires on every handler failure, retryable or
+    // terminal.
     this.onFailed(claim.job, error)
     const runAt = Date.now() + this.backoff(claim.job.attemptsMade + 1)
     try {

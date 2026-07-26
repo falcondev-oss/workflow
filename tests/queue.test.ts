@@ -635,9 +635,10 @@ test('runAt and runIn are mutually exclusive', async () => {
   const queue = ns.queue({ id: randomUUID() })
 
   try {
-    await expect(queue.add('x', { runAt: Date.now() + 1000, runIn: 1000 })).rejects.toThrow(
-      /mutually exclusive/,
-    )
+    await expect(
+      // @ts-expect-error `runAt` and `runIn` are mutually exclusive at the type level
+      queue.add('x', { runAt: Date.now() + 1000, runIn: 1000 }),
+    ).rejects.toThrow(/mutually exclusive/)
   } finally {
     await ns.close()
   }

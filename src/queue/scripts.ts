@@ -2,9 +2,9 @@ import type Redis from 'ioredis'
 
 /**
  * Purpose-built queue Lua. Every atomic op is exactly one script, registered via
- * `defineCommand` (free NOSCRIPT/EVAL fallback). Single-instance only (§2): keys are
- * built inside the scripts from the prefix + ids, so `numberOfKeys` is 0 and everything
- * is passed as ARGV. The `releaseActive` helper is defined once and prepended to every
+ * `defineCommand` (free NOSCRIPT/EVAL fallback). Single-instance only: keys are built
+ * inside the scripts from the prefix + ids, so `numberOfKeys` is 0 and everything is
+ * passed as ARGV. The `releaseActive` helper is defined once and prepended to every
  * script that frees a claim, so reserve/release can never drift.
  */
 
@@ -13,7 +13,7 @@ export const PMAX = 2 ** 21 - 1
 /** Sentinel for an unlimited cap. */
 export const UNLIMITED = Number.MAX_SAFE_INTEGER
 
-/** `now` in ms from Redis `TIME` — the single clock authority (§2). */
+/** `now` in ms from Redis `TIME` — the single clock authority. */
 const NOW = `
 local __t = redis.call("TIME")
 local now = tonumber(__t[1]) * 1000 + math.floor(tonumber(__t[2]) / 1000)
@@ -22,7 +22,7 @@ local now = tonumber(__t[1]) * 1000 + math.floor(tonumber(__t[2]) / 1000)
 /**
  * The single source of truth for a group's derived membership: the `ready` ZSET-of-groups
  * (runnable = has waiting jobs AND under the group cap) and the lightweight `groups` metrics
- * SET (§11 — member exactly while the group has waiting jobs). Both are keyed off the one
+ * SET (a member exactly while the group has waiting jobs). Both are keyed off the one
  * `ZCARD groupJobs` read, so the metrics SET cannot drift from the `ready` set or over-count:
  * every path that adds/pops a waiting job (`addWaiting`, `reserve`'s pop, `releaseActive`) funnels
  * through here. It is a MEMBERSHIP set, never an INCR/DECR count. Assumes nothing else in scope.
@@ -113,7 +113,7 @@ end
 
 /**
  * Move a job into the waiting structure: stamp the FIFO tiebreak counter (`INCR pc` at
- * promotion time, §6), pack the priority score, `ZADD` the group ZSET, and re-evaluate
+ * promotion time), pack the priority score, `ZADD` the group ZSET, and re-evaluate
  * `ready`. The single source of truth for "a job becomes runnable" — shared (included, not
  * copied) by `enqueue`'s immediate path and `reserve`'s delayed-promotion, so the ready
  * logic can never drift between them.
@@ -121,7 +121,7 @@ end
 const ADD_WAITING = `
 local function addWaiting(wf, jobKey, jobId, groupId, priority, groupCap, scoreArg)
   -- Recovery requeues at the STORED packed score (front of its band); the enqueue/promotion
-  -- paths pass no score and stamp a fresh FIFO counter (§6). Either way the ready-set
+  -- paths pass no score and stamp a fresh FIFO counter. Either way the ready-set
   -- maintenance below is the single shared source of truth, so recovery can't drift.
   local score = scoreArg
   if not score then
@@ -156,7 +156,7 @@ end
 
 /**
  * Add a job. `EXISTS` guard on the job hash (in-script, no TOCTOU) → `JobAlreadyExists`.
- * The effective `runAt` is resolved against Redis `TIME` (§2): `runIn` → `now + runIn`,
+ * The effective `runAt` is resolved against Redis `TIME`: `runIn` → `now + runIn`,
  * absolute `runAt` verbatim. `runAt > now` lands in the `delayed` ZSET scored by `runAt`
  * (kicking `wake` so an idle worker re-computes to the nearer due time); otherwise
  * (`runAt <= now`, or neither given) the job goes straight into waiting via the shared
@@ -212,11 +212,11 @@ return 1
 `
 
 /**
- * The hot path (ported from `prototypes/reserve.lua`). Delayed-job promotion is embedded at
- * the top (§7): due jobs (`ZRANGEBYSCORE delayed -inf now`, batch-capped) are `ZREM`'d and
- * moved into waiting via the shared `addWaiting` — atomic under Lua's single thread ⇒
- * exactly-once across concurrent workers, and promoting in `runAt` order stamps `pc`
- * ascending-by-due-time (FIFO-by-ready-time, §6). Then O(1) top-gates → pop head group of
+ * The hot path. Delayed-job promotion is embedded at the top: due jobs
+ * (`ZRANGEBYSCORE delayed -inf now`, batch-capped) are `ZREM`'d and moved into waiting via
+ * the shared `addWaiting` — atomic under Lua's single thread ⇒ exactly-once across concurrent
+ * workers, and promoting in `runAt` order stamps `pc` ascending-by-due-time
+ * (FIFO-by-ready-time). Then O(1) top-gates → pop head group of
  * `ready` → `ZPOPMIN` its head job → all-or-nothing claim into the three active structures
  * + lock + `state=active` → ready-set maintenance.
  *
@@ -385,7 +385,7 @@ return 1
 /**
  * `fail`-terminal minus the token-equality guard and minus backoff — an unconditional
  * dead-letter for callers that already hold the right to finalize (stalled-recovery over its
- * budget, ticket 08). Anti-drift: recovery never hand-writes a failed-set entry, it routes
+ * budget). Anti-drift: recovery never hand-writes a failed-set entry, it routes
  * through the same `finalizeFailed`.
  *
  * ARGV: prefix, wfId, jobId, reason, resultTtl, groupCap, keepFailed
@@ -407,7 +407,7 @@ return 1
 `
 
 /**
- * Token-CAS heartbeat (§9): no-op returning 0 if `lock != myToken` (the claim was recovered
+ * Token-CAS heartbeat: no-op returning 0 if `lock != myToken` (the claim was recovered
  * and re-reserved elsewhere → the caller must abort). Else renew the lock PX *and* the
  * `wf:active` deadline score in lockstep so they can never diverge, keeping a healthy
  * long-running job out of the stalled-candidate window. The worker runs it on a derived
@@ -435,7 +435,7 @@ return 1
 `
 
 /**
- * The single throttled stalled-recovery scan (§9), never folded into reserve. Gated by
+ * The single throttled stalled-recovery scan, never folded into reserve. Gated by
  * `SET wf:stalled-check <now> NX PX interval` so only one worker per interval scans; returns
  * 0 immediately when the gate is held. Detection is a pure deadline-compare over the
  * deadline-scored active ZSET (`ZRANGEBYSCORE wf:active 0 now`, batch-capped) — no `stalled`
@@ -490,7 +490,7 @@ return recovered
 `
 
 /**
- * Cron firing = "JS computes next, Lua commits via CAS-on-score" (§8). The JS wake-loop tick
+ * Cron firing = "JS computes next, Lua commits via CAS-on-score". The JS wake-loop tick
  * reads a due schedule, computes `nextScore = croner.nextRun(now)`, and calls this with the
  * score it saw (`expectedScore`). The CAS bails unless `ZSCORE due scheduleId == expectedScore`,
  * so a racing worker that already fired (and advanced the score) is a no-op ⇒ **exactly-once
@@ -498,7 +498,7 @@ return recovered
  * the call, a crash before it is a no-op retry and a crash after is fully done — never a
  * half-fired state.
  *
- * On a winning CAS: re-arm `ZADD due nextScore` (atomic with the enqueue). Skip-if-running (§8):
+ * On a winning CAS: re-arm `ZADD due nextScore` (atomic with the enqueue). Skip-if-running:
  * if enabled and the record's `lastJobId` is still non-terminal (its hash exists and is not
  * `failed` — a completed occurrence's hash is `DEL`'d, a failed one carries `state=failed`),
  * advance the score but do NOT enqueue. Otherwise enqueue the occurrence via the shared

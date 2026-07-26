@@ -8,7 +8,7 @@ export interface ExpBackoffOptions {
 }
 
 /**
- * Default retry backoff: exponential with full jitter (§10). `attempt` is 1-based — the
+ * Default retry backoff: exponential with full jitter. `attempt` is 1-based — the
  * number of the attempt that just failed. Returns a uniform random delay in
  * `[0, min(cap, base * factor^(attempt-1))]` ms, so retries spread out instead of
  * thundering. Pure; the worker evaluates it at fail time and stores the resulting `runAt`.

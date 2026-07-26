@@ -22,20 +22,31 @@ export interface QueueOptions {
   resultTtl?: number
 }
 
-export interface AddOptions {
+interface AddOptionsBase {
   /** Group id. Default: a random UUID (every add is its own group). */
   groupId?: string
   /** Numeric priority, 0…2^21-1, higher runs first. Default: 0. */
   priority?: number
-  /** Absolute epoch-ms instant to run at → delayed ZSET. Mutually exclusive with `runIn`. */
-  runAt?: number
-  /** Delay in ms before running (`runAt = redisNow + runIn`). Mutually exclusive with `runAt`. */
-  runIn?: number
   /** Per-job override of the worker's `maxAttempts` default. */
   maxAttempts?: number
   /** Explicit job id. Default: a random UUID. */
   jobId?: string
 }
+
+/** Options for {@link Queue.add}. `runAt` and `runIn` are mutually exclusive. */
+export type AddOptions = AddOptionsBase &
+  (
+    | {
+        /** Absolute epoch-ms timestamp to run the job at. Mutually exclusive with `runIn`. */
+        runAt?: number
+        runIn?: never
+      }
+    | {
+        /** Delay in ms before the job runs. Mutually exclusive with `runAt`. */
+        runIn?: number
+        runAt?: never
+      }
+  )
 
 export interface WorkerOptions {
   /** Per-process (per-worker) concurrency cap. Default: 1. */
@@ -89,7 +100,7 @@ export interface ScheduleInfo {
   lastJobId: string | null
 }
 
-/** Pull-based queue-depth gauges (§11), read on demand — never maintained by counters. */
+/** Point-in-time queue-depth gauges, read on demand — never maintained by counters. */
 export interface QueueMetrics {
   /** Jobs currently claimed and running (`ZCARD wf:active`). */
   active: number

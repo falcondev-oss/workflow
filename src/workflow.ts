@@ -62,8 +62,8 @@ export interface WorkflowScheduleOptions<RunInput> {
  * Owns the shared redis + single pub/sub connection (via the queue module's `Namespace`) and the
  * cross-workflow concurrency cap. Mints workflows whose namespace-level option bags are shallow-
  * merged under each workflow's own overrides. Default concurrency is unlimited (no cross-workflow
- * cap, preserving pre-namespace behavior). The module `Namespace` is created lazily so the default
- * (async) redis connection can be resolved on first use.
+ * cap). The module `Namespace` is created lazily so the default (async) redis connection can be
+ * resolved on first use.
  */
 export class WorkflowNamespace {
   readonly id: string
@@ -268,16 +268,15 @@ export class Workflow<RunInput, Input, Output> {
           {
             groupId,
             priority: opts?.priority ?? this.opts.jobOptions?.priority,
-            // Thread the worker/job `maxAttempts` default into `add` — the module applies
-            // `maxAttempts` per-job at enqueue time, so a per-workflow retry default only takes
-            // effect if the lib passes it here.
+            // `maxAttempts` is applied per-job at enqueue time, so a per-workflow retry default
+            // only takes effect if it is passed here.
             maxAttempts:
               opts?.maxAttempts ??
               this.opts.jobOptions?.maxAttempts ??
               this.opts.workerOptions?.maxAttempts,
             jobId: opts?.jobId ?? this.opts.jobOptions?.jobId,
-            runAt: opts?.runAt,
-            runIn: opts?.runIn,
+            // `runAt`/`runIn` are mutually exclusive; pass only the one that was set.
+            ...(opts?.runIn === undefined ? { runAt: opts?.runAt } : { runIn: opts.runIn }),
           },
         )
 
