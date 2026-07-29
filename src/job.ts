@@ -1,36 +1,25 @@
-import type { Job } from 'groupmq'
-import type { Serialized } from './serializer'
-import { setInterval } from 'node:timers/promises'
+import type { Queue } from './queue'
 import { deserialize } from './serializer'
 
 export class WorkflowJob<Output> {
-  private job
+  private queue
+  private jobId
   groupId
   id
 
-  constructor(opts: { job: Job<unknown> }) {
-    this.job = opts.job
-    this.groupId = opts.job.groupId
-    this.id = opts.job.id
+  constructor(opts: { queue: Queue; jobId: string; groupId: string }) {
+    this.queue = opts.queue
+    this.jobId = opts.jobId
+    this.groupId = opts.groupId
+    this.id = opts.jobId
   }
 
-  async wait(timeoutMs?: number) {
-    if (this.job.finishedOn) {
-      const returnValue = this.job.returnvalue as Serialized<Output> | undefined
-      return returnValue && deserialize(returnValue)
-    }
-
-    for await (const _ of setInterval(1000, undefined, {
-      signal: timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined,
-    })) {
-      const updatedJob = await this.job.queue.getJob(this.job.id).catch(() => null)
-
-      // deleted after completion
-      if (!updatedJob) return
-      if (updatedJob.finishedOn) {
-        const returnValue = updatedJob.returnvalue as Serialized<Output> | undefined
-        return returnValue && deserialize(returnValue)
-      }
-    }
+  /**
+   * Block until the job finishes and return its output. Propagates the workflow's own failure,
+   * `TimeoutError` (if `timeoutMs` elapses), and `ResultExpiredError` (past the result window).
+   */
+  async wait(timeoutMs?: number): Promise<Output> {
+    const raw = await this.queue.wait(this.jobId, { timeoutMs })
+    return deserialize<Output>(raw)
   }
 }

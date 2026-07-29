@@ -1,11 +1,9 @@
-import type { Job, Queue } from 'groupmq'
-import type { Serialized } from './serializer'
-import type { WorkflowStepData } from './step'
+import type { Queue } from './queue'
 
-export type WorkflowJobPayloadInternal<Input> = Serialized<{
-  input: Input | undefined
-  stepData: Record<string, WorkflowStepData>
+/** Decoded job payload. Serialized to an opaque `data` string; step data lives in the `:steps` hash. */
+export interface WorkflowJobPayloadInternal {
+  input: unknown
   tracingHeaders: unknown
-}>
-export type WorkflowJobInternal<Input> = Job<WorkflowJobPayloadInternal<Input>>
-export type WorkflowQueueInternal<Input> = Queue<WorkflowJobPayloadInternal<Input>>
+}
+
+export type WorkflowQueueInternal = Queue

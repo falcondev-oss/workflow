@@ -1,20 +1,43 @@
 import type { Meter, Span } from '@opentelemetry/api'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
-import type { AddOptions, QueueOptions, WorkerOptions } from 'groupmq'
 import type Redis from 'ioredis'
-import type { Except, IsUnknown, SetOptional } from 'type-fest'
+import type { IsUnknown } from 'type-fest'
+import type { AddOptions, QueueOptions, ReservedJob, Worker, WorkerOptions } from './queue'
 import type { WorkflowJobPayloadInternal, WorkflowQueueInternal } from './types'
-import { randomUUID } from 'node:crypto'
 import { context, propagation, ROOT_CONTEXT, SpanKind } from '@opentelemetry/api'
 import { asyncExitHook } from 'exit-hook'
-import { Queue, Worker } from 'groupmq'
 import { WorkflowJob } from './job'
+import { Namespace } from './queue'
 import { deserialize, serialize } from './serializer'
 import { defaultRedisConnection, Settings } from './settings'
 import { WorkflowStep } from './step'
 import { runWithTracing } from './tracer'
 
-export interface WorkflowOptions<RunInput, Input, Output> {
+/** Per-workflow queue overrides (module `QueueOptions` minus the id). */
+export type WorkflowQueueOptions = Omit<QueueOptions, 'id'>
+
+/** Per-workflow worker overrides plus the lib's OTel metrics binding. */
+export type WorkflowWorkerOptions = WorkerOptions & {
+  metrics?: {
+    meter: Meter
+    prefix: string
+  }
+}
+
+/** Per-run enqueue overrides (`runAt`/`runIn` are set by `runAt()`/`runIn()`). */
+export type WorkflowJobRunOptions = Omit<AddOptions, 'runAt' | 'runIn'>
+
+export interface WorkflowNamespaceOptions {
+  id: string
+  concurrency?: number
+  redis?: Redis
+  prefix?: string
+  queueOptions?: WorkflowQueueOptions
+  workerOptions?: WorkflowWorkerOptions
+  jobOptions?: WorkflowJobRunOptions
+}
+
+export interface CreateWorkflowOptions<RunInput, Input, Output> {
   id: string
   schema?: StandardSchemaV1<RunInput, Input>
   run: (ctx: WorkflowRunContext<Input>) => Promise<Output>
@@ -22,71 +45,124 @@ export interface WorkflowOptions<RunInput, Input, Output> {
     input: IsUnknown<Input> extends true ? undefined : Input,
   ) => string | undefined | Promise<string | undefined>
   queueOptions?: WorkflowQueueOptions
-  workerOptions?: WorkflowWorkerOptions<Input>
-  jobOptions?: WorkflowJobRunOptions<Input>
-  redis?: Redis
+  workerOptions?: WorkflowWorkerOptions
+  jobOptions?: WorkflowJobRunOptions
 }
 
-export type WorkflowJobRunOptions<Input> = SetOptional<
-  Except<AddOptions<WorkflowJobPayloadInternal<Input>>, 'data'>,
-  'groupId'
-> & {
-  priority?: 'high' | 'normal'
+export interface WorkflowScheduleOptions<RunInput> {
+  pattern: string
+  input: RunInput
+  tz?: string
+  priority?: number
+  groupId?: string
+  skipIfRunning?: boolean
 }
 
-export type WorkflowQueueOptions = SetOptional<Except<QueueOptions, 'namespace'>, 'redis'>
+/**
+ * Owns the shared redis + single pub/sub connection (via the queue module's `Namespace`) and the
+ * cross-workflow concurrency cap. Mints workflows whose namespace-level option bags are shallow-
+ * merged under each workflow's own overrides. Default concurrency is unlimited (no cross-workflow
+ * cap). The module `Namespace` is created lazily so the default (async) redis connection can be
+ * resolved on first use.
+ */
+export class WorkflowNamespace {
+  readonly id: string
+  private readonly opts: WorkflowNamespaceOptions
+  private namespace?: Promise<Namespace>
 
-export type WorkflowWorkerOptions<Input> = Except<
-  WorkerOptions<WorkflowJobPayloadInternal<Input>>,
-  'queue' | 'handler' | 'name'
-> & {
-  metrics?: {
-    meter: Meter
-    prefix: string
-  }
-}
-
-export class Workflow<RunInput, Input, Output> {
-  'id'
-  private 'opts'
-  private 'queue'?: WorkflowQueueInternal<Input>
-  '~internal' = {
-    getOrCreateQueue: this.getOrCreateQueue.bind(this),
-  }
-
-  'constructor'(opts: WorkflowOptions<RunInput, Input, Output>) {
+  constructor(opts: WorkflowNamespaceOptions) {
     this.id = opts.id
     this.opts = opts
   }
 
-  async 'work'(opts?: WorkflowWorkerOptions<Input>) {
-    const queue = await this.getOrCreateQueue()
+  async getNamespace(): Promise<Namespace> {
+    if (!this.namespace) {
+      this.namespace = (async () => {
+        const redis = this.opts.redis ?? (await defaultRedisConnection())
+        const namespace = new Namespace({
+          id: this.opts.id,
+          concurrency: this.opts.concurrency,
+          redis,
+          prefix: this.opts.prefix,
+        })
+        // One namespace-level exit hook for the redis disconnect (cascades to queues/workers).
+        asyncExitHook(async () => namespace.close(), { wait: 10_000 })
+        return namespace
+      })()
+    }
+    return this.namespace
+  }
 
-    const worker: Worker<WorkflowJobPayloadInternal<Input>> = new Worker({
-      handler: async (job) => {
-        Settings.logger?.info?.(`[${this.opts.id}] Processing job ${job.id} `)
-        const jobId = job.id
-        if (!jobId) throw new Error('Job ID is missing')
+  createWorkflow<RunInput, Input = RunInput, Output = unknown>(
+    opts: CreateWorkflowOptions<RunInput, Input, Output>,
+  ): Workflow<RunInput, Input, Output> {
+    return new Workflow(this, {
+      ...opts,
+      queueOptions: { ...this.opts.queueOptions, ...opts.queueOptions },
+      workerOptions: { ...this.opts.workerOptions, ...opts.workerOptions },
+      jobOptions: { ...this.opts.jobOptions, ...opts.jobOptions },
+    })
+  }
 
-        const deserializedData = deserialize(job.data)
+  /** Top-level cascade: closes every queue/worker and disconnects the shared connections. */
+  async close(): Promise<void> {
+    if (!this.namespace) return
+    const namespace = await this.namespace
+    await namespace.close()
+  }
+}
+
+export class Workflow<RunInput, Input, Output> {
+  readonly id: string
+  private readonly ns: WorkflowNamespace
+  private readonly opts: CreateWorkflowOptions<RunInput, Input, Output>
+  private queue?: Promise<WorkflowQueueInternal>
+
+  constructor(ns: WorkflowNamespace, opts: CreateWorkflowOptions<RunInput, Input, Output>) {
+    this.ns = ns
+    this.opts = opts
+    this.id = opts.id
+  }
+
+  private async getQueue(): Promise<WorkflowQueueInternal> {
+    if (!this.queue) {
+      this.queue = (async () => {
+        const namespace = await this.ns.getNamespace()
+        return namespace.queue({
+          id: this.opts.id,
+          concurrency: this.opts.queueOptions?.concurrency,
+          groupConcurrency: this.opts.queueOptions?.groupConcurrency,
+          resultTtl: this.opts.queueOptions?.resultTtl,
+        })
+      })()
+    }
+    return this.queue
+  }
+
+  async work(opts?: WorkflowWorkerOptions): Promise<Worker> {
+    const queue = await this.getQueue()
+    const { metrics, ...workerOpts } = { ...this.opts.workerOptions, ...opts }
+
+    const worker = queue.worker(
+      async (job: ReservedJob, ctx) => {
+        Settings.logger?.info?.(`[${this.id}] Processing job ${job.id}`)
+
+        const deserializedData = deserialize<WorkflowJobPayloadInternal>(job.data)
         const parsedData =
           this.opts.schema && (await this.opts.schema['~standard'].validate(deserializedData.input))
         if (parsedData?.issues) throw new Error(`Invalid workflow input`)
 
         return runWithTracing(
-          `workflow-worker/${this.opts.id}`,
+          `workflow-worker/${this.id}`,
           {
             attributes: {
-              'workflow.id': this.opts.id,
-              'workflow.job_id': jobId,
+              'workflow.id': this.id,
+              'workflow.job_id': job.id,
             },
             kind: SpanKind.CONSUMER,
           },
           async (span) => {
-            const stepMeta = {
-              stepPromises: new Set<Promise<any>>(),
-              isCanceled: false,
-            }
+            const stepPromises = new Set<Promise<any>>()
             const start = performance.now()
             try {
               const result = await this.opts.run({
@@ -94,54 +170,53 @@ export class Workflow<RunInput, Input, Output> {
                 input: parsedData?.value as any,
                 step: new WorkflowStep({
                   queue,
-                  workflowJobId: jobId,
-                  workflowId: this.opts.id,
-                  meta: stepMeta,
+                  workflowJobId: job.id,
+                  workflowId: this.id,
+                  signal: ctx.signal,
+                  stepPromises,
                 }),
                 span,
               })
 
-              const end = performance.now()
-
               Settings.logger?.success?.(
-                `[${this.opts.id}] Completed job ${job.id} in ${(end - start).toFixed(2)} ms`,
+                `[${this.id}] Completed job ${job.id} in ${(performance.now() - start).toFixed(2)} ms`,
               )
               return serialize(result)
             } catch (err) {
-              stepMeta.isCanceled = true
-              if (stepMeta.stepPromises.size > 0) {
+              if (stepPromises.size > 0) {
                 Settings.logger?.warn?.(
-                  `[${this.opts.id}] Job failed but there are still ${stepMeta.stepPromises.size} running step(s), waiting for them to finish. Be careful when using 'Promise.all([step0, step1, ...])', as running steps are not canceled when one of them fails.`,
+                  `[${this.id}] Job failed but there are still ${stepPromises.size} running step(s), waiting for them to finish. Be careful when using 'Promise.all([step0, step1, ...])', as running steps are not canceled when one of them fails.`,
                 )
-                await Promise.allSettled(stepMeta.stepPromises)
+                await Promise.allSettled(stepPromises)
               }
-
               throw err
             }
           },
-          propagation.extract(ROOT_CONTEXT, deserializedData.tracingHeaders),
+          propagation.extract(
+            ROOT_CONTEXT,
+            deserializedData.tracingHeaders as Record<string, string>,
+          ),
         )
       },
-      queue,
-      ...this.opts.workerOptions,
-      ...opts,
-    })
+      {
+        ...workerOpts,
+        onFailed:
+          workerOpts.onFailed ??
+          ((job, error) => Settings.logger?.error?.(`[${this.id}] Job ${job.id} failed:`, error)),
+        onError:
+          workerOpts.onError ??
+          ((error) => Settings.logger?.error?.(`[${this.id}] Job error:`, error)),
+      },
+    )
 
-    worker.on('failed', (job) => {
-      Settings.logger?.info?.(`[${this.opts.id}] Job ${job.id} failed`)
-    })
-    worker.on('error', (error) => {
-      Settings.logger?.error?.(`[${this.opts.id}] Job error:`, error)
-    })
+    Settings.logger?.info?.(`[${this.id}] Worker started`)
 
-    Settings.logger?.info?.(`[${this.opts.id}] Worker started`)
-
-    const metricsOpts = opts?.metrics ?? this.opts.workerOptions?.metrics ?? Settings.metrics
-    if (metricsOpts) await this.setupMetrics(metricsOpts)
+    const metricsOpts = metrics ?? Settings.metrics
+    if (metricsOpts) this.setupMetrics(queue, metricsOpts)
 
     asyncExitHook(
       async (signal) => {
-        Settings.logger?.info?.(`[${this.opts.id}] Received ${signal}, shutting down worker...`)
+        Settings.logger?.info?.(`[${this.id}] Received ${signal}, shutting down worker...`)
         await worker.close()
       },
       { wait: 10_000 },
@@ -150,105 +225,103 @@ export class Workflow<RunInput, Input, Output> {
     return worker
   }
 
-  async 'run'(input: RunInput, opts?: WorkflowJobRunOptions<Input>) {
+  async run(input: RunInput, opts?: WorkflowJobRunOptions): Promise<WorkflowJob<Output>> {
+    return this.enqueue(input, opts)
+  }
+
+  async runIn(input: RunInput, delayMs: number, opts?: WorkflowJobRunOptions) {
+    return this.enqueue(input, { ...opts, runIn: delayMs })
+  }
+
+  async runAt(input: RunInput, date: Date, opts?: WorkflowJobRunOptions) {
+    return this.enqueue(input, { ...opts, runAt: date.getTime() })
+  }
+
+  private async enqueue(
+    input: RunInput,
+    opts?: WorkflowJobRunOptions & { runAt?: number; runIn?: number },
+  ): Promise<WorkflowJob<Output>> {
     const parsedInput = this.opts.schema && (await this.opts.schema['~standard'].validate(input))
     if (parsedInput?.issues) throw new Error('Invalid workflow input')
 
-    const queue = await this.getOrCreateQueue()
+    const queue = await this.getQueue()
 
     const groupId =
       opts?.groupId ??
       (await this.opts.getGroupId?.(
         parsedInput?.value as IsUnknown<Input> extends true ? undefined : Input,
       )) ??
-      randomUUID()
-    if (opts?.repeat) {
-      const didRemove = await queue.removeRepeatingJob(groupId)
-      if (didRemove)
-        Settings.logger?.debug?.(
-          `[${this.opts.id}] Removed existing repeating job with groupId '${groupId}' before adding new one with schedule ${JSON.stringify(opts.repeat)}`,
-        )
-    }
+      this.opts.jobOptions?.groupId
 
     return runWithTracing(
-      `workflow-producer/${this.opts.id}`,
+      `workflow-producer/${this.id}`,
       {
-        attributes: {
-          'workflow.id': this.opts.id,
-        },
+        attributes: { 'workflow.id': this.id },
         kind: SpanKind.PRODUCER,
       },
       async () => {
         const tracingHeaders = {}
         propagation.inject(context.active(), tracingHeaders)
 
-        const orderMs =
-          opts?.orderMs ??
-          (opts?.priority === 'high' ? 0 : undefined) ??
-          this.opts.jobOptions?.orderMs ??
-          (this.opts.jobOptions?.priority === 'high' ? 0 : undefined)
+        const job = await queue.add(
+          serialize({ input: parsedInput?.value ?? input, tracingHeaders }),
+          {
+            groupId,
+            priority: opts?.priority ?? this.opts.jobOptions?.priority,
+            // `maxAttempts` is applied per-job at enqueue time, so a per-workflow retry default
+            // only takes effect if it is passed here.
+            maxAttempts:
+              opts?.maxAttempts ??
+              this.opts.jobOptions?.maxAttempts ??
+              this.opts.workerOptions?.maxAttempts,
+            jobId: opts?.jobId ?? this.opts.jobOptions?.jobId,
+            // `runAt`/`runIn` are mutually exclusive; pass only the one that was set.
+            ...(opts?.runIn === undefined ? { runAt: opts?.runAt } : { runIn: opts.runIn }),
+          },
+        )
 
-        const job = await queue.add({
-          data: serialize({
-            input: parsedInput?.value,
-            stepData: {},
-            tracingHeaders,
-          }),
-          ...this.opts.jobOptions,
-          ...opts,
-          groupId,
-          orderMs,
-        })
-
-        return new WorkflowJob<Output>({
-          job,
-        })
+        return new WorkflowJob<Output>({ queue, jobId: job.id, groupId: job.groupId })
       },
     )
   }
 
-  async 'runIn'(input: RunInput, delayMs: number, opts?: WorkflowJobRunOptions<Input>) {
-    return this.run(input, {
-      delay: delayMs,
-      ...opts,
+  /**
+   * Register (or idempotently replace) a cron schedule. The typed `input` is validated against
+   * `schema` at registration time (fail fast) and stored pre-serialized as opaque `data`.
+   */
+  async upsertSchedule(scheduleId: string, opts: WorkflowScheduleOptions<RunInput>): Promise<void> {
+    const parsed = this.opts.schema && (await this.opts.schema['~standard'].validate(opts.input))
+    if (parsed?.issues) throw new Error('Invalid workflow input')
+
+    const queue = await this.getQueue()
+    await queue.upsertSchedule(scheduleId, {
+      pattern: opts.pattern,
+      data: serialize({ input: parsed?.value ?? opts.input, tracingHeaders: {} }),
+      tz: opts.tz,
+      priority: opts.priority,
+      groupId: opts.groupId,
+      skipIfRunning: opts.skipIfRunning,
     })
   }
 
-  async 'runAt'(input: RunInput, date: Date, opts?: WorkflowJobRunOptions<Input>) {
-    return this.run(input, {
-      runAt: date,
-      ...opts,
-    })
+  async removeSchedule(scheduleId: string): Promise<void> {
+    const queue = await this.getQueue()
+    await queue.removeSchedule(scheduleId)
   }
 
-  private async 'getOrCreateQueue'() {
-    if (!this.queue) {
-      this.queue = new Queue({
-        namespace: this.opts.id,
-        redis: this.opts.redis ?? (await defaultRedisConnection()),
-        keepFailed: 100,
-        ...this.opts.queueOptions,
-      })
-    }
-
-    return this.queue
+  async getSchedules() {
+    const queue = await this.getQueue()
+    return queue.getSchedules()
   }
 
-  private async 'setupMetrics'({ meter, prefix }: { meter: Meter; prefix: string }) {
-    const attributes = {
-      workflow_id: this.opts.id,
-    }
+  private setupMetrics(
+    queue: WorkflowQueueInternal,
+    { meter, prefix }: { meter: Meter; prefix: string },
+  ) {
+    const attributes = { workflow_id: this.id }
 
-    const queue = await this.getOrCreateQueue()
-
-    const completedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_completed_jobs`, {
-      description: 'Number of completed workflow jobs',
-    })
     const activeJobsGauge = meter.createObservableGauge(`${prefix}_workflow_active_jobs`, {
       description: 'Number of active workflow jobs',
-    })
-    const failedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_failed_jobs`, {
-      description: 'Number of failed workflow jobs',
     })
     const waitingJobsGauge = meter.createObservableGauge(`${prefix}_workflow_waiting_jobs`, {
       description: 'Number of waiting workflow jobs',
@@ -256,36 +329,19 @@ export class Workflow<RunInput, Input, Output> {
     const delayedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_delayed_jobs`, {
       description: 'Number of delayed workflow jobs',
     })
-    const groupCountGauge = meter.createObservableGauge(`${prefix}_workflow_groups`, {
-      description: 'Number of workflow job groups',
-    })
 
     meter.addBatchObservableCallback(
       async (observableResult) => {
         try {
-          const [counts, groupCount] = await Promise.all([
-            queue.getJobCounts(),
-            queue.getUniqueGroupsCount(),
-          ])
-
-          observableResult.observe(completedJobsGauge, counts.completed, attributes)
-          observableResult.observe(activeJobsGauge, counts.active, attributes)
-          observableResult.observe(failedJobsGauge, counts.failed, attributes)
-          observableResult.observe(waitingJobsGauge, counts.waiting, attributes)
-          observableResult.observe(delayedJobsGauge, counts.delayed, attributes)
-          observableResult.observe(groupCountGauge, groupCount, attributes)
+          const { active, waiting, delayed } = await queue.getMetrics()
+          observableResult.observe(activeJobsGauge, active, attributes)
+          observableResult.observe(waitingJobsGauge, waiting, attributes)
+          observableResult.observe(delayedJobsGauge, delayed, attributes)
         } catch (err) {
-          console.error('Error collecting workflow metrics:', err)
+          Settings.logger?.error?.('Error collecting workflow metrics:', err)
         }
       },
-      [
-        completedJobsGauge,
-        activeJobsGauge,
-        failedJobsGauge,
-        waitingJobsGauge,
-        delayedJobsGauge,
-        groupCountGauge,
-      ],
+      [activeJobsGauge, waitingJobsGauge, delayedJobsGauge],
     )
   }
 }
