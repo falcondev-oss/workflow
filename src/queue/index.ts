@@ -1,6 +1,11 @@
 export { expBackoff } from './backoff'
 export type { ExpBackoffOptions } from './backoff'
-export { JobAlreadyExistsError, ResultExpiredError, TimeoutError } from './errors'
+export {
+  JobAlreadyExistsError,
+  NonRecoverableError,
+  ResultExpiredError,
+  TimeoutError,
+} from './errors'
 export { Namespace } from './namespace'
 export { Queue } from './queue'
 export type {
@@ -14,6 +19,7 @@ export type {
   ScheduleOptions,
   WaitOptions,
   WorkerOptions,
+  WorkflowLogger,
 } from './types'
 export { Worker } from './worker'
 export type { WorkerHandler } from './worker'

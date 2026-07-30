@@ -1,3 +1,10 @@
-export { expBackoff, JobAlreadyExistsError, ResultExpiredError, TimeoutError } from './queue'
-export { createRedis, Settings } from './settings'
+export {
+  expBackoff,
+  JobAlreadyExistsError,
+  NonRecoverableError,
+  ResultExpiredError,
+  TimeoutError,
+} from './queue'
+export type { WorkflowLogger } from './queue'
+export { createRedis } from './settings'
 export * from './workflow'

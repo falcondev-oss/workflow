@@ -341,10 +341,11 @@ return 1
  * claim). Else `HINCRBY attempts 1` (the single attempt counter, never in JS; `stalledCount`
  * is untouched). Retryable (`attempts < maxAttempts`) → set `state=delayed`, `releaseActive`
  * (frees ALL concurrency slots + kicks both wake lists during backoff), and `ZADD delayed` at
- * the JS-computed `runAt` score so `reserve` promotes it when due. Exhausted → `finalizeFailed`.
+ * the JS-computed `runAt` score so `reserve` promotes it when due. Exhausted, or `noRetry=1`
+ * (a `NonRecoverableError` — retrying cannot fix it) → `finalizeFailed`.
  *
  * Returns 0 (stale token no-op), 1 (terminal dead-letter), or 2 (requeued for retry).
- * ARGV: prefix, wfId, jobId, token, reason, stack, runAt, resultTtl, groupCap, keepFailed
+ * ARGV: prefix, wfId, jobId, token, reason, stack, runAt, resultTtl, groupCap, keepFailed, noRetry
  */
 const FAIL = `
 ${MAINTAIN_GROUP}
@@ -360,6 +361,7 @@ local runAt = tonumber(ARGV[7])
 local resultTtl = tonumber(ARGV[8])
 local groupCap = tonumber(ARGV[9])
 local keepFailed = tonumber(ARGV[10])
+local noRetry = tonumber(ARGV[11])
 
 local wf = prefix .. ":" .. wfId
 local jobKey = wf .. ":j:" .. jobId
@@ -371,7 +373,7 @@ end
 local attempts = redis.call("HINCRBY", jobKey, "attempts", 1)
 local maxAttempts = tonumber(redis.call("HGET", jobKey, "maxAttempts"))
 
-if attempts < maxAttempts then
+if noRetry == 0 and attempts < maxAttempts then
   redis.call("HSET", jobKey, "state", "delayed", "runAt", runAt)
   releaseActive(prefix, wfId, jobId, groupCap)
   redis.call("ZADD", wf .. ":delayed", runAt, jobId)

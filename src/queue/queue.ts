@@ -8,6 +8,7 @@ import type {
   ScheduleOptions,
   WaitOptions,
   WorkerOptions,
+  WorkflowLogger,
 } from './types'
 import { randomUUID } from 'node:crypto'
 import { JobAlreadyExistsError, ResultExpiredError, TimeoutError } from './errors'
@@ -41,6 +42,10 @@ export class Queue {
 
   get prefix(): string {
     return this.ns.prefix
+  }
+
+  get logger(): WorkflowLogger | undefined {
+    return this.ns.logger
   }
 
   /** Enqueue an immediate job. Throws `JobAlreadyExistsError` on a live id collision. */
