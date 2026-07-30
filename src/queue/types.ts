@@ -1,5 +1,13 @@
 import type Redis from 'ioredis'
 
+export type WorkflowLogger = {
+  info?: (...data: any[]) => void
+  success?: (...data: any[]) => void
+  error?: (...data: any[]) => void
+  debug?: (...data: any[]) => void
+  warn?: (...data: any[]) => void
+}
+
 export interface NamespaceOptions {
   /** Namespace id — scopes the cross-workflow concurrency cap. */
   id: string
@@ -9,6 +17,8 @@ export interface NamespaceOptions {
   redis: Redis
   /** Global key prefix. Default: `wf`. */
   prefix?: string
+  /** Logger inherited by every queue and worker of this namespace. Default: no logging. */
+  logger?: WorkflowLogger
 }
 
 export interface QueueOptions {
@@ -67,9 +77,9 @@ export interface WorkerOptions {
   backoff?: (attempt: number) => number
   /** Max retained failed jobs (count-trimmed by `finishedOn`). Default: 100. */
   keepFailed?: number
-  /** Called with a worker-internal/unexpected error (best-effort). Defaults to `Settings.logger`. */
+  /** Called with a worker-internal/unexpected error (best-effort). Defaults to the namespace logger. */
   onError?: (error: unknown) => void
-  /** Called with the job + error each time a handler throws and the job fails (best-effort). Defaults to `Settings.logger`. */
+  /** Called with the job + error each time a handler throws and the job fails (best-effort). Defaults to the namespace logger. */
   onFailed?: (job: ReservedJob, error: unknown) => void
 }
 

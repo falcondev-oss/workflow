@@ -2,14 +2,21 @@ import type { Meter, Span } from '@opentelemetry/api'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
 import type Redis from 'ioredis'
 import type { IsUnknown } from 'type-fest'
-import type { AddOptions, QueueOptions, ReservedJob, Worker, WorkerOptions } from './queue'
+import type {
+  AddOptions,
+  QueueOptions,
+  ReservedJob,
+  Worker,
+  WorkerOptions,
+  WorkflowLogger,
+} from './queue'
 import type { WorkflowJobPayloadInternal, WorkflowQueueInternal } from './types'
 import { context, propagation, ROOT_CONTEXT, SpanKind } from '@opentelemetry/api'
 import { asyncExitHook } from 'exit-hook'
 import { WorkflowJob } from './job'
-import { Namespace } from './queue'
+import { Namespace, NonRecoverableError } from './queue'
 import { deserialize, serialize } from './serializer'
-import { defaultRedisConnection, Settings } from './settings'
+import { defaultRedisConnection } from './settings'
 import { WorkflowStep } from './step'
 import { runWithTracing } from './tracer'
 
@@ -32,6 +39,13 @@ export interface WorkflowNamespaceOptions {
   concurrency?: number
   redis?: Redis
   prefix?: string
+  /** Logger inherited by every workflow, queue and worker of this namespace. Default: none. */
+  logger?: WorkflowLogger
+  /**
+   * Close the namespace (draining workers, disconnecting redis) on `SIGINT`/`SIGTERM`/exit.
+   * Default: true.
+   */
+  autoClose?: boolean
   queueOptions?: WorkflowQueueOptions
   workerOptions?: WorkflowWorkerOptions
   jobOptions?: WorkflowJobRunOptions
@@ -67,11 +81,14 @@ export interface WorkflowScheduleOptions<RunInput> {
  */
 export class WorkflowNamespace {
   readonly id: string
+  readonly logger?: WorkflowLogger
   private readonly opts: WorkflowNamespaceOptions
   private namespace?: Promise<Namespace>
+  private unregisterExitHook?: () => void
 
   constructor(opts: WorkflowNamespaceOptions) {
     this.id = opts.id
+    this.logger = opts.logger
     this.opts = opts
   }
 
@@ -84,9 +101,19 @@ export class WorkflowNamespace {
           concurrency: this.opts.concurrency,
           redis,
           prefix: this.opts.prefix,
+          logger: this.opts.logger,
         })
-        // One namespace-level exit hook for the redis disconnect (cascades to queues/workers).
-        asyncExitHook(async () => namespace.close(), { wait: 10_000 })
+        // One namespace-level exit hook: drains every worker and disconnects redis on a
+        // process signal. Opt out with `autoClose: false` to own shutdown yourself.
+        if (this.opts.autoClose ?? true) {
+          this.unregisterExitHook = asyncExitHook(
+            async (signal) => {
+              this.logger?.info?.(`[${this.id}] Received ${signal}, closing namespace...`)
+              await namespace.close()
+            },
+            { wait: 10_000 },
+          )
+        }
         return namespace
       })()
     }
@@ -107,6 +134,9 @@ export class WorkflowNamespace {
   /** Top-level cascade: closes every queue/worker and disconnects the shared connections. */
   async close(): Promise<void> {
     if (!this.namespace) return
+    // Drop the exit hook first: an explicit close means a later signal must not close again.
+    this.unregisterExitHook?.()
+    this.unregisterExitHook = undefined
     const namespace = await this.namespace
     await namespace.close()
   }
@@ -122,6 +152,10 @@ export class Workflow<RunInput, Input, Output> {
     this.ns = ns
     this.opts = opts
     this.id = opts.id
+  }
+
+  private get logger() {
+    return this.ns.logger
   }
 
   private async getQueue(): Promise<WorkflowQueueInternal> {
@@ -145,12 +179,22 @@ export class Workflow<RunInput, Input, Output> {
 
     const worker = queue.worker(
       async (job: ReservedJob, ctx) => {
-        Settings.logger?.info?.(`[${this.id}] Processing job ${job.id}`)
+        this.logger?.info?.(`[${this.id}] Processing job ${job.id}`)
 
         const deserializedData = deserialize<WorkflowJobPayloadInternal>(job.data)
         const parsedData =
           this.opts.schema && (await this.opts.schema['~standard'].validate(deserializedData.input))
-        if (parsedData?.issues) throw new Error(`Invalid workflow input`)
+        if (parsedData?.issues) {
+          // Stored payload no longer matches the schema — typically a job enqueued before a
+          // schema change. Retrying re-reads the same payload, so this can never succeed.
+          this.logger?.warn?.(
+            `[${this.id}] Job ${job.id} data does not match the workflow schema (stale payload from an older schema version?):`,
+            parsedData.issues,
+          )
+          throw new NonRecoverableError(`Invalid workflow input for job ${job.id}`, {
+            cause: parsedData.issues,
+          })
+        }
 
         return runWithTracing(
           `workflow-worker/${this.id}`,
@@ -178,13 +222,13 @@ export class Workflow<RunInput, Input, Output> {
                 span,
               })
 
-              Settings.logger?.success?.(
+              this.logger?.success?.(
                 `[${this.id}] Completed job ${job.id} in ${(performance.now() - start).toFixed(2)} ms`,
               )
               return serialize(result)
             } catch (err) {
               if (stepPromises.size > 0) {
-                Settings.logger?.warn?.(
+                this.logger?.warn?.(
                   `[${this.id}] Job failed but there are still ${stepPromises.size} running step(s), waiting for them to finish. Be careful when using 'Promise.all([step0, step1, ...])', as running steps are not canceled when one of them fails.`,
                 )
                 await Promise.allSettled(stepPromises)
@@ -202,25 +246,15 @@ export class Workflow<RunInput, Input, Output> {
         ...workerOpts,
         onFailed:
           workerOpts.onFailed ??
-          ((job, error) => Settings.logger?.error?.(`[${this.id}] Job ${job.id} failed:`, error)),
+          ((job, error) => this.logger?.error?.(`[${this.id}] Job ${job.id} failed:`, error)),
         onError:
-          workerOpts.onError ??
-          ((error) => Settings.logger?.error?.(`[${this.id}] Job error:`, error)),
+          workerOpts.onError ?? ((error) => this.logger?.error?.(`[${this.id}] Job error:`, error)),
       },
     )
 
-    Settings.logger?.info?.(`[${this.id}] Worker started`)
+    this.logger?.info?.(`[${this.id}] Worker started`)
 
-    const metricsOpts = metrics ?? Settings.metrics
-    if (metricsOpts) this.setupMetrics(queue, metricsOpts)
-
-    asyncExitHook(
-      async (signal) => {
-        Settings.logger?.info?.(`[${this.id}] Received ${signal}, shutting down worker...`)
-        await worker.close()
-      },
-      { wait: 10_000 },
-    )
+    if (metrics) this.setupMetrics(queue, metrics)
 
     return worker
   }
@@ -314,6 +348,12 @@ export class Workflow<RunInput, Input, Output> {
     return queue.getSchedules()
   }
 
+  /** Point-in-time queue-depth gauges (`active`/`waiting`/`delayed`) for this workflow. */
+  async getMetrics() {
+    const queue = await this.getQueue()
+    return queue.getMetrics()
+  }
+
   private setupMetrics(
     queue: WorkflowQueueInternal,
     { meter, prefix }: { meter: Meter; prefix: string },
@@ -338,7 +378,7 @@ export class Workflow<RunInput, Input, Output> {
           observableResult.observe(waitingJobsGauge, waiting, attributes)
           observableResult.observe(delayedJobsGauge, delayed, attributes)
         } catch (err) {
-          Settings.logger?.error?.('Error collecting workflow metrics:', err)
+          this.logger?.error?.('Error collecting workflow metrics:', err)
         }
       },
       [activeJobsGauge, waitingJobsGauge, delayedJobsGauge],

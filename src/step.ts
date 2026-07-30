@@ -2,7 +2,6 @@ import type { Span } from '@opentelemetry/api'
 import type { WorkflowQueueInternal } from './types'
 import { setTimeout } from 'node:timers/promises'
 import { deserialize, serialize } from './serializer'
-import { Settings } from './settings'
 import { runWithTracing } from './tracer'
 
 export type WorkflowStepData =
@@ -23,6 +22,7 @@ export class WorkflowStep {
   private stepNamePrefix
   private signal
   private stepPromises
+  private logger
 
   constructor(opts: {
     queue: WorkflowQueueInternal
@@ -38,6 +38,7 @@ export class WorkflowStep {
     this.stepNamePrefix = opts.stepNamePrefix ? `${opts.stepNamePrefix}|` : ''
     this.signal = opts.signal
     this.stepPromises = opts.stepPromises
+    this.logger = opts.queue.logger
   }
 
   private addNamePrefix(name: string) {
@@ -51,7 +52,7 @@ export class WorkflowStep {
     // attempt, so a job-level retry replays it from cache and only re-runs the failed step.
     const stepData = await this.getStepData('do', name)
     if (stepData && 'result' in stepData) {
-      Settings.logger?.debug?.(
+      this.logger?.debug?.(
         `[${this.workflowId}/${this.workflowJobId}] Step '${name}' already completed, returning cached result`,
       )
       return stepData.result as R
@@ -60,7 +61,7 @@ export class WorkflowStep {
     // Cooperative cancellation: bail before starting new work if the claim was lost.
     this.signal.throwIfAborted()
 
-    Settings.logger?.debug?.(`[${this.workflowId}/${this.workflowJobId}] Running step '${name}'`)
+    this.logger?.debug?.(`[${this.workflowId}/${this.workflowJobId}] Running step '${name}'`)
     const promise = runWithTracing(
       `workflow-worker/${this.workflowId}/step/${name}`,
       {
@@ -85,9 +86,7 @@ export class WorkflowStep {
 
         await this.updateStepData(name, { type: 'do', result })
 
-        Settings.logger?.debug?.(
-          `[${this.workflowId}/${this.workflowJobId}] Completed step '${name}'`,
-        )
+        this.logger?.debug?.(`[${this.workflowId}/${this.workflowJobId}] Completed step '${name}'`)
 
         return result
       },
@@ -121,7 +120,7 @@ export class WorkflowStep {
         },
       },
       async () => {
-        Settings.logger?.debug?.(
+        this.logger?.debug?.(
           `[${this.workflowId}/${this.workflowJobId}] Waiting in step '${name}' for ${durationMs} ms`,
         )
         // Durable sleep survives resume: remaining time is computed from the persisted start.

@@ -3,8 +3,8 @@ import type { Queue } from './queue'
 import type { QueueRedis } from './scripts'
 import type { JobContext, ReservedJob, WorkerOptions } from './types'
 import { randomUUID } from 'node:crypto'
-import { Settings } from '../settings'
 import { expBackoff } from './backoff'
+import { NonRecoverableError } from './errors'
 import { localTimeZone, nextRunMs } from './schedule'
 
 export type WorkerHandler = (job: ReservedJob, ctx: JobContext) => Promise<string> | string
@@ -65,8 +65,8 @@ export class Worker {
     this.promoteBatchSize = opts?.promoteBatchSize ?? 500
     this.backoff = opts?.backoff ?? expBackoff()
     this.keepFailed = opts?.keepFailed ?? 100
-    this.onError = opts?.onError ?? ((error) => Settings.logger?.error?.(error))
-    this.onFailed = opts?.onFailed ?? ((_job, error) => Settings.logger?.error?.(error))
+    this.onError = opts?.onError ?? ((error) => queue.logger?.error?.(error))
+    this.onFailed = opts?.onFailed ?? ((_job, error) => queue.logger?.error?.(error))
 
     this.redis = queue.redis
     this.blockingRedis = queue.redis.duplicate()
@@ -304,6 +304,7 @@ export class Worker {
         this.queue.resultTtl,
         this.queue.groupConcurrency,
         this.keepFailed,
+        err instanceof NonRecoverableError ? 1 : 0,
       )
     } catch (failErr) {
       this.onError(failErr)

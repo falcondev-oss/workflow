@@ -3,20 +3,22 @@ import { randomUUID } from 'node:crypto'
 import { sleep } from '@antfu/utils'
 import { type } from 'arktype'
 import { beforeAll, describe, expect, test, vi } from 'vitest'
-import { createRedis, ResultExpiredError, Settings, TimeoutError, WorkflowNamespace } from '../src'
+import { createRedis, ResultExpiredError, TimeoutError, WorkflowNamespace } from '../src'
 
-beforeAll(() => {
-  Settings.logger = console
-  Settings.defaultConnection = async () =>
-    createRedis({
-      host: 'localhost',
-      port: Number(process.env.REDIS_PORT),
-    })
+let sharedRedis: Awaited<ReturnType<typeof createRedis>>
+
+beforeAll(async () => {
+  sharedRedis = await connect()
 })
 
 /** Mint a fresh namespace so each test is key-isolated by its random workflow/namespace ids. */
 function namespace() {
-  return new WorkflowNamespace({ id: randomUUID() })
+  return new WorkflowNamespace({
+    id: randomUUID(),
+    redis: sharedRedis,
+    logger: console,
+    autoClose: false,
+  })
 }
 
 async function connect() {
@@ -126,7 +128,13 @@ describe('wait', () => {
     const redis = await connect()
     const prefix = randomUUID()
     const wfId = randomUUID()
-    const ns = new WorkflowNamespace({ id: randomUUID(), redis, prefix })
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      redis,
+      prefix,
+      logger: console,
+      autoClose: false,
+    })
     const workflow = ns.createWorkflow({ id: wfId, run: async () => 'x' })
 
     try {
@@ -302,6 +310,42 @@ describe('groups', () => {
   })
 })
 
+test('job data that no longer matches the schema warns and fails without retrying', async () => {
+  const logger = { ...console, warn: vi.fn() }
+  const ns = new WorkflowNamespace({
+    id: randomUUID(),
+    redis: sharedRedis,
+    logger,
+    autoClose: false,
+  })
+  const wfId = randomUUID()
+
+  // Enqueue under the old (permissive) schema, then work it under the new (stricter) one —
+  // exactly the shape of a job left in the queue across a schema change.
+  // A retry would re-read the same stored payload, so the budget must go unused.
+  const oldVersion = ns.createWorkflow({
+    id: wfId,
+    run: async () => 'ok',
+    jobOptions: { maxAttempts: 5 },
+  })
+  const job = await oldVersion.run({ name: 123 })
+
+  const handler = vi.fn()
+  const newVersion = ns.createWorkflow({
+    id: wfId,
+    schema: type({ name: 'string' }),
+    run: handler,
+  })
+  await newVersion.work()
+
+  await expect(job.wait(5000)).rejects.toThrow('Invalid workflow input')
+  expect(handler).not.toHaveBeenCalled()
+  expect(logger.warn).toHaveBeenCalledWith(
+    expect.stringContaining('does not match the workflow schema'),
+    expect.anything(),
+  )
+})
+
 test('numeric priority — higher runs first', async () => {
   const handler = vi.fn()
   const workflow = namespace().createWorkflow({
@@ -402,7 +446,13 @@ describe('durable sleep', () => {
     const redis = await connect()
     const prefix = randomUUID()
     const wfId = randomUUID()
-    const ns = new WorkflowNamespace({ id: randomUUID(), redis, prefix })
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      redis,
+      prefix,
+      logger: console,
+      autoClose: false,
+    })
     const started = makeGate()
     let aborted = false
     let committed = false

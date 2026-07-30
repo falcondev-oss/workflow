@@ -8,6 +8,7 @@ import {
   expBackoff,
   JobAlreadyExistsError,
   Namespace,
+  NonRecoverableError,
   ResultExpiredError,
   TimeoutError,
 } from '../src/queue'
@@ -886,6 +887,33 @@ test('maxAttempts exhaustion dead-letters to the failed ZSET', async () => {
     // The claim was released and step data cleared.
     expect(await redis.zcard(`${prefix}:${wfId}:active`)).toBe(0)
     expect(await redis.exists(`${prefix}:${wfId}:j:${id}:steps`)).toBe(0)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('nonRecoverableError dead-letters immediately, skipping the remaining maxAttempts budget', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+
+  let calls = 0
+  queue.worker(() => {
+    calls++
+    throw new NonRecoverableError('bad payload')
+  })
+
+  try {
+    const { id } = await queue.add('x', { maxAttempts: 5 })
+    await expect(queue.wait(id)).rejects.toThrow('bad payload')
+
+    expect(calls).toBe(1)
+    expect(await redis.zscore(`${prefix}:${wfId}:failed`, id)).not.toBeNull()
+    expect(await redis.zscore(`${prefix}:${wfId}:delayed`, id)).toBeNull()
+    const hash = await redis.hgetall(`${prefix}:${wfId}:j:${id}`)
+    expect(hash.state).toBe('failed')
+    expect(hash.attempts).toBe('1') // burned one of five, then went terminal
   } finally {
     await ns.close()
   }
