@@ -18,7 +18,7 @@ export class Namespace {
 
   private readonly subscriber: Redis
   private readonly subscriberReady: Promise<unknown>
-  private readonly channelListeners = new Map<string, Set<() => void>>()
+  private readonly channelListeners = new Map<string, Set<(message: string) => void>>()
   private readonly queues = new Set<Queue>()
 
   constructor(opts: NamespaceOptions) {
@@ -30,8 +30,8 @@ export class Namespace {
 
     this.subscriber = opts.redis.duplicate()
     this.subscriberReady = this.subscriber.connect().catch(() => {})
-    this.subscriber.on('message', (channel: string) => {
-      for (const cb of this.channelListeners.get(channel) ?? []) cb()
+    this.subscriber.on('message', (channel: string, message: string) => {
+      for (const cb of this.channelListeners.get(channel) ?? []) cb(message)
     })
   }
 
@@ -42,7 +42,7 @@ export class Namespace {
   }
 
   /** Register a waiter on a pub/sub channel; subscribes on first listener. */
-  async addWaiter(channel: string, cb: () => void): Promise<void> {
+  async addWaiter(channel: string, cb: (message: string) => void): Promise<void> {
     await this.subscriberReady
     let set = this.channelListeners.get(channel)
     if (!set) {
@@ -54,7 +54,7 @@ export class Namespace {
   }
 
   /** Remove a waiter; unsubscribes once the channel has no listeners. */
-  async removeWaiter(channel: string, cb: () => void): Promise<void> {
+  async removeWaiter(channel: string, cb: (message: string) => void): Promise<void> {
     const set = this.channelListeners.get(channel)
     if (!set) return
     set.delete(cb)

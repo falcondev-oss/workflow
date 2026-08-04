@@ -88,14 +88,16 @@ export class Queue {
   /**
    * Block until `jobId` finishes and return its raw result string. Subscribes to the
    * done channel *before* reading the result key, so the terminal publish can't be missed.
+   * The publish carries the result record itself, so the common path is one `GET` (the
+   * already-finished check) and then the notification — never a second read.
    * Throws `TimeoutError`, `ResultExpiredError`, or the job's own failure.
    */
   async wait(jobId: string, opts?: WaitOptions): Promise<string> {
     const channel = `${this.prefix}:${this.id}:done:${jobId}`
     const resultKey = `${this.prefix}:${this.id}:result:${jobId}`
 
-    let notify!: () => void
-    const notified = new Promise<void>((resolve) => {
+    let notify!: (message: string) => void
+    const notified = new Promise<string>((resolve) => {
       notify = resolve
     })
     await this.ns.addWaiter(channel, notify)
@@ -103,23 +105,20 @@ export class Queue {
       const first = await this.redis.get(resultKey)
       if (first !== null) return this.parseResult(first)
 
-      if (opts?.timeoutMs === undefined) {
-        await notified
-      } else {
-        let timer: NodeJS.Timeout
-        const timedOut = new Promise<'timeout'>((resolve) => {
-          timer = setTimeout(() => resolve('timeout'), opts.timeoutMs)
-        })
-        const outcome = await Promise.race([notified.then(() => 'done' as const), timedOut])
-        clearTimeout(timer!)
-        if (outcome === 'timeout') throw new TimeoutError(jobId)
-      }
+      if (opts?.timeoutMs === undefined) return await this.resolvePublished(jobId, await notified)
 
-      const result = await this.redis.get(resultKey)
-      if (result === null) throw new ResultExpiredError(jobId)
-      return this.parseResult(result)
+      let timer: NodeJS.Timeout
+      const timedOut = new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), opts.timeoutMs)
+      })
+      const published = await Promise.race([notified, timedOut])
+      clearTimeout(timer!)
+      if (published === null) throw new TimeoutError(jobId)
+      return await this.resolvePublished(jobId, published)
     } finally {
-      await this.ns.removeWaiter(channel, notify)
+      // Fire-and-forget: the unsubscribe is ordered on the subscriber connection ahead of any
+      // later subscribe, so nothing is lost by not making the caller pay its round-trip.
+      void this.ns.removeWaiter(channel, notify).catch((err) => this.logger?.error?.(err))
     }
   }
 
@@ -128,9 +127,21 @@ export class Queue {
     await this.redis.hset(`${this.prefix}:${this.id}:j:${jobId}:steps`, stepName, value)
   }
 
-  /** Read a step's data — a single `HGET`, `null` on miss. Opaque string, no deserialization. */
-  async getStepData(jobId: string, stepName: string): Promise<string | null> {
-    return this.redis.hget(`${this.prefix}:${this.id}:j:${jobId}:steps`, stepName)
+  /**
+   * Turn a `done` publish into the result. The finalize scripts publish the record itself, so
+   * this is normally pure JS — no second read of the key the notification just carried.
+   *
+   * The fallback is not dead: the payload is a wire format shared with *other processes*, which
+   * may be running an older build whose `complete` publishes a bare `"1"`. During any rolling
+   * deploy both shapes are on the channel at once, so a non-record payload is treated as a bare
+   * wake-up and re-read from the result key (`ResultExpiredError` if it has aged out) — exactly
+   * the pre-change behaviour.
+   */
+  private async resolvePublished(jobId: string, published: string): Promise<string> {
+    if (published.startsWith('{')) return this.parseResult(published)
+    const stored = await this.redis.get(`${this.prefix}:${this.id}:result:${jobId}`)
+    if (stored === null) throw new ResultExpiredError(jobId)
+    return this.parseResult(stored)
   }
 
   private parseResult(raw: string): string {
