@@ -105,9 +105,10 @@ local function finalizeFailed(prefix, wfId, jobId, reason, stack, resultTtl, gro
     redis.call("ZREMRANGEBYRANK", failedKey, 0, excess - 1)
   end
 
-  redis.call("SET", wf .. ":result:" .. jobId,
-    cjson.encode({ state = "failed", reason = reason, stack = stack }), "EX", resultTtl)
-  redis.call("PUBLISH", wf .. ":done:" .. jobId, "1")
+  local record = cjson.encode({ state = "failed", reason = reason, stack = stack })
+  redis.call("SET", wf .. ":result:" .. jobId, record, "EX", resultTtl)
+  -- The record travels in the publish payload, so a waiter never re-reads the key it just got.
+  redis.call("PUBLISH", wf .. ":done:" .. jobId, record)
 end
 `
 
@@ -212,20 +213,32 @@ return 1
 `
 
 /**
- * The hot path. Delayed-job promotion is embedded at the top: due jobs
- * (`ZRANGEBYSCORE delayed -inf now`, batch-capped) are `ZREM`'d and moved into waiting via
- * the shared `addWaiting` — atomic under Lua's single thread ⇒ exactly-once across concurrent
- * workers, and promoting in `runAt` order stamps `pc` ascending-by-due-time
- * (FIFO-by-ready-time). Then O(1) top-gates → pop head group of
- * `ready` → `ZPOPMIN` its head job → all-or-nothing claim into the three active structures
- * + lock + `state=active` → ready-set maintenance.
+ * The hot path, and the worker's *only* per-iteration round-trip: it claims a batch, promotes
+ * due delayed jobs, and reports everything the wake loop needs to decide its next block —
+ * so an idle or saturated worker costs exactly one command per wake, not four.
  *
- * Returns `{"maxed"}`, `{"empty", msToNext}`, or
- * `{"job", jobId, groupId, data, attempts, priority}`. `msToNext` is the ms until the next
- * due delayed job (`-1` if none, `0` if due work remains past the promote cap) — an idle
- * worker uses it as its `BRPOP wake` timeout, so the block itself is the delayed-job timer.
+ * Delayed-job promotion is embedded at the top: due jobs (`ZRANGEBYSCORE delayed -inf now`,
+ * batch-capped) are `ZREM`'d and moved into waiting via the shared `addWaiting` — atomic under
+ * Lua's single thread ⇒ exactly-once across concurrent workers, and promoting in `runAt` order
+ * stamps `pc` ascending-by-due-time (FIFO-by-ready-time). Then, up to `want` times: O(1)
+ * top-gates → pop head group of `ready` → `ZPOPMIN` its head job → all-or-nothing claim into the
+ * three active structures + lock + `state=active` → ready-set maintenance. Claiming `want` jobs
+ * in one call is what makes a high-concurrency worker cost ~1 reserve per *batch* instead of per
+ * job; `want = 0` (locally saturated) still promotes and reports, it just claims nothing.
  *
- * ARGV: prefix, wfId, nsId, nsCap, wfCap, groupCap, lockMs, token, promoteCap
+ * Claim tokens are derived in-script as `<tokenPrefix>:<n>` from the one UUID the caller passes,
+ * so a batch needs a single JS UUID and the tokens stay globally unique.
+ *
+ * Returns `{ jobs, msToNext, msToSchedule, dueSchedules, maxed }`:
+ * - `jobs`: array of `{ jobId, groupId, data, attempts, priority, token, steps }`, where `steps`
+ *   is the job's memoized step hash flattened to `[name, value, …]`
+ * - `msToNext`: ms until the next due delayed job (`-1` none, `0` due work left behind by the
+ *   promote cap) — the worker's `BRPOP wake` timeout, so the block *is* the delayed-job timer
+ * - `msToSchedule`: same, for the nearest cron occurrence
+ * - `dueSchedules`: `{ scheduleId, score, … }` of schedules due now, for the JS cron tick
+ * - `maxed`: 1 when a concurrency ceiling (not an empty queue) stopped the batch
+ *
+ * ARGV: prefix, wfId, nsId, nsCap, wfCap, groupCap, lockMs, tokenPrefix, promoteCap, want
  */
 const RESERVE = `
 ${MAINTAIN_GROUP}
@@ -237,14 +250,16 @@ local nsCap = tonumber(ARGV[4])
 local wfCap = tonumber(ARGV[5])
 local groupCap = tonumber(ARGV[6])
 local lockMs = tonumber(ARGV[7])
-local token = ARGV[8]
+local tokenPrefix = ARGV[8]
 local promoteCap = tonumber(ARGV[9])
+local want = tonumber(ARGV[10])
 
 local wf = prefix .. ":" .. wfId
 local nsActive = prefix .. ":ns:" .. nsId .. ":active"
 local wfActive = wf .. ":active"
 local readyKey = wf .. ":ready"
 local delayedKey = wf .. ":delayed"
+local scheduleDueKey = wf .. ":schedules:due"
 ${NOW}
 
 -- Promote due delayed jobs (batch-capped). ZRANGEBYSCORE ascending ⇒ promote in runAt order.
@@ -257,47 +272,55 @@ for i = 1, #due do
   addWaiting(wf, djKey, dj, meta[1], tonumber(meta[2]), groupCap)
 end
 
--- ms until the next delayed job is due (for an idle worker BRPOP timeout). Returns 0 when
--- work is already due but was left behind by the promote cap, so the worker re-reserves now.
-local function msToNext()
-  local next = redis.call("ZRANGE", delayedKey, 0, 0, "WITHSCORES")
+-- ms until the head of a due-scored ZSET (for an idle worker BRPOP timeout). Returns 0 when
+-- work is already due, so the worker loops back instead of blocking.
+local function msToHead(key)
+  local next = redis.call("ZRANGE", key, 0, 0, "WITHSCORES")
   if #next == 0 then return -1 end
   local d = tonumber(next[2]) - now
   if d < 0 then return 0 end
   return d
 end
 
-if redis.call("SCARD", nsActive) >= nsCap then return { "maxed" } end
-if redis.call("ZCARD", wfActive) >= wfCap then return { "maxed" } end
+local jobs = {}
+local maxed = 0
+while #jobs < want do
+  if redis.call("SCARD", nsActive) >= nsCap or redis.call("ZCARD", wfActive) >= wfCap then
+    maxed = 1
+    break
+  end
+  local head = redis.call("ZRANGE", readyKey, 0, 0)
+  if #head == 0 then break end
+  local gid = head[1]
+  local popped = redis.call("ZPOPMIN", wf .. ":g:" .. gid .. ":jobs")
+  if #popped == 0 then
+    -- ready pointed at a drained group; fix the membership and try the next one.
+    maintainGroup(wf, gid, groupCap)
+  else
+    local jobId = popped[1]
+    local jobKey = wf .. ":j:" .. jobId
+    local deadline = now + lockMs
+    local token = tokenPrefix .. ":" .. #jobs
 
-local head = redis.call("ZRANGE", readyKey, 0, 0)
-if #head == 0 then return { "empty", msToNext() } end
-local gid = head[1]
+    redis.call("ZADD", wfActive, deadline, jobId)
+    redis.call("SADD", wf .. ":g:" .. gid .. ":active", jobId)
+    redis.call("SADD", nsActive, wfId .. ":" .. jobId)
+    redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
+    -- Store the popped packed score so stalled-recovery can requeue at the front of its band.
+    redis.call("HSET", jobKey, "state", "active", "deadlineAt", deadline, "score", popped[2])
 
-local groupJobs = wf .. ":g:" .. gid .. ":jobs"
-local groupActive = wf .. ":g:" .. gid .. ":active"
+    maintainGroup(wf, gid, groupCap)
 
-local popped = redis.call("ZPOPMIN", groupJobs)
-if #popped == 0 then
-  maintainGroup(wf, gid, groupCap)
-  return { "empty", msToNext() }
+    -- The claim makes this worker the only writer of the step hash, so shipping it with the
+    -- job is an exact snapshot: a replay resolves memoized steps with no round-trip at all.
+    local vals = redis.call("HMGET", jobKey, "data", "priority", "attempts")
+    local steps = redis.call("HGETALL", jobKey .. ":steps")
+    jobs[#jobs + 1] = { jobId, gid, vals[1], vals[3], vals[2], token, steps }
+  end
 end
-local jobId = popped[1]
 
-local jobKey = wf .. ":j:" .. jobId
-local deadline = now + lockMs
-
-redis.call("ZADD", wfActive, deadline, jobId)
-redis.call("SADD", groupActive, jobId)
-redis.call("SADD", nsActive, wfId .. ":" .. jobId)
-redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
--- Store the popped packed score so stalled-recovery can requeue at the front of its band.
-redis.call("HSET", jobKey, "state", "active", "deadlineAt", deadline, "score", popped[2])
-
-maintainGroup(wf, gid, groupCap)
-
-local vals = redis.call("HMGET", jobKey, "data", "priority", "attempts")
-return { "job", jobId, gid, vals[1], vals[3], vals[2] }
+local dueSchedules = redis.call("ZRANGEBYSCORE", scheduleDueKey, "-inf", now, "WITHSCORES")
+return { jobs, msToHead(delayedKey), msToHead(scheduleDueKey), dueSchedules, maxed }
 `
 
 /**
@@ -332,7 +355,8 @@ releaseActive(prefix, wfId, jobId, groupCap)
 redis.call("DEL", jobKey)
 redis.call("DEL", jobKey .. ":steps")
 redis.call("SET", wf .. ":result:" .. jobId, result, "EX", resultTtl)
-redis.call("PUBLISH", wf .. ":done:" .. jobId, "1")
+-- The record travels in the publish payload, so a waiter never re-reads the key it just got.
+redis.call("PUBLISH", wf .. ":done:" .. jobId, result)
 return 1
 `
 
@@ -557,7 +581,25 @@ return { "fired", jobId }
 
 export interface QueueCommands {
   enqueue: (...args: (string | number)[]) => Promise<number>
-  reserve: (...args: (string | number)[]) => Promise<(string | number)[]>
+  reserve: (
+    ...args: (string | number)[]
+  ) => Promise<
+    [
+      jobs: [
+        id: string,
+        groupId: string,
+        data: string,
+        attempts: string,
+        priority: string,
+        token: string,
+        steps: string[],
+      ][],
+      msToNext: number,
+      msToSchedule: number,
+      due: string[],
+      maxed: number,
+    ]
+  >
   complete: (...args: (string | number)[]) => Promise<number>
   fail: (...args: (string | number)[]) => Promise<number>
   moveToFailed: (...args: (string | number)[]) => Promise<number>

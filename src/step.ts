@@ -23,6 +23,7 @@ export class WorkflowStep {
   private signal
   private stepPromises
   private logger
+  private memo
 
   constructor(opts: {
     queue: WorkflowQueueInternal
@@ -31,6 +32,8 @@ export class WorkflowStep {
     stepNamePrefix?: string
     signal: AbortSignal
     stepPromises: Set<Promise<any>>
+    /** The job's persisted step data, shipped with the claim — the memo's initial contents. */
+    memo: Map<string, string>
   }) {
     this.queue = opts.queue
     this.workflowJobId = opts.workflowJobId
@@ -39,6 +42,7 @@ export class WorkflowStep {
     this.signal = opts.signal
     this.stepPromises = opts.stepPromises
     this.logger = opts.queue.logger
+    this.memo = opts.memo
   }
 
   private addNamePrefix(name: string) {
@@ -50,7 +54,7 @@ export class WorkflowStep {
 
     // Memoize on completion only: a stored `result` field means the step finished on a prior
     // attempt, so a job-level retry replays it from cache and only re-runs the failed step.
-    const stepData = await this.getStepData('do', name)
+    const stepData = this.getStepData('do', name)
     if (stepData && 'result' in stepData) {
       this.logger?.debug?.(
         `[${this.workflowId}/${this.workflowJobId}] Step '${name}' already completed, returning cached result`,
@@ -80,6 +84,7 @@ export class WorkflowStep {
             stepNamePrefix: name,
             signal: this.signal,
             stepPromises: this.stepPromises,
+            memo: this.memo,
           }),
           span,
         })
@@ -99,7 +104,7 @@ export class WorkflowStep {
   async wait(stepName: string, durationMs: number) {
     const name = this.addNamePrefix(stepName)
 
-    const existingStepData = await this.getStepData('wait', name)
+    const existingStepData = this.getStepData('wait', name)
 
     const now = Date.now()
     const stepData = existingStepData ?? {
@@ -138,9 +143,14 @@ export class WorkflowStep {
     return this.wait(stepName, durationMs)
   }
 
-  private async getStepData<T extends WorkflowStepData['type']>(type: T, stepName: string) {
-    const raw = await this.queue.getStepData(this.workflowJobId, stepName)
-    if (raw === null) return
+  /**
+   * Read a step's persisted data. The memo is seeded from the step hash that came back with the
+   * claim and kept in step with every write, so this is always local — the durability round-trip
+   * happens on write, never on read.
+   */
+  private getStepData<T extends WorkflowStepData['type']>(type: T, stepName: string) {
+    const raw = this.memo.get(stepName)
+    if (raw === undefined) return
 
     const stepData = deserialize<WorkflowStepData>(raw)
     if (stepData.type !== type)
@@ -151,6 +161,8 @@ export class WorkflowStep {
 
   /** Per-field superjson persist — a single atomic `HSET` on the job's `:steps` hash. */
   private async updateStepData(stepName: string, data: WorkflowStepData) {
-    await this.queue.setStepData(this.workflowJobId, stepName, serialize(data))
+    const raw = serialize(data)
+    await this.queue.setStepData(this.workflowJobId, stepName, raw)
+    this.memo.set(stepName, raw)
   }
 }

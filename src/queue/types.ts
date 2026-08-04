@@ -132,6 +132,11 @@ export interface ReservedJob {
   data: string
   attemptsMade: number
   priority: number
+  /**
+   * The job's persisted step data, read atomically with the claim. Empty on a first attempt;
+   * on a replay it is the complete memo, so resolving a cached step costs no round-trip.
+   */
+  steps: Map<string, string>
 }
 
 export interface JobContext {

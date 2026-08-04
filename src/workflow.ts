@@ -218,6 +218,7 @@ export class Workflow<RunInput, Input, Output> {
                   workflowId: this.id,
                   signal: ctx.signal,
                   stepPromises,
+                  memo: new Map(job.steps),
                 }),
                 span,
               })

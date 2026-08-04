@@ -2,6 +2,7 @@ import type { StandardSchemaV1 } from '@standard-schema/spec'
 import { randomUUID } from 'node:crypto'
 import { sleep } from '@antfu/utils'
 import { type } from 'arktype'
+import { stringify } from 'superjson'
 import { beforeAll, describe, expect, test, vi } from 'vitest'
 import { createRedis, ResultExpiredError, TimeoutError, WorkflowNamespace } from '../src'
 
@@ -554,4 +555,82 @@ test('retired surface is absent (keepCompleted / step retry / repeat / removeRep
   })
   // The retired options are ignored, not honored: the job still runs once and completes.
   await expect(job.wait()).resolves.toBe(1)
+})
+
+// ---------------------------------------------------------------------------
+// Step memo prefetch + `done` publish payload (perf rework)
+//
+// Step data now rides along with the claim instead of being read per step, and the `done`
+// publish carries the result record instead of a bare wake-up. Both are cross-process wire
+// contracts, so they need to hold for a worker that never saw the earlier attempt and for a
+// peer still running the older shape.
+// ---------------------------------------------------------------------------
+
+describe('step memo prefetch', () => {
+  test('a retry picked up by a different worker still replays completed steps', async () => {
+    // The memo is seeded from the step hash that `reserve` ships with the claim. Two workers on
+    // separate connections means the retry can land on a worker whose heap never held this
+    // job's step data — the prefetch is the only thing that can carry it across.
+    // `namespace()` shares the suite-wide connection, so it must not be closed here.
+    const ns = namespace()
+    const stepA = vi.fn(async () => 'a')
+    const stepB = vi.fn(async () => 'b')
+    let attempts = 0
+
+    const workflow = ns.createWorkflow({
+      id: randomUUID(),
+      run: async ({ step }) => {
+        await step.do('a', stepA)
+        attempts++
+        if (attempts === 1) throw new Error('fail after a')
+        await step.do('b', stepB)
+        return 'done'
+      },
+    })
+
+    await workflow.work({ concurrency: 5, maxAttempts: 5, backoff: () => 0 })
+    await workflow.work({ concurrency: 5, maxAttempts: 5, backoff: () => 0 })
+
+    const job = await workflow.run(undefined, { maxAttempts: 5 })
+    await expect(job.wait(15_000)).resolves.toBe('done')
+
+    // Step 'a' completed on attempt 1; the replay must return its cached result, not re-run it.
+    expect(stepA).toHaveBeenCalledOnce()
+    expect(stepB).toHaveBeenCalledOnce()
+    expect(attempts).toBe(2)
+  })
+})
+
+test('a bare "1" done publish (an older peer) still resolves via the result key', async () => {
+  // The publish payload is a wire format shared with other processes. During a rolling deploy a
+  // peer running the previous build publishes `"1"` with the record only in the result key —
+  // that must still resolve, not be parsed as a result.
+  const redis = await connect()
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new WorkflowNamespace({
+    id: randomUUID(),
+    redis,
+    prefix,
+    logger: console,
+    autoClose: false,
+  })
+  const workflow = ns.createWorkflow({ id: wfId, run: async () => 'unused' })
+
+  try {
+    const job = await workflow.run(undefined)
+    const waiting = job.wait(10_000)
+
+    // Write the record the way the old code did, then ring the old doorbell.
+    const resultKey = `${prefix}:${wfId}:result:${job.id}`
+    const channel = `${prefix}:${wfId}:done:${job.id}`
+    const record = { state: 'completed', value: stringify('legacy') }
+    await redis.set(resultKey, JSON.stringify(record), 'EX', 60)
+    const pump = setInterval(() => void redis.publish(channel, '1'), 20)
+
+    await expect(waiting).resolves.toBe('legacy')
+    clearInterval(pump)
+  } finally {
+    await ns.close()
+  }
 })

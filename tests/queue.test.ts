@@ -541,25 +541,31 @@ test('add() rejects an out-of-range or non-integer priority', async () => {
 // Mutable step data (ticket 05)
 // ---------------------------------------------------------------------------
 
-test('setStepData/getStepData round-trips an opaque string; null on miss', async () => {
-  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
-  const queue = ns.queue({ id: randomUUID() })
+test('setStepData writes an opaque string to the job step hash', async () => {
+  const prefix = randomUUID()
+  const conn = await connect()
+  const ns = new Namespace({ id: randomUUID(), redis: conn, prefix })
+  const wfId = randomUUID()
+  const queue = ns.queue({ id: wfId })
 
   try {
     const jobId = randomUUID()
-    expect(await queue.getStepData(jobId, 'step-a')).toBeNull() // never written
-
+    const stepsKey = `${prefix}:${wfId}:j:${jobId}:steps`
+    expect(await conn.hget(stepsKey, 'step-a')).toBeNull() // never written
     await queue.setStepData(jobId, 'step-a', 'opaque \n{"x":1}')
-    expect(await queue.getStepData(jobId, 'step-a')).toBe('opaque \n{"x":1}')
-    expect(await queue.getStepData(jobId, 'step-b')).toBeNull() // distinct field still missing
+    expect(await conn.hget(stepsKey, 'step-a')).toBe('opaque \n{"x":1}')
+    expect(await conn.hget(stepsKey, 'step-b')).toBeNull() // distinct field still missing
   } finally {
     await ns.close()
   }
 })
 
 test('parallel setStepData on distinct steps both persist (no lost update)', async () => {
-  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
-  const queue = ns.queue({ id: randomUUID() })
+  const prefix = randomUUID()
+  const conn = await connect()
+  const ns = new Namespace({ id: randomUUID(), redis: conn, prefix })
+  const wfId = randomUUID()
+  const queue = ns.queue({ id: wfId })
 
   try {
     const jobId = randomUUID()
@@ -567,8 +573,10 @@ test('parallel setStepData on distinct steps both persist (no lost update)', asy
       queue.setStepData(jobId, 'a', 'value-a'),
       queue.setStepData(jobId, 'b', 'value-b'),
     ])
-    expect(await queue.getStepData(jobId, 'a')).toBe('value-a')
-    expect(await queue.getStepData(jobId, 'b')).toBe('value-b')
+    expect(await conn.hgetall(`${prefix}:${wfId}:j:${jobId}:steps`)).toEqual({
+      a: 'value-a',
+      b: 'value-b',
+    })
   } finally {
     await ns.close()
   }
@@ -933,11 +941,17 @@ test('keepFailed count-trims the failed ZSET and DELs evicted job hashes', async
 
   try {
     // Fail 4 jobs one at a time (sequenced via wait) ⇒ strictly increasing `finishedOn`.
+    // `finishedOn` is the retention score and is only millisecond-granular, so two failures
+    // landing in the same millisecond would tie and be evicted in member (uuid) order rather
+    // than the order they finished — which is what this test is asserting. `wait()` now returns
+    // as soon as the notification lands rather than after a second read, so the loop can and
+    // does close that gap on a fast box: step past the millisecond to keep the premise true.
     const ids: string[] = []
     for (let i = 0; i < 4; i++) {
       const { id } = await queue.add(`j${i}`)
       ids.push(id)
       await queue.wait(id).catch(() => {})
+      await sleep(2)
     }
 
     const failedKey = `${prefix}:${wfId}:failed`
@@ -1490,6 +1504,264 @@ test('onError is invoked when a worker-internal operation throws', async () => {
     expect((error as Error).message).toBe('scan failed')
   } finally {
     vi.restoreAllMocks()
+    await ns.close()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Batch reserve + local slot parking (perf rework)
+//
+// `reserve` now claims a BATCH of jobs in one atomic script and a saturated worker parks on an
+// in-process signal instead of BRPOP. Both move decisions that used to be one-per-round-trip
+// into places where a bug is invisible from the outside — these pin the invariants that keep
+// them honest, including across workers that do not share a JS heap.
+// ---------------------------------------------------------------------------
+
+test('batch reserve never exceeds the group cap, however many slots the worker offers', async () => {
+  const prefix = randomUUID()
+  const nsId = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
+  // One group, cap 1: a single batch could trivially claim all 8 at once if the Lua loop failed
+  // to re-evaluate the group's `ready` membership between claims.
+  const queue = ns.queue({ id: wfId, groupConcurrency: 1 })
+  const tracker = makeTracker()
+  const ran = vi.fn()
+
+  try {
+    queue.worker(
+      async (job) => {
+        tracker.enter()
+        await sleep(5)
+        tracker.exit()
+        ran(job.data)
+        return 'ok'
+      },
+      { concurrency: 20 },
+    )
+
+    for (let i = 0; i < 8; i++) await queue.add(`job-${i}`, { groupId: 'g' })
+
+    await vi.waitFor(() => {
+      expect(ran).toHaveBeenCalledTimes(8)
+    })
+    expect(tracker.max).toBe(1)
+    await assertDrained(prefix, [wfId], nsId)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('batch reserve respects the namespace cap across workers on separate connections', async () => {
+  const prefix = randomUUID()
+  const nsId = randomUUID()
+  const wfId = randomUUID()
+  const NS_CAP = 2
+
+  // Two Namespace instances on two connections = two independent JS heaps' worth of worker
+  // state, exactly like two processes. Only Redis can hold the cap between them.
+  const nsA = new Namespace({ id: nsId, concurrency: NS_CAP, redis: await connect(), prefix })
+  const nsB = new Namespace({ id: nsId, concurrency: NS_CAP, redis: await connect(), prefix })
+  const queueA = nsA.queue({ id: wfId })
+  const queueB = nsB.queue({ id: wfId })
+  const tracker = makeTracker()
+  const ran = vi.fn()
+
+  try {
+    for (const queue of [queueA, queueB]) {
+      queue.worker(
+        async (job) => {
+          tracker.enter()
+          await sleep(10)
+          tracker.exit()
+          ran(job.data)
+          return 'ok'
+        },
+        // Each worker offers far more slots than the namespace allows, so an uncapped batch
+        // would blow straight through NS_CAP.
+        { concurrency: 20 },
+      )
+    }
+
+    for (let i = 0; i < 12; i++) await queueA.add(`job-${i}`)
+
+    await vi.waitFor(() => {
+      expect(ran).toHaveBeenCalledTimes(12)
+    })
+    expect(tracker.max).toBeLessThanOrEqual(NS_CAP)
+    await assertDrained(prefix, [wfId], nsId)
+  } finally {
+    await Promise.all([nsA.close(), nsB.close()])
+  }
+})
+
+test('every job in one batch gets a distinct claim token, so each one commits', async () => {
+  const prefix = randomUUID()
+  const nsId = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+
+  try {
+    // Tokens are derived in-script as `<uuid>:<n>`. If two jobs in a batch shared a token, the
+    // token guard on `complete` would silently no-op one of them and it would hang here.
+    queue.worker(() => 'ok', { concurrency: 20 })
+
+    const ids: string[] = []
+    for (let i = 0; i < 20; i++) {
+      const job = await queue.add(`job-${i}`)
+      ids.push(job.id)
+    }
+
+    const results = await Promise.all(ids.map(async (id) => queue.wait(id, { timeoutMs: 10_000 })))
+    expect(results).toHaveLength(20)
+    await assertDrained(prefix, [wfId], nsId)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('a worker held off by a cap another process owns still re-polls and recovers it', async () => {
+  const prefix = randomUUID()
+  const nsId = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
+  // Workflow cap 1: while the dead claim below is held, our worker can never claim anything.
+  const queue = ns.queue({ id: wfId, concurrency: 1 })
+  const ran = vi.fn()
+
+  try {
+    // A claim held by a process that then died: reserved directly, never heartbeated, never
+    // completed. Nothing will ever LPUSH a wake on its behalf.
+    const stuck = await queue.add('stuck')
+    const noNsCap = Number.MAX_SAFE_INTEGER
+    const claimed = await ns.redis.reserve(
+      prefix,
+      wfId,
+      nsId,
+      noNsCap,
+      1,
+      1,
+      150,
+      randomUUID(),
+      500,
+      1,
+    )
+    const [claimedJobs] = claimed
+    expect(claimedJobs).toHaveLength(1)
+
+    // More due delayed jobs than the promote cap, so `reserve` keeps reporting msToNext = 0
+    // ("work is due right now") while the cap says we cannot have it. That pair used to compute
+    // a BRPOP timeout of 0 — which Redis reads as *block forever*, not *don't block* — so the
+    // worker parked permanently and never ran the stalled scan that frees the dead claim.
+    for (let i = 0; i < 3; i++) await queue.add(`delayed-${i}`, { runIn: 40 })
+    await sleep(120)
+
+    queue.worker(() => 'ok', {
+      concurrency: 5,
+      promoteBatchSize: 1,
+      lockMs: 150,
+      stalledInterval: 100,
+      maxStalledCount: 10,
+      safetyTimeout: 0.2,
+      backoff: () => 0,
+      onFailed: () => {
+        ran('failed')
+      },
+    })
+
+    // All four jobs — the recovered one and the three delayed — must drain.
+    await vi.waitFor(
+      async () => {
+        expect(await redis.zcard(`${prefix}:${wfId}:delayed`)).toBe(0)
+        expect(await redis.exists(`${prefix}:${wfId}:j:${stuck.id}`)).toBe(0)
+      },
+      { timeout: 15_000, interval: 100 },
+    )
+    await assertDrained(prefix, [wfId], nsId)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('close() during an in-flight batch reserve strands nothing', async () => {
+  // The loop claims up to `concurrency` jobs in one call. If it dropped that batch on seeing
+  // `closing`, those jobs would sit `active` — locked, slot-consuming, invisible — until
+  // stalled-recovery, on every clean shutdown. Racing close() against the reserve pins that:
+  // 0ms lands inside the first round-trip, 2ms after it, so both sides of the window are hit.
+  for (const delayMs of [0, 2]) {
+    const prefix = randomUUID()
+    const nsId = randomUUID()
+    const wfId = randomUUID()
+    const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
+    const queue = ns.queue({ id: wfId })
+
+    try {
+      for (let i = 0; i < 16; i++) await queue.add(`job-${i}`)
+
+      const worker = queue.worker(() => 'ok', { concurrency: 16 })
+      // Land close() at varying points across the first reserve round-trip.
+      await sleep(delayMs)
+      await worker.close()
+
+      // Whatever it claimed, it finished: nothing may be left holding a slot or a lock.
+      const lockKeys = await redis.keys(`${prefix}:${wfId}:j:*:lock`)
+      expect({
+        wfActive: await redis.zcard(`${prefix}:${wfId}:active`),
+        nsActive: await redis.scard(`${prefix}:ns:${nsId}:active`),
+        locks: lockKeys.length,
+      }).toEqual({ wfActive: 0, nsActive: 0, locks: 0 })
+    } finally {
+      await ns.close()
+    }
+  }
+})
+
+test('a saturated worker still fires a due cron schedule (it parks locally, not blindly)', async () => {
+  const prefix = randomUUID()
+  const nsId = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const release = makeGate()
+  const seen: string[] = []
+
+  try {
+    // Concurrency 1, and the only slot is occupied by a job that will not finish until we say
+    // so. A saturated worker parks on an in-process signal now — the cron tick must still run.
+    queue.worker(
+      async (job) => {
+        seen.push(job.data)
+        if (job.data === 'blocker') await release.wait()
+        return 'ok'
+      },
+      { concurrency: 1, safetyTimeout: 0.2 },
+    )
+    await queue.add('blocker')
+    await vi.waitFor(() => {
+      expect(seen).toContain('blocker')
+    })
+
+    await queue.upsertSchedule('tick', { pattern: '* * * * * *', data: 'from-cron' })
+
+    // The occurrence must reach `waiting` while the worker is still saturated.
+    await vi.waitFor(
+      async () => {
+        expect(await redis.zcard(`${prefix}:${wfId}:ready`)).toBeGreaterThan(0)
+      },
+      { timeout: 10_000, interval: 100 },
+    )
+
+    release.open()
+    await vi.waitFor(
+      () => {
+        expect(seen).toContain('from-cron')
+      },
+      { timeout: 10_000, interval: 100 },
+    )
+  } finally {
+    release.open()
+    await queue.removeSchedule('tick')
     await ns.close()
   }
 })
