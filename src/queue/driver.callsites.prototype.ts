@@ -11,7 +11,7 @@
  *   namespace.ts — duplicate()+subscribe/unsubscribe, disconnect×2
  */
 
-import type { WorkflowDriver } from './driver.prototype'
+import type { ClaimedJob, WorkflowDriver } from './driver.prototype'
 import type { AddOptions, ReservedJob, ScheduleOptions, WaitOptions } from './types'
 import { randomUUID } from 'node:crypto'
 import { JobAlreadyExistsError, NonRecoverableError, ResultExpiredError } from './errors'
@@ -28,7 +28,7 @@ declare const resultTtlMs: number
 async function add(data: string, opts?: AddOptions): Promise<{ id: string; groupId: string }> {
   const id = opts?.jobId ?? randomUUID()
   const groupId = opts?.groupId ?? randomUUID()
-  // Q3 in action: the `(runAt, runIn)` pair collapses to one absolute epoch-ms here, in JS.
+  // The `(runAt, runIn)` pair collapses to one absolute epoch-ms here, in JS.
   const runAt = opts?.runAt ?? (opts?.runIn === undefined ? null : Date.now() + opts.runIn)
   const outcome = await driver.enqueue({
     wfId,
@@ -118,7 +118,9 @@ async function loop(opts: {
       promoteBatchSize: opts.promoteBatchSize,
       want,
     })
-    for (const claim of res.claims) void process_(claim, opts.lockMs)
+    // The public value type is minted here, once, not in each driver.
+    for (const { job, token } of res.claims)
+      void process_({ job: toReservedJob(job), token }, opts.lockMs)
     if (closing) break
 
     if (res.dueSchedules.length > 0) {
@@ -253,6 +255,11 @@ async function namespaceClose(queues: { close: () => Promise<void> }[]): Promise
 }
 
 /* ──────────────────────────────── unrelated stubs ──────────────────────────────── */
+
+/** Replaces `flatToMap` — the shaping every driver would otherwise have copied. */
+function toReservedJob(row: ClaimedJob): ReservedJob {
+  return Object.freeze({ ...row, steps: new Map(Object.entries(row.steps)) })
+}
 
 declare function parseResult(raw: string): string
 declare function timeout(ms: number): Promise<null>
