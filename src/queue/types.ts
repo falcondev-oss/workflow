@@ -125,6 +125,18 @@ export interface WaitOptions {
   timeoutMs?: number
 }
 
+export interface WatchOptions {
+  signal?: AbortSignal
+  /** Internal: `runAndWatch` subscribes before the job exists. */
+  allowMissing?: boolean
+}
+
+export type QueueEvent =
+  | { type: 'started'; attempt: number }
+  | { type: 'progress'; data: string }
+  | { type: 'completed'; output: string }
+  | { type: 'failed'; error: Error }
+
 /** A job handed to a worker handler — a frozen value, not a class. */
 export interface ReservedJob {
   id: string

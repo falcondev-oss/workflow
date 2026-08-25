@@ -11,6 +11,7 @@ import type {
   WorkflowLogger,
 } from './queue'
 import type { WorkflowJobPayloadInternal, WorkflowQueueInternal } from './types'
+import { randomUUID } from 'node:crypto'
 import { context, propagation, ROOT_CONTEXT, SpanKind } from '@opentelemetry/api'
 import { asyncExitHook } from 'exit-hook'
 import { WorkflowJob } from './job'
@@ -19,6 +20,8 @@ import { deserialize, serialize } from './serializer'
 import { defaultRedisConnection } from './settings'
 import { WorkflowStep } from './step'
 import { runWithTracing } from './tracer'
+
+export type { WorkflowEvent } from './job'
 
 /** Per-workflow queue overrides (module `QueueOptions` minus the id). */
 export type WorkflowQueueOptions = Omit<QueueOptions, 'id'>
@@ -51,10 +54,17 @@ export interface WorkflowNamespaceOptions {
   jobOptions?: WorkflowJobRunOptions
 }
 
-export interface CreateWorkflowOptions<RunInput, Input, Output> {
+export interface CreateWorkflowOptions<
+  RunInput,
+  Input,
+  Output,
+  ProgressInput = never,
+  Progress = ProgressInput,
+> {
   id: string
   schema?: StandardSchemaV1<RunInput, Input>
-  run: (ctx: WorkflowRunContext<Input>) => Promise<Output>
+  progressSchema?: StandardSchemaV1<ProgressInput, Progress>
+  run: (ctx: WorkflowRunContext<Input, ProgressInput>) => Promise<Output>
   getGroupId?: (
     input: IsUnknown<Input> extends true ? undefined : Input,
   ) => string | undefined | Promise<string | undefined>
@@ -120,9 +130,15 @@ export class WorkflowNamespace {
     return this.namespace
   }
 
-  createWorkflow<RunInput, Input = RunInput, Output = unknown>(
-    opts: CreateWorkflowOptions<RunInput, Input, Output>,
-  ): Workflow<RunInput, Input, Output> {
+  createWorkflow<
+    RunInput,
+    Input = RunInput,
+    Output = unknown,
+    ProgressInput = never,
+    Progress = ProgressInput,
+  >(
+    opts: CreateWorkflowOptions<RunInput, Input, Output, ProgressInput, Progress>,
+  ): Workflow<RunInput, Input, Output, ProgressInput, Progress> {
     return new Workflow(this, {
       ...opts,
       queueOptions: { ...this.opts.queueOptions, ...opts.queueOptions },
@@ -142,13 +158,16 @@ export class WorkflowNamespace {
   }
 }
 
-export class Workflow<RunInput, Input, Output> {
+export class Workflow<RunInput, Input, Output, ProgressInput = never, Progress = ProgressInput> {
   readonly id: string
   private readonly ns: WorkflowNamespace
-  private readonly opts: CreateWorkflowOptions<RunInput, Input, Output>
+  private readonly opts: CreateWorkflowOptions<RunInput, Input, Output, ProgressInput, Progress>
   private queue?: Promise<WorkflowQueueInternal>
 
-  constructor(ns: WorkflowNamespace, opts: CreateWorkflowOptions<RunInput, Input, Output>) {
+  constructor(
+    ns: WorkflowNamespace,
+    opts: CreateWorkflowOptions<RunInput, Input, Output, ProgressInput, Progress>,
+  ) {
     this.ns = ns
     this.opts = opts
     this.id = opts.id
@@ -212,7 +231,7 @@ export class Workflow<RunInput, Input, Output> {
               const result = await this.opts.run({
                 // eslint-disable-next-line ts/no-unsafe-assignment
                 input: parsedData?.value as any,
-                step: new WorkflowStep({
+                step: new WorkflowStep<ProgressInput>({
                   queue,
                   workflowJobId: job.id,
                   workflowId: this.id,
@@ -260,8 +279,33 @@ export class Workflow<RunInput, Input, Output> {
     return worker
   }
 
-  async run(input: RunInput, opts?: WorkflowJobRunOptions): Promise<WorkflowJob<Output>> {
+  async run(input: RunInput, opts?: WorkflowJobRunOptions): Promise<WorkflowJob<Output, Progress>> {
     return this.enqueue(input, opts)
+  }
+
+  async runAndWatch(input: RunInput, opts?: WorkflowJobRunOptions) {
+    const jobId = opts?.jobId ?? this.opts.jobOptions?.jobId ?? randomUUID()
+    const events = await new WorkflowJob<Output, Progress>({
+      queue: await this.getQueue(),
+      jobId,
+      progressSchema: this.opts.progressSchema,
+      watchBeforeEnqueue: true,
+    }).watch()
+    try {
+      const job = await this.enqueue(input, { ...opts, jobId })
+      return { job, events }
+    } catch (err) {
+      await events.cancel(err)
+      throw err
+    }
+  }
+
+  async getJob(jobId: string): Promise<WorkflowJob<Output, Progress>> {
+    return new WorkflowJob<Output, Progress>({
+      queue: await this.getQueue(),
+      jobId,
+      progressSchema: this.opts.progressSchema,
+    })
   }
 
   async runIn(input: RunInput, delayMs: number, opts?: WorkflowJobRunOptions) {
@@ -275,7 +319,7 @@ export class Workflow<RunInput, Input, Output> {
   private async enqueue(
     input: RunInput,
     opts?: WorkflowJobRunOptions & { runAt?: number; runIn?: number },
-  ): Promise<WorkflowJob<Output>> {
+  ): Promise<WorkflowJob<Output, Progress>> {
     const parsedInput = this.opts.schema && (await this.opts.schema['~standard'].validate(input))
     if (parsedInput?.issues) throw new Error('Invalid workflow input')
 
@@ -315,7 +359,11 @@ export class Workflow<RunInput, Input, Output> {
           },
         )
 
-        return new WorkflowJob<Output>({ queue, jobId: job.id, groupId: job.groupId })
+        return new WorkflowJob<Output, Progress>({
+          queue,
+          jobId: job.id,
+          progressSchema: this.opts.progressSchema,
+        })
       },
     )
   }
@@ -387,8 +435,8 @@ export class Workflow<RunInput, Input, Output> {
   }
 }
 
-export interface WorkflowRunContext<Input> {
+export interface WorkflowRunContext<Input, Progress = never> {
   input: IsUnknown<Input> extends true ? undefined : Input
-  step: WorkflowStep
+  step: WorkflowStep<Progress>
   span: Span
 }

@@ -280,7 +280,14 @@ export class Worker {
     const controller = new AbortController()
     const stopHeartbeat = this.startHeartbeat(claim, controller)
     try {
+      const started = this.queue
+        .publish(claim.job.id, {
+          type: 'started',
+          attempt: claim.job.attemptsMade + 1,
+        })
+        .catch(this.onError)
       const result = await this.handler(claim.job, { signal: controller.signal })
+      await started
       // Abort-on-lost-claim: the heartbeat aborted because the claim was recovered
       // and re-reserved elsewhere — drop the job without committing. The token-guard on
       // complete/fail makes those no-ops anyway, but skipping avoids the wasted round-trip.

@@ -15,7 +15,7 @@ export type WorkflowStepData =
       startedAt: number
     }
 
-export class WorkflowStep {
+export class WorkflowStep<Progress = never> {
   private workflowId
   private queue
   private workflowJobId
@@ -49,7 +49,7 @@ export class WorkflowStep {
     return `${this.stepNamePrefix}${name}`
   }
 
-  async do<R>(stepName: string, run: (ctx: { step: WorkflowStep; span: Span }) => R) {
+  async do<R>(stepName: string, run: (ctx: { step: WorkflowStep<Progress>; span: Span }) => R) {
     const name = this.addNamePrefix(stepName)
 
     // Memoize on completion only: a stored `result` field means the step finished on a prior
@@ -77,7 +77,7 @@ export class WorkflowStep {
       },
       async (span) => {
         const result = await run({
-          step: new WorkflowStep({
+          step: new WorkflowStep<Progress>({
             queue: this.queue,
             workflowId: this.workflowId,
             workflowJobId: this.workflowJobId,
@@ -99,6 +99,10 @@ export class WorkflowStep {
 
     this.stepPromises.add(promise)
     return promise.finally(() => this.stepPromises.delete(promise))
+  }
+
+  async progress(data: Progress): Promise<void> {
+    await this.queue.publish(this.workflowJobId, { type: 'progress', data: serialize(data) })
   }
 
   async wait(stepName: string, durationMs: number) {

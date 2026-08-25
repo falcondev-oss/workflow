@@ -61,6 +61,55 @@ const result = await job.wait()
 console.log(result.engagementLevel)
 ```
 
+### Watching jobs
+
+Declare a Standard Schema for progress, then emit its input type from any step. Watchers receive
+the validated output type on the same stream as lifecycle and terminal events.
+
+```ts
+const exportPdf = namespace.createWorkflow({
+  id: 'export-pdf',
+  schema: z.object({ reportId: z.string() }),
+  progressSchema: z.object({
+    label: z.string(),
+    done: z.number(),
+    total: z.number(),
+  }),
+  async run({ input, step }) {
+    const rows = await step.do('fetch rows', async ({ step: nestedStep }) => {
+      await nestedStep.progress({ label: 'Fetching rows', done: 0, total: 0 })
+      return loadRows(input.reportId)
+    })
+    await step.progress({ label: 'Rendering', done: 0, total: rows.length })
+    return renderPdf(rows)
+  },
+})
+
+const { job, events } = await exportPdf.runAndWatch({ reportId: '1' })
+for await (const event of events) {
+  if (event.type === 'progress') console.log(event.data.label)
+  if (event.type === 'completed') console.log(event.output)
+}
+```
+
+Events published before `watch()` attaches are lost. Lifecycle and progress events are not
+persisted, and the watcher reads no progress snapshot. Use `runAndWatch()` when the first event
+matters because it subscribes before enqueueing. To attach from another request or process, build
+a handle from the known id:
+
+```ts
+const job = await exportPdf.getJob(jobId)
+const events = await job.watch({ signal: request.signal })
+```
+
+`watch()` subscribes before it resolves and buffers until iteration starts. Breaking out of the
+loop unsubscribes. A retry emits another `started` event, while `failed` is terminal. A completed
+job still yields its stored terminal result until the configured result TTL expires.
+
+The library does not derive a percentage, ETA, or step count because workflows have no declared
+step list. If a workflow knows a total, include it in its progress payload as above. Without a
+`progressSchema`, `step.progress()` is a type error and the `progress` event arm is absent.
+
 ### Steps
 
 - `step.do(name, fn)` — run once, memoize the result. Replayed from Redis on a retry.
