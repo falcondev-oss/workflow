@@ -2,11 +2,13 @@ import type { Namespace } from './namespace'
 import type { QueueRedis } from './scripts'
 import type {
   AddOptions,
+  QueueEvent,
   QueueMetrics,
   QueueOptions,
   ScheduleInfo,
   ScheduleOptions,
   WaitOptions,
+  WatchOptions,
   WorkerOptions,
   WorkflowLogger,
 } from './types'
@@ -93,33 +95,103 @@ export class Queue {
    * Throws `TimeoutError`, `ResultExpiredError`, or the job's own failure.
    */
   async wait(jobId: string, opts?: WaitOptions): Promise<string> {
+    const controller = new AbortController()
+    const timer =
+      opts?.timeoutMs === undefined
+        ? undefined
+        : setTimeout(() => controller.abort(new TimeoutError(jobId)), opts.timeoutMs)
+    try {
+      for await (const event of await this.watch(jobId, { signal: controller.signal })) {
+        if (event.type === 'completed') return event.output
+        if (event.type === 'failed') throw event.error
+      }
+      throw new ResultExpiredError(jobId)
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /** Subscribe before checking for an existing result, then stream every later lifecycle event. */
+  async watch(jobId: string, opts?: WatchOptions): Promise<ReadableStream<QueueEvent>> {
     const channel = `${this.prefix}:${this.id}:done:${jobId}`
     const resultKey = `${this.prefix}:${this.id}:result:${jobId}`
+    let controller!: ReadableStreamDefaultController<QueueEvent>
+    let done = false
+    let cleaned = false
+    let processing = Promise.resolve()
+    let notify!: (raw: string) => void
+    let abort!: () => void
 
-    let notify!: (message: string) => void
-    const notified = new Promise<string>((resolve) => {
-      notify = resolve
-    })
-    await this.ns.addWaiter(channel, notify)
-    try {
-      const first = await this.redis.get(resultKey)
-      if (first !== null) return this.parseResult(first)
-
-      if (opts?.timeoutMs === undefined) return await this.resolvePublished(jobId, await notified)
-
-      let timer: NodeJS.Timeout
-      const timedOut = new Promise<null>((resolve) => {
-        timer = setTimeout(() => resolve(null), opts.timeoutMs)
-      })
-      const published = await Promise.race([notified, timedOut])
-      clearTimeout(timer!)
-      if (published === null) throw new TimeoutError(jobId)
-      return await this.resolvePublished(jobId, published)
-    } finally {
-      // Fire-and-forget: the unsubscribe is ordered on the subscriber connection ahead of any
-      // later subscribe, so nothing is lost by not making the caller pay its round-trip.
-      void this.ns.removeWaiter(channel, notify).catch((err) => this.logger?.error?.(err))
+    const cleanup = async () => {
+      if (cleaned) return
+      cleaned = true
+      opts?.signal?.removeEventListener('abort', abort)
+      await this.ns.removeWaiter(channel, notify)
     }
+    const fail = (error: unknown) => {
+      if (done) return
+      done = true
+      controller.error(error)
+      void cleanup().catch((err) => this.logger?.error?.(err))
+    }
+    const emit = async (raw: string) => {
+      if (done) return
+      const event = await this.parsePublished(jobId, raw)
+      controller.enqueue(event)
+      if (event.type === 'completed' || event.type === 'failed') {
+        done = true
+        controller.close()
+        await cleanup()
+      }
+    }
+    notify = (raw: string) => {
+      processing = processing.then(async () => emit(raw)).catch(fail)
+    }
+    abort = () => fail(opts?.signal?.reason)
+    const events = new ReadableStream<QueueEvent>({
+      start: (controller_) => {
+        controller = controller_
+      },
+      cancel: async () => {
+        done = true
+        await cleanup()
+      },
+    })
+
+    try {
+      await this.ns.addWaiter(channel, notify)
+      opts?.signal?.addEventListener('abort', abort, { once: true })
+      if (opts?.signal?.aborted) abort()
+      else {
+        const result = await this.redis.get(resultKey)
+        // GET and Pub/Sub use separate connections. PING the subscriber before using the snapshot
+        // so every event Redis published before that GET is already in `processing`.
+        await this.ns.flushWaiters()
+        await processing
+        if (!done && result !== null) await emit(result)
+        else if (!done && !opts?.allowMissing) {
+          const state = await this.redis.hget(`${this.prefix}:${this.id}:j:${jobId}`, 'state')
+          if (state === null || state === 'failed') {
+            const lateResult = await this.redis.get(resultKey)
+            await this.ns.flushWaiters()
+            await processing
+            if (!done && lateResult !== null) await emit(lateResult)
+            else if (!done) fail(new ResultExpiredError(jobId))
+          }
+        }
+      }
+    } catch (err) {
+      fail(err)
+    }
+    return events
+  }
+
+  /** Publish a transient lifecycle record. Nothing is persisted. */
+  async publish(
+    jobId: string,
+    event: Extract<QueueEvent, { type: 'started' | 'progress' }>,
+  ): Promise<void> {
+    await this.redis.publish(`${this.prefix}:${this.id}:done:${jobId}`, JSON.stringify(event))
   }
 
   /** Persist a step's data (opaque string) — a single atomic `HSET` on the `:steps` hash. */
@@ -137,26 +209,51 @@ export class Queue {
    * wake-up and re-read from the result key (`ResultExpiredError` if it has aged out) — exactly
    * the pre-change behaviour.
    */
-  private async resolvePublished(jobId: string, published: string): Promise<string> {
-    if (published.startsWith('{')) return this.parseResult(published)
-    const stored = await this.redis.get(`${this.prefix}:${this.id}:result:${jobId}`)
-    if (stored === null) throw new ResultExpiredError(jobId)
-    return this.parseResult(stored)
-  }
-
-  private parseResult(raw: string): string {
-    const record = JSON.parse(raw) as {
-      state: string
-      value?: string
-      reason?: string
-      stack?: string
+  private async parsePublished(jobId: string, published: string): Promise<QueueEvent> {
+    if (!published.startsWith('{')) {
+      const stored = await this.redis.get(`${this.prefix}:${this.id}:result:${jobId}`)
+      if (stored === null) throw new ResultExpiredError(jobId)
+      return this.parsePublished(jobId, stored)
     }
-    if (record.state === 'failed') {
-      const error = new Error(record.reason ?? 'job failed')
-      if (record.stack) error.stack = record.stack
-      throw error
+    const record: unknown = JSON.parse(published)
+    if (typeof record !== 'object' || record === null)
+      throw new Error(`Invalid job event for ${jobId}`)
+    if (
+      'type' in record &&
+      record.type === 'started' &&
+      'attempt' in record &&
+      typeof record.attempt === 'number' &&
+      Number.isInteger(record.attempt) &&
+      record.attempt > 0
+    )
+      return { type: 'started', attempt: record.attempt }
+    if (
+      'type' in record &&
+      record.type === 'progress' &&
+      'data' in record &&
+      typeof record.data === 'string'
+    )
+      return { type: 'progress', data: record.data }
+    if (
+      'state' in record &&
+      record.state === 'failed' &&
+      'reason' in record &&
+      typeof record.reason === 'string' &&
+      (!('stack' in record) || typeof record.stack === 'string')
+    ) {
+      const error = new Error(record.reason)
+      if ('stack' in record && typeof record.stack === 'string' && record.stack)
+        error.stack = record.stack
+      return { type: 'failed', error }
     }
-    return record.value ?? ''
+    if (
+      'state' in record &&
+      record.state === 'completed' &&
+      'value' in record &&
+      typeof record.value === 'string'
+    )
+      return { type: 'completed', output: record.value }
+    throw new Error(`Invalid job event for ${jobId}`)
   }
 
   /**

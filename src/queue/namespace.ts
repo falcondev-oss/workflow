@@ -19,6 +19,7 @@ export class Namespace {
   private readonly subscriber: Redis
   private readonly subscriberReady: Promise<unknown>
   private readonly channelListeners = new Map<string, Set<(message: string) => void>>()
+  private readonly channelSubscriptions = new Map<string, Promise<unknown>>()
   private readonly queues = new Set<Queue>()
 
   constructor(opts: NamespaceOptions) {
@@ -48,9 +49,10 @@ export class Namespace {
     if (!set) {
       set = new Set()
       this.channelListeners.set(channel, set)
-      await this.subscriber.subscribe(channel)
+      this.channelSubscriptions.set(channel, this.subscriber.subscribe(channel))
     }
     set.add(cb)
+    await this.channelSubscriptions.get(channel)
   }
 
   /** Remove a waiter; unsubscribes once the channel has no listeners. */
@@ -59,9 +61,17 @@ export class Namespace {
     if (!set) return
     set.delete(cb)
     if (set.size === 0) {
+      await this.channelSubscriptions.get(channel)
+      if (set.size > 0) return
       this.channelListeners.delete(channel)
+      this.channelSubscriptions.delete(channel)
       await this.subscriber.unsubscribe(channel)
     }
+  }
+
+  /** Wait until this connection has dispatched every Pub/Sub message Redis sent before the ping. */
+  async flushWaiters(): Promise<void> {
+    await this.subscriber.ping()
   }
 
   /** Drains and closes every queue, then disconnects the shared + pub/sub connections. */

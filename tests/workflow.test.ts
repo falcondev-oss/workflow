@@ -4,6 +4,7 @@ import { sleep } from '@antfu/utils'
 import { type } from 'arktype'
 import { stringify } from 'superjson'
 import { beforeAll, describe, expect, test, vi } from 'vitest'
+import { z } from 'zod'
 import { createRedis, ResultExpiredError, TimeoutError, WorkflowNamespace } from '../src'
 
 let sharedRedis: Awaited<ReturnType<typeof createRedis>>
@@ -44,6 +45,12 @@ function passthrough<T>(): StandardSchemaV1<T, T> {
       validate: (value) => ({ value: value as T }),
     },
   }
+}
+
+async function collect<T>(events: AsyncIterable<T>): Promise<T[]> {
+  const result: T[] = []
+  for await (const event of events) result.push(event)
+  return result
 }
 
 describe('input', () => {
@@ -149,6 +156,330 @@ describe('wait', () => {
     } finally {
       await ns.close()
     }
+  })
+})
+
+describe('watch', () => {
+  test('yields the attempt and output in emission order, then ends', async () => {
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      run: async () => 'done',
+    })
+    const job = await workflow.run(undefined)
+    const events = await job.watch()
+    await workflow.work()
+
+    const received = await collect(events)
+
+    expect(received).toEqual([
+      { type: 'started', attempt: 1 },
+      { type: 'completed', output: 'done' },
+    ])
+  })
+
+  test('yields a terminal failure instead of throwing from the stream', async () => {
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      run: async () => {
+        throw new Error('boom')
+      },
+    })
+    const job = await workflow.run(undefined)
+    const events = await job.watch()
+    await workflow.work()
+
+    const received = await collect(events)
+
+    expect(received[0]).toEqual({ type: 'started', attempt: 1 })
+    expect(received[1]).toMatchObject({ type: 'failed', error: { message: 'boom' } })
+  })
+
+  test('emits another start after a retry and no intermediate failure', async () => {
+    let attempts = 0
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      workerOptions: { maxAttempts: 2 },
+      run: async () => {
+        if (attempts++ === 0) throw new Error('retry me')
+        return 'done'
+      },
+    })
+    const job = await workflow.run(undefined)
+    const events = await job.watch()
+    await workflow.work({ backoff: () => 0 })
+
+    const received = await collect(events)
+
+    expect(received).toEqual([
+      { type: 'started', attempt: 1 },
+      { type: 'started', attempt: 2 },
+      { type: 'completed', output: 'done' },
+    ])
+  })
+
+  test('gives two watchers the complete stream independently', async () => {
+    const workflow = namespace().createWorkflow({ id: randomUUID(), run: async () => 'done' })
+    const job = await workflow.run(undefined)
+    const watchers = await Promise.all([job.watch(), job.watch()])
+    await workflow.work()
+
+    const received = await Promise.all(watchers.map(collect))
+
+    expect(received[0]).toEqual(received[1])
+    expect(received[0]).toEqual([
+      { type: 'started', attempt: 1 },
+      { type: 'completed', output: 'done' },
+    ])
+  })
+
+  test('unsubscribes when iteration stops early', async () => {
+    const gate = makeGate()
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      run: async () => {
+        await gate.wait()
+        return 'done'
+      },
+    })
+    const job = await workflow.run(undefined)
+    const [earlyEvents, completeEvents] = await Promise.all([job.watch(), job.watch()])
+    await workflow.work()
+    const completeReceived = collect(completeEvents)
+    const earlyReceived = []
+
+    try {
+      for await (const event of earlyEvents) {
+        earlyReceived.push(event)
+        if (event.type === 'started') break
+      }
+    } finally {
+      gate.open()
+    }
+
+    expect(earlyReceived).toEqual([{ type: 'started', attempt: 1 }])
+    await expect(completeReceived).resolves.toEqual([
+      { type: 'started', attempt: 1 },
+      { type: 'completed', output: 'done' },
+    ])
+  })
+
+  test('returns the terminal event when the job already finished', async () => {
+    const workflow = namespace().createWorkflow({ id: randomUUID(), run: async () => 'done' })
+    await workflow.work()
+    const job = await workflow.run(undefined)
+    await job.wait()
+
+    const received = await collect(await job.watch())
+
+    expect(received).toEqual([{ type: 'completed', output: 'done' }])
+  })
+
+  test('throws ResultExpiredError after the terminal result window', async () => {
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      queueOptions: { resultTtl: 1 },
+      run: async () => 'done',
+    })
+    const { job, events: initialEvents } = await workflow.runAndWatch(undefined)
+    await workflow.work()
+    await collect(initialEvents)
+    await sleep(1100)
+
+    const events = await job.watch()
+    const next = events[Symbol.asyncIterator]().next()
+
+    await expect(
+      Promise.race([
+        next,
+        sleep(100).then(() => {
+          throw new Error('watch hung')
+        }),
+      ]),
+    ).rejects.toBeInstanceOf(ResultExpiredError)
+  })
+
+  test('accepts an AbortSignal', async () => {
+    const workflow = namespace().createWorkflow({ id: randomUUID(), run: async () => 'never' })
+    const job = await workflow.run(undefined)
+    const controller = new AbortController()
+    const events = await job.watch({ signal: controller.signal })
+    const reason = new Error('stop watching')
+
+    controller.abort(reason)
+
+    await expect(events[Symbol.asyncIterator]().next()).rejects.toBe(reason)
+  })
+
+  test('validates and yields progress emitted from a nested step', async () => {
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      schema: type({ name: 'string' }),
+      progressSchema: type({ label: 'string', done: 'number' }),
+      run: async ({ input, step }) => {
+        input.name satisfies string
+        await step.do('outer', async ({ step: nestedStep }) => {
+          await nestedStep.progress({ label: 'Rendering', done: 1 })
+          await nestedStep.progress({ label: 'Uploading', done: 2 })
+        })
+        return 'done'
+      },
+    })
+    const job = await workflow.run({ name: 'report' })
+    const events = await job.watch()
+    await workflow.work()
+
+    const received = await collect(events)
+
+    expect(received).toEqual([
+      { type: 'started', attempt: 1 },
+      { type: 'progress', data: { label: 'Rendering', done: 1 } },
+      { type: 'progress', data: { label: 'Uploading', done: 2 } },
+      { type: 'completed', output: 'done' },
+    ])
+  })
+
+  test('removes progress from workflows without a schema', async () => {
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      run: async ({ step }) => {
+        if (false) {
+          // @ts-expect-error progress is unavailable without a progress schema
+          await step.progress('undeclared')
+        }
+        return 'done'
+      },
+    })
+    const job = await workflow.run(undefined)
+    const events = await job.watch()
+    await workflow.work()
+
+    for await (const event of events) {
+      // @ts-expect-error the progress arm vanishes when Progress is never
+      if (event.type === 'progress') throw new Error('unreachable')
+    }
+  })
+
+  test('splits schema input from validated output', async () => {
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      schema: z.object({ id: z.string() }),
+      progressSchema: z.object({
+        value: z.string().transform(Number),
+        label: z.string().default('Working'),
+      }),
+      run: async ({ input, step }) => {
+        input.id satisfies string
+        await step.progress({ value: '42' })
+        return input.id
+      },
+    })
+    const job = await workflow.run({ id: 'report' })
+    const events = await job.watch()
+    await workflow.work()
+
+    for await (const event of events) {
+      if (event.type === 'progress') {
+        event.data.value satisfies number
+        event.data.label satisfies string
+        expect(event.data).toEqual({ value: 42, label: 'Working' })
+      }
+    }
+  })
+
+  test('keeps a union progress payload in the event type', async () => {
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      progressSchema: type('string | number'),
+      run: async ({ step }) => {
+        await step.progress(1)
+        return 'done'
+      },
+    })
+    const job = await workflow.run(undefined)
+    const events = await job.watch()
+    await workflow.work()
+
+    for await (const event of events) {
+      if (event.type === 'progress') expect(event.data satisfies string | number).toBe(1)
+    }
+  })
+
+  test('rejects progress that fails receive-side validation', async () => {
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      progressSchema: type({ done: 'number' }),
+      run: async ({ step }) => {
+        await step.progress({ done: 'wrong' } as unknown as { done: number })
+        return 'done'
+      },
+    })
+    const job = await workflow.run(undefined)
+    const events = await job.watch()
+    const iterator = events[Symbol.asyncIterator]()
+    await workflow.work()
+
+    await expect(iterator.next()).resolves.toMatchObject({
+      value: { type: 'started', attempt: 1 },
+    })
+    await expect(iterator.next()).rejects.toThrow(`Invalid workflow progress for job ${job.id}`)
+  })
+
+  test('does not re-emit progress from a cached step on retry', async () => {
+    let attempts = 0
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      progressSchema: type({ label: 'string' }),
+      workerOptions: { maxAttempts: 2 },
+      run: async ({ step }) => {
+        await step.do('cached', async ({ step: nestedStep }) => {
+          await nestedStep.progress({ label: 'Running once' })
+          return 'cached'
+        })
+        if (attempts++ === 0) throw new Error('retry')
+        return 'done'
+      },
+    })
+    const job = await workflow.run(undefined)
+    const events = await job.watch()
+    await workflow.work({ backoff: () => 0 })
+
+    const received = await collect(events)
+
+    expect(received).toEqual([
+      { type: 'started', attempt: 1 },
+      { type: 'progress', data: { label: 'Running once' } },
+      { type: 'started', attempt: 2 },
+      { type: 'completed', output: 'done' },
+    ])
+  })
+
+  test('runAndWatch attaches before enqueueing', async () => {
+    const workflow = namespace().createWorkflow({ id: randomUUID(), run: async () => 'done' })
+    const { job, events } = await workflow.runAndWatch(undefined)
+    await workflow.work()
+
+    const received = await collect(events)
+
+    expect(job.id).toMatch(/^[0-9a-f-]{36}$/i)
+    expect(received).toEqual([
+      { type: 'started', attempt: 1 },
+      { type: 'completed', output: 'done' },
+    ])
+  })
+
+  test('rehydrates a typed job handle from its id on a producer-only namespace', async () => {
+    const workflowId = randomUUID()
+    const producer = namespace().createWorkflow({ id: workflowId, run: async () => 'done' })
+    const observer = namespace().createWorkflow({ id: workflowId, run: async () => 'unused' })
+    const job = await producer.run(undefined)
+    const attached = await observer.getJob(job.id)
+    const watchers = await Promise.all([job.watch(), attached.watch()])
+    await producer.work()
+
+    const received = await Promise.all(watchers.map(collect))
+
+    expect(attached.id).toBe(job.id)
+    expect(received[0]).toEqual(received[1])
   })
 })
 
@@ -285,29 +616,17 @@ describe('step', () => {
 })
 
 describe('groups', () => {
-  test('random id if not specified', async () => {
-    const workflow = namespace().createWorkflow({
-      id: randomUUID(),
-      schema: type({ name: 'string' }),
-      run: async () => {},
-    })
-    await workflow.work()
-    const job = await workflow.run({ name: 'A' })
-
-    expect(job.groupId).toMatch(/^[0-9a-f-]{36}$/i)
-  })
-
-  test('uses specified groupId getter', async () => {
+  test('does not expose groupId on the public job handle', async () => {
     const workflow = namespace().createWorkflow({
       id: randomUUID(),
       schema: type({ name: 'string' }),
       getGroupId: (input) => `group-for-${input.name}`,
       run: async () => {},
     })
-    await workflow.work()
     const job = await workflow.run({ name: 'A' })
 
-    expect(job.groupId).toBe('group-for-A')
+    // @ts-expect-error groupId is worker-internal, not part of a producer's handle
+    expect(job.groupId).toBeUndefined()
   })
 })
 
