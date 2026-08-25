@@ -1,7 +1,7 @@
 {
   "name": "@falcondev-oss/workflow",
   "type": "module",
-  "version": "0.13.1",
+  "version": "0.14.0",
   "packageManager": "pnpm@10.28.2",
   "description": "Durable, type-safe queue workers on Redis with memoized steps, cron schedules, group ordering, OpenTelemetry tracing.",
   "license": "MIT",
