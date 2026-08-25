@@ -198,9 +198,3 @@ Spans are emitted for producers, workers and each step via the global OpenTeleme
 
 - https://x.com/imsh4yy/status/1984073526605967785?s=46
 
-## Breaking changes
-
-- `groupId` is no longer exposed on the public job handle. Group ordering options still work.
-- Do not rolling-deploy this version alongside an older release. Progress records use the existing
-  per-job completion channel, and an older peer can mistake one for a completed job with empty
-  output. Stop every old producer and worker, deploy the new version, then restart them together.
