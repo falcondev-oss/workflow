@@ -1,7 +1,7 @@
 import type { Meter, Span } from '@opentelemetry/api'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
 import type Redis from 'ioredis'
-import type { IsUnknown } from 'type-fest'
+import type { IsUnion, IsUnknown } from 'type-fest'
 import type {
   AddOptions,
   QueueOptions,
@@ -10,12 +10,14 @@ import type {
   WorkerOptions,
   WorkflowLogger,
 } from './queue'
+import type { RateLimiterBudget, RateLimiterMetrics } from './queue/types'
 import type { WorkflowJobPayloadInternal, WorkflowQueueInternal } from './types'
 import { randomUUID } from 'node:crypto'
 import { context, propagation, ROOT_CONTEXT, SpanKind } from '@opentelemetry/api'
 import { asyncExitHook } from 'exit-hook'
 import { WorkflowJob } from './job'
 import { Namespace, NonRecoverableError } from './queue'
+import { RateLimitError } from './queue/errors'
 import { deserialize, serialize } from './serializer'
 import { defaultRedisConnection } from './settings'
 import { WorkflowStep } from './step'
@@ -24,7 +26,13 @@ import { runWithTracing } from './tracer'
 export type { WorkflowEvent } from './job'
 
 /** Per-workflow queue overrides (module `QueueOptions` minus the id). */
-export type WorkflowQueueOptions = Omit<QueueOptions, 'id'>
+export type WorkflowQueueOptions<Names extends readonly string[] = readonly string[]> = Omit<
+  QueueOptions,
+  'id' | 'rateLimiters'
+> & {
+  /** Replaces the namespace default list. Use [] to remove every limiter. */
+  rateLimiters?: Names
+}
 
 /** Per-workflow worker overrides plus the lib's OTel metrics binding. */
 export type WorkflowWorkerOptions = WorkerOptions & {
@@ -37,7 +45,10 @@ export type WorkflowWorkerOptions = WorkerOptions & {
 /** Per-run enqueue overrides (`runAt`/`runIn` are set by `runAt()`/`runIn()`). */
 export type WorkflowJobRunOptions = Omit<AddOptions, 'runAt' | 'runIn'>
 
-export interface WorkflowNamespaceOptions {
+export interface WorkflowNamespaceOptions<
+  Limiters extends Record<string, RateLimiterBudget> = Record<string, RateLimiterBudget>,
+  Names extends readonly (keyof Limiters & string)[] = readonly (keyof Limiters & string)[],
+> {
   id: string
   concurrency?: number
   redis?: Redis
@@ -49,7 +60,12 @@ export interface WorkflowNamespaceOptions {
    * Default: true.
    */
   autoClose?: boolean
-  queueOptions?: WorkflowQueueOptions
+  /**
+   * At most limit starts in any window ms. Bursts are allowed; retries and stalled
+   * re-claims count too. Both limit and window must be positive integers.
+   */
+  rateLimiters?: Limiters
+  queueOptions?: WorkflowQueueOptions<Names>
   workerOptions?: WorkflowWorkerOptions
   jobOptions?: WorkflowJobRunOptions
 }
@@ -60,15 +76,16 @@ export interface CreateWorkflowOptions<
   Output,
   ProgressInput = never,
   Progress = ProgressInput,
+  Names extends readonly string[] = readonly string[],
 > {
   id: string
   schema?: StandardSchemaV1<RunInput, Input>
   progressSchema?: StandardSchemaV1<ProgressInput, Progress>
-  run: (ctx: WorkflowRunContext<Input, ProgressInput>) => Promise<Output>
+  run: (ctx: WorkflowRunContext<Input, ProgressInput, Names[number]>) => Promise<Output>
   getGroupId?: (
     input: IsUnknown<Input> extends true ? undefined : Input,
   ) => string | undefined | Promise<string | undefined>
-  queueOptions?: WorkflowQueueOptions
+  queueOptions?: WorkflowQueueOptions<Names>
   workerOptions?: WorkflowWorkerOptions
   jobOptions?: WorkflowJobRunOptions
 }
@@ -89,14 +106,21 @@ export interface WorkflowScheduleOptions<RunInput> {
  * cap). The module `Namespace` is created lazily so the default (async) redis connection can be
  * resolved on first use.
  */
-export class WorkflowNamespace {
+export class WorkflowNamespace<
+  const Limiters extends Record<string, RateLimiterBudget> = Record<never, never>,
+  const Defaults extends readonly (keyof Limiters & string)[] = [],
+> {
   readonly id: string
   readonly logger?: WorkflowLogger
-  private readonly opts: WorkflowNamespaceOptions
+  private readonly opts: WorkflowNamespaceOptions<Limiters, Defaults>
   private namespace?: Promise<Namespace>
   private unregisterExitHook?: () => void
 
-  constructor(opts: WorkflowNamespaceOptions) {
+  constructor(opts: WorkflowNamespaceOptions<Limiters, Defaults>) {
+    for (const [name, { limit, window }] of Object.entries(opts.rateLimiters ?? {})) {
+      if (!Number.isInteger(limit) || limit <= 0 || !Number.isInteger(window) || window <= 0)
+        throw new Error(`Rate limiter "${name}" requires positive integer limit and window`)
+    }
     this.id = opts.id
     this.logger = opts.logger
     this.opts = opts
@@ -112,6 +136,7 @@ export class WorkflowNamespace {
           redis,
           prefix: this.opts.prefix,
           logger: this.opts.logger,
+          rateLimiters: this.opts.rateLimiters,
         })
         // One namespace-level exit hook: drains every worker and disconnects redis on a
         // process signal. Opt out with `autoClose: false` to own shutdown yourself.
@@ -136,15 +161,30 @@ export class WorkflowNamespace {
     Output = unknown,
     ProgressInput = never,
     Progress = ProgressInput,
+    const Names extends readonly (keyof Limiters & string)[] = Defaults,
   >(
-    opts: CreateWorkflowOptions<RunInput, Input, Output, ProgressInput, Progress>,
-  ): Workflow<RunInput, Input, Output, ProgressInput, Progress> {
+    opts: CreateWorkflowOptions<RunInput, Input, Output, ProgressInput, Progress, Names>,
+  ): Workflow<RunInput, Input, Output, ProgressInput, Progress, Names> {
     return new Workflow(this, {
       ...opts,
-      queueOptions: { ...this.opts.queueOptions, ...opts.queueOptions },
+      queueOptions: {
+        ...this.opts.queueOptions,
+        ...opts.queueOptions,
+        rateLimiters: (opts.queueOptions?.rateLimiters ?? this.opts.queueOptions?.rateLimiters) as
+          | Names
+          | undefined,
+      },
       workerOptions: { ...this.opts.workerOptions, ...opts.workerOptions },
       jobOptions: { ...this.opts.jobOptions, ...opts.jobOptions },
     })
+  }
+
+  /** Point-in-time starts in the current window and pausedMs remaining, per declared limiter. */
+  async getRateLimiterMetrics(): Promise<Record<keyof Limiters & string, RateLimiterMetrics>> {
+    const namespace = await this.getNamespace()
+    return namespace.getRateLimiterMetrics() as Promise<
+      Record<keyof Limiters & string, RateLimiterMetrics>
+    >
   }
 
   /** Top-level cascade: closes every queue/worker and disconnects the shared connections. */
@@ -158,15 +198,29 @@ export class WorkflowNamespace {
   }
 }
 
-export class Workflow<RunInput, Input, Output, ProgressInput = never, Progress = ProgressInput> {
+export class Workflow<
+  RunInput,
+  Input,
+  Output,
+  ProgressInput = never,
+  Progress = ProgressInput,
+  Names extends readonly string[] = readonly string[],
+> {
   readonly id: string
-  private readonly ns: WorkflowNamespace
-  private readonly opts: CreateWorkflowOptions<RunInput, Input, Output, ProgressInput, Progress>
+  private readonly ns: Pick<WorkflowNamespace, 'getNamespace' | 'logger'>
+  private readonly opts: CreateWorkflowOptions<
+    RunInput,
+    Input,
+    Output,
+    ProgressInput,
+    Progress,
+    Names
+  >
   private queue?: Promise<WorkflowQueueInternal>
 
   constructor(
-    ns: WorkflowNamespace,
-    opts: CreateWorkflowOptions<RunInput, Input, Output, ProgressInput, Progress>,
+    ns: Pick<WorkflowNamespace, 'getNamespace' | 'logger'>,
+    opts: CreateWorkflowOptions<RunInput, Input, Output, ProgressInput, Progress, Names>,
   ) {
     this.ns = ns
     this.opts = opts
@@ -186,6 +240,7 @@ export class Workflow<RunInput, Input, Output, ProgressInput = never, Progress =
           concurrency: this.opts.queueOptions?.concurrency,
           groupConcurrency: this.opts.queueOptions?.groupConcurrency,
           resultTtl: this.opts.queueOptions?.resultTtl,
+          rateLimiters: this.opts.queueOptions?.rateLimiters,
         })
       })()
     }
@@ -253,6 +308,16 @@ export class Workflow<RunInput, Input, Output, ProgressInput = never, Progress =
                   memo: new Map(job.steps),
                 }),
                 span,
+                rateLimit: ((ms: number, name?: string): never => {
+                  if (!Number.isFinite(ms) || ms <= 0)
+                    throw new Error('rateLimit ms must be a positive finite number')
+                  const limiter = name ?? this.opts.queueOptions?.rateLimiters?.[0] ?? ''
+                  span.addEvent('workflow.rate_limit', {
+                    ...(limiter ? { 'workflow.rate_limiter': limiter } : {}),
+                    'workflow.rate_limit.pause_ms': ms,
+                  })
+                  throw new RateLimitError(ms, limiter)
+                }) as RateLimit<Names[number]>,
               })
 
               this.logger?.success?.(
@@ -287,7 +352,10 @@ export class Workflow<RunInput, Input, Output, ProgressInput = never, Progress =
 
     this.logger?.info?.(`[${this.id}] Worker started`)
 
-    if (metrics) this.setupMetrics(queue, metrics)
+    if (metrics) {
+      this.setupMetrics(queue, metrics)
+      queue.ns.setupRateLimiterMetrics(metrics)
+    }
 
     return worker
   }
@@ -448,8 +516,20 @@ export class Workflow<RunInput, Input, Output, ProgressInput = never, Progress =
   }
 }
 
-export interface WorkflowRunContext<Input, Progress = never> {
+type RateLimit<Names extends string> = [Names] extends [never]
+  ? (ms: number) => never
+  : IsUnion<Names> extends true
+    ? (ms: number, limiter: Names) => never
+    : (ms: number, limiter?: Names) => never
+
+export interface WorkflowRunContext<Input, Progress = never, Names extends string = never> {
   input: IsUnknown<Input> extends true ? undefined : Input
   step: WorkflowStep<Progress>
   span: Span
+  /**
+   * Throws and pauses the limiter for every workflow using it, without using an attempt.
+   * A pause never shortens an earlier pause. The name is required with several limiters;
+   * with no limiters, only this workflow pauses. ms must be a positive finite number.
+   */
+  rateLimit: RateLimit<Names>
 }

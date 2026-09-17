@@ -28,6 +28,8 @@ export class Queue {
   readonly groupConcurrency: number
   readonly resultTtl: number
   readonly redis: QueueRedis
+  /** `reserve`'s trailing ARGV: `count, name, limit, window, …`. */
+  readonly rateLimitArgs: (string | number)[]
 
   private readonly workers = new Set<Worker>()
 
@@ -40,6 +42,14 @@ export class Queue {
     this.groupConcurrency = opts.groupConcurrency ?? 1
     this.resultTtl = opts.resultTtl ?? 300
     this.redis = ns.redis
+    const names = opts.rateLimiters ?? []
+    this.rateLimitArgs = [
+      names.length,
+      ...names.flatMap((name) => {
+        const budget = ns.rateLimiters[name]!
+        return [name, budget.limit, budget.window]
+      }),
+    ]
   }
 
   get prefix(): string {

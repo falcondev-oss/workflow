@@ -1,9 +1,21 @@
 import type { StandardSchemaV1 } from '@standard-schema/spec'
 import { randomUUID } from 'node:crypto'
 import { sleep } from '@antfu/utils'
+import { SpanStatusCode, trace } from '@opentelemetry/api'
+import {
+  AggregationTemporality,
+  InMemoryMetricExporter,
+  MeterProvider,
+  PeriodicExportingMetricReader,
+} from '@opentelemetry/sdk-metrics'
+import {
+  BasicTracerProvider,
+  InMemorySpanExporter,
+  SimpleSpanProcessor,
+} from '@opentelemetry/sdk-trace-base'
 import { type } from 'arktype'
 import { stringify } from 'superjson'
-import { beforeAll, describe, expect, test, vi } from 'vitest'
+import { beforeAll, describe, expect, onTestFinished, test, vi } from 'vitest'
 import { z } from 'zod'
 import { createRedis, ResultExpiredError, TimeoutError, WorkflowNamespace } from '../src'
 
@@ -952,4 +964,644 @@ test('a bare "1" done publish (an older peer) still resolves via the result key'
   } finally {
     await ns.close()
   }
+})
+
+describe('rate limits', () => {
+  test('shares every budget across workflows and admits bursts', async () => {
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      redis: await connect(),
+      autoClose: false,
+      rateLimiters: { api: { limit: 3, window: 240 }, search: { limit: 2, window: 100 } },
+      queueOptions: { rateLimiters: ['api', 'search'] },
+    })
+    onTestFinished(async () => ns.close())
+    const starts: number[] = []
+    const workflows = ['a', 'b'].map(() =>
+      ns.createWorkflow({
+        id: randomUUID(),
+        run: async () => {
+          starts.push(Date.now())
+        },
+      }),
+    )
+    const jobs = await Promise.all(
+      Array.from({ length: 12 }, async (_, i) => workflows[i % 2]!.run(undefined)),
+    )
+    await Promise.all(workflows.map(async (wf) => wf.work({ concurrency: 8 })))
+    await Promise.all(jobs.map(async (job) => job.wait(4000)))
+    expect(starts[1]! - starts[0]!).toBeLessThan(60)
+    for (const { limit, window } of [
+      { limit: 3, window: 240 },
+      { limit: 2, window: 100 },
+    ]) {
+      for (let i = limit; i < starts.length; i++)
+        expect(starts[i]! - starts[i - limit]!).toBeGreaterThanOrEqual(window - 10)
+    }
+  })
+
+  test('counts retries and spaces starts with the local timer', async () => {
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      redis: await connect(),
+      autoClose: false,
+      rateLimiters: { api: { limit: 1, window: 100 } },
+      queueOptions: { rateLimiters: ['api'] },
+    })
+    onTestFinished(async () => ns.close())
+    const starts: number[] = []
+    const wf = ns.createWorkflow({
+      id: randomUUID(),
+      run: async () => {
+        starts.push(Date.now())
+        if (starts.length < 5) throw new Error('retry')
+        return 'done'
+      },
+      jobOptions: { maxAttempts: 5 },
+    })
+    const { job, events } = await wf.runAndWatch(undefined)
+    const watching = collect(events)
+    await wf.work({ backoff: () => 0 })
+    await expect(job.wait(3000)).resolves.toBe('done')
+    const recorded = await watching
+    expect(
+      recorded.filter((event) => event.type === 'started').map((event) => event.attempt),
+    ).toEqual([1, 2, 3, 4, 5])
+    for (let i = 1; i < starts.length; i++)
+      expect(starts[i]! - starts[i - 1]!).toBeGreaterThanOrEqual(90)
+    // BRPOP at Redis's default hz can add another 100 ms to each interval.
+    expect(starts.at(-1)! - starts[0]!).toBeLessThan(650)
+  })
+
+  test('limited jobs stay waiting and keep priority, group position, and attempts', async () => {
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      redis: await connect(),
+      autoClose: false,
+      rateLimiters: { api: { limit: 1, window: 200 } },
+      queueOptions: { rateLimiters: ['api'] },
+    })
+    onTestFinished(async () => ns.close())
+    const order: string[] = []
+    const wf = ns.createWorkflow({
+      id: randomUUID(),
+      schema: z.string(),
+      run: async ({ input }) => {
+        order.push(input)
+      },
+    })
+    await wf.work({ concurrency: 8 })
+    const first = await wf.run('first')
+    await first.wait(1000)
+    const low = await wf.runAndWatch('low')
+    const high = await wf.runAndWatch('high', { priority: 2, groupId: 'group' })
+    const next = await wf.runAndWatch('next', { priority: 2, groupId: 'group' })
+    expect(await wf.getMetrics()).toEqual({ active: 0, waiting: 3, delayed: 0 })
+    const events = await Promise.all([low, high, next].map(async (job) => collect(job.events)))
+    expect(order).toEqual(['first', 'high', 'next', 'low'])
+    for (const stream of events)
+      expect(stream).toEqual([
+        { type: 'started', attempt: 1 },
+        { type: 'completed', output: undefined },
+      ])
+  })
+
+  test('inherits the default list, replaces it, and opts out with an empty list', async () => {
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      redis: await connect(),
+      autoClose: false,
+      rateLimiters: { api: { limit: 1, window: 400 }, other: { limit: 1, window: 400 } },
+      queueOptions: { rateLimiters: ['api'] },
+    })
+    onTestFinished(async () => ns.close())
+    const inherited = ns.createWorkflow({ id: randomUUID(), run: async () => 'inherited' })
+    const replaced = ns.createWorkflow({
+      id: randomUUID(),
+      queueOptions: { rateLimiters: ['other'] },
+      run: async () => 'replaced',
+    })
+    const unlimited = ns.createWorkflow({
+      id: randomUUID(),
+      queueOptions: { rateLimiters: [] },
+      run: async () => 'unlimited',
+    })
+    await Promise.all([inherited.work(), replaced.work(), unlimited.work()])
+    const first = await inherited.run(undefined)
+    await first.wait(1000)
+    const waiting = await inherited.run(undefined)
+    const replacement = await replaced.run(undefined)
+    await expect(replacement.wait(200)).resolves.toBe('replaced')
+    const optedOut = await unlimited.run(undefined)
+    await expect(optedOut.wait(200)).resolves.toBe('unlimited')
+    expect(await inherited.getMetrics()).toEqual({ active: 0, waiting: 1, delayed: 0 })
+    expect(await ns.getRateLimiterMetrics()).toEqual({
+      api: { starts: 1, pausedMs: 0 },
+      other: { starts: 1, pausedMs: 0 },
+    })
+    await waiting.wait(1000)
+  })
+
+  test('a shorter-window process preserves starts recorded with a longer window', async () => {
+    const id = randomUUID()
+    const long = new WorkflowNamespace({
+      id,
+      redis: await connect(),
+      autoClose: false,
+      rateLimiters: { api: { limit: 2, window: 450 } },
+      queueOptions: { rateLimiters: ['api'] },
+    })
+    const short = new WorkflowNamespace({
+      id,
+      redis: await connect(),
+      autoClose: false,
+      rateLimiters: { api: { limit: 2, window: 80 } },
+      queueOptions: { rateLimiters: ['api'] },
+    })
+    onTestFinished(async () => {
+      await Promise.all([long.close(), short.close()])
+    })
+    const a = long.createWorkflow({ id: randomUUID(), run: async () => Date.now() })
+    const b = short.createWorkflow({ id: randomUUID(), run: async () => Date.now() })
+    await a.work()
+    await b.work()
+    const firstJob = await a.run(undefined)
+    const first = await firstJob.wait(1000)
+    const shortJob = await b.run(undefined)
+    await shortJob.wait(1000)
+    await sleep(120)
+    const nextShortJob = await b.run(undefined)
+    await nextShortJob.wait(1000)
+    expect(await long.getRateLimiterMetrics()).toEqual({ api: { starts: 2, pausedMs: 0 } })
+    const nextJob = await a.run(undefined)
+    const next = await nextJob.wait(1000)
+    expect(next - first).toBeGreaterThanOrEqual(190)
+    // The short writer must also preserve the long start when extending the log's TTL.
+    expect(await long.getRateLimiterMetrics()).toEqual({ api: { starts: 2, pausedMs: 0 } })
+  })
+
+  test('pauses shared workflows, preserves memoized steps and reruns first without a failure', async () => {
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      redis: await connect(),
+      autoClose: false,
+      rateLimiters: { api: { limit: 20, window: 1000 } },
+      queueOptions: { rateLimiters: ['api'] },
+    })
+    onTestFinished(async () => ns.close())
+    const onFailed = vi.fn()
+    const backoff = vi.fn(() => 0)
+    const completed = vi.fn(() => 'cached')
+    const order: string[] = []
+    let calls = 0
+    const running = makeGate()
+    const finish = makeGate()
+    const sibling = ns.createWorkflow({
+      id: randomUUID(),
+      run: async () => {
+        running.open()
+        await finish.wait()
+        return 'finished'
+      },
+    })
+    await sibling.work()
+    const activeJob = await sibling.run(undefined)
+    await running.wait()
+    const wf = ns.createWorkflow({
+      id: randomUUID(),
+      schema: z.string(),
+      workerOptions: { onFailed, backoff },
+      run: async ({ input, step, rateLimit }) => {
+        order.push(input)
+        await step.do('cached', completed)
+        await step.do('api', () => {
+          if (++calls === 1) rateLimit(250)
+        })
+        return 'done'
+      },
+    })
+    const first = await wf.runAndWatch('first', { groupId: 'group', maxAttempts: 1 })
+    const second = await wf.run('second', { groupId: 'group' })
+    const events = collect(first.events)
+    await wf.work({ concurrency: 8 })
+    await vi.waitFor(async () => {
+      const { api } = await ns.getRateLimiterMetrics()
+      expect(api.pausedMs).toBeGreaterThan(0)
+    })
+    expect(await wf.getMetrics()).toEqual({ active: 0, waiting: 2, delayed: 0 })
+    finish.open()
+    await expect(activeJob.wait(100)).resolves.toBe('finished')
+    const blocked = await sibling.run(undefined)
+    expect(await sibling.getMetrics()).toEqual({ active: 0, waiting: 1, delayed: 0 })
+    await Promise.all([first.job.wait(2000), second.wait(2000), blocked.wait(2000)])
+    expect(order).toEqual(['first', 'first', 'second'])
+    expect(completed).toHaveBeenCalledTimes(2)
+    expect(calls).toBe(3)
+    expect(onFailed).not.toHaveBeenCalled()
+    expect(backoff).not.toHaveBeenCalled()
+    expect(await events).toEqual([
+      { type: 'started', attempt: 1 },
+      { type: 'started', attempt: 1 },
+      { type: 'completed', output: 'done' },
+    ])
+    expect(await ns.getRateLimiterMetrics()).toEqual({ api: { starts: 5, pausedMs: 0 } })
+  })
+
+  test('a shorter second pause cannot shorten the first', async () => {
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      redis: await connect(),
+      autoClose: false,
+      rateLimiters: { api: { limit: 20, window: 1000 } },
+      queueOptions: { rateLimiters: ['api'] },
+    })
+    onTestFinished(async () => ns.close())
+    const bothStarted = makeGate()
+    const shorterPause = makeGate()
+    let calls = 0
+    const starts: number[] = []
+    const wf = ns.createWorkflow({
+      id: randomUUID(),
+      schema: z.number(),
+      run: async ({ input, rateLimit }) => {
+        starts.push(Date.now())
+        if (++calls > 2) return
+        if (calls === 2) bothStarted.open()
+        await bothStarted.wait()
+        if (input === 2) await shorterPause.wait()
+        rateLimit(input === 1 ? 300 : 30)
+      },
+    })
+    const jobs = [await wf.run(1), await wf.run(2)]
+    await wf.work({ concurrency: 2 })
+    await vi.waitFor(async () => {
+      const { api } = await ns.getRateLimiterMetrics()
+      expect(api.pausedMs).toBeGreaterThan(200)
+    })
+    shorterPause.open()
+    await Promise.all(jobs.map(async (job) => job.wait(2000)))
+    expect(starts[2]! - starts[0]!).toBeGreaterThanOrEqual(290)
+  })
+
+  test('without limiters, a pause affects only its workflow', async () => {
+    const ns = new WorkflowNamespace({ id: randomUUID(), redis: await connect(), autoClose: false })
+    onTestFinished(async () => ns.close())
+    let calls = 0
+    const wf = ns.createWorkflow({
+      id: randomUUID(),
+      run: async ({ rateLimit }) => {
+        if (++calls === 1) rateLimit(200.2)
+        return Date.now()
+      },
+    })
+    const other = ns.createWorkflow({ id: randomUUID(), run: async () => Date.now() })
+    await wf.work()
+    await other.work()
+    const started = Date.now()
+    const job = await wf.run(undefined)
+    await vi.waitFor(() => expect(calls).toBe(1))
+    const otherJob = await other.run(undefined)
+    expect((await otherJob.wait(100)) - started).toBeLessThan(150)
+    expect((await job.wait(1000)) - started).toBeGreaterThanOrEqual(200)
+    expect(await ns.getRateLimiterMetrics()).toEqual({})
+  })
+
+  test.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    'rejects an invalid pause of %s through normal failure handling',
+    async (ms) => {
+      const ns = new WorkflowNamespace({
+        id: randomUUID(),
+        redis: await connect(),
+        autoClose: false,
+      })
+      onTestFinished(async () => ns.close())
+      const onFailed = vi.fn()
+      const wf = ns.createWorkflow({
+        id: randomUUID(),
+        run: async ({ rateLimit }) => rateLimit(ms),
+      })
+      await wf.work({ onFailed })
+      const job = await wf.run(undefined)
+      await expect(job.wait(1000)).rejects.toThrow('positive finite')
+      expect(onFailed).toHaveBeenCalledOnce()
+    },
+  )
+
+  test('writes a pause after the worker has lost its claim', async () => {
+    const redis = await connect()
+    const prefix = randomUUID()
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      redis,
+      prefix,
+      autoClose: false,
+      rateLimiters: { api: { limit: 20, window: 1000 } },
+      queueOptions: { rateLimiters: ['api'] },
+    })
+    onTestFinished(async () => ns.close())
+    const started = makeGate()
+    const onFailed = vi.fn()
+    const wf = ns.createWorkflow({
+      id: randomUUID(),
+      run: async ({ step, rateLimit }) => {
+        started.open()
+        try {
+          await step.wait('lost-claim', 10_000)
+        } catch {
+          rateLimit(300)
+        }
+      },
+    })
+    await wf.work({ lockMs: 90, safetyTimeout: 30, onFailed })
+    const job = await wf.run(undefined)
+    await started.wait()
+    await redis.set(`${prefix}:${wf.id}:j:${job.id}:lock`, 'new-owner')
+    await vi.waitFor(async () => {
+      const { api } = await ns.getRateLimiterMetrics()
+      expect(api.pausedMs).toBeGreaterThan(0)
+    })
+    expect(await wf.getMetrics()).toEqual({ active: 1, waiting: 0, delayed: 0 })
+    expect(onFailed).not.toHaveBeenCalled()
+  })
+
+  test('a stalled re-claim counts as another start', async () => {
+    const redis = await connect()
+    const prefix = randomUUID()
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      redis,
+      prefix,
+      autoClose: false,
+      rateLimiters: { api: { limit: 1, window: 200 } },
+      queueOptions: { rateLimiters: ['api'] },
+    })
+    onTestFinished(async () => ns.close())
+    const started = makeGate()
+    const starts: number[] = []
+    const wf = ns.createWorkflow({
+      id: randomUUID(),
+      run: async ({ step }) => {
+        starts.push(Date.now())
+        if (starts.length === 1) {
+          started.open()
+          await step.wait('until-recovery', 10_000)
+        }
+      },
+    })
+    const { job, events } = await wf.runAndWatch(undefined)
+    const watching = collect(events)
+    await wf.work({ lockMs: 90, stalledInterval: 25, safetyTimeout: 0.05 })
+    await started.wait()
+    await redis.del(`${prefix}:${wf.id}:j:${job.id}:lock`)
+    await job.wait(2000)
+    expect(starts).toHaveLength(2)
+    expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(190)
+    expect(await watching).toEqual([
+      { type: 'started', attempt: 1 },
+      { type: 'started', attempt: 1 },
+      { type: 'completed', output: undefined },
+    ])
+  })
+
+  test('a wrapped pause error fails normally', async () => {
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      redis: await connect(),
+      autoClose: false,
+      rateLimiters: { api: { limit: 10, window: 1000 } },
+      queueOptions: { rateLimiters: ['api'] },
+    })
+    onTestFinished(async () => ns.close())
+    const onFailed = vi.fn()
+    const wf = ns.createWorkflow({
+      id: randomUUID(),
+      run: async ({ rateLimit }) => {
+        try {
+          rateLimit(200)
+        } catch (err) {
+          throw new Error('wrapped', { cause: err })
+        }
+      },
+    })
+    await wf.work({ onFailed })
+    const job = await wf.run(undefined)
+    await expect(job.wait(1000)).rejects.toThrow('wrapped')
+    expect(onFailed).toHaveBeenCalledOnce()
+    expect(await ns.getRateLimiterMetrics()).toEqual({ api: { starts: 1, pausedMs: 0 } })
+  })
+
+  test('reports pause storage errors without failing the job', async () => {
+    const ns = new WorkflowNamespace({ id: randomUUID(), redis: await connect(), autoClose: false })
+    onTestFinished(async () => ns.close())
+    const storageError = new Error('pause storage failed')
+    const internal = await ns.getNamespace()
+    const pause = vi.spyOn(internal.redis, 'rateLimit').mockRejectedValue(storageError)
+    const onError = vi.fn()
+    const onFailed = vi.fn()
+    const backoff = vi.fn(() => 0)
+    const wf = ns.createWorkflow({ id: randomUUID(), run: async ({ rateLimit }) => rateLimit(100) })
+    await wf.work({ onError, onFailed, backoff })
+    await wf.run(undefined)
+    await vi.waitFor(() => expect(onError).toHaveBeenCalledWith(storageError))
+    expect(onFailed).not.toHaveBeenCalled()
+    expect(backoff).not.toHaveBeenCalled()
+    pause.mockRestore()
+  })
+
+  test.each([0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    'rejects invalid budgets of %s in the constructor',
+    (value) => {
+      for (const budget of [
+        { limit: value, window: 100 },
+        { limit: 1, window: value },
+      ])
+        expect(
+          () => new WorkflowNamespace({ id: randomUUID(), rateLimiters: { api: budget } }),
+        ).toThrow('positive integer')
+    },
+  )
+
+  test('infers valid limiter names and the resolved workflow list', () => {
+    const ns = new WorkflowNamespace({
+      id: randomUUID(),
+      rateLimiters: { api: { limit: 1, window: 100 }, other: { limit: 2, window: 100 } },
+      queueOptions: { rateLimiters: ['api'] },
+    })
+    const invalid = new WorkflowNamespace({
+      id: randomUUID(),
+      rateLimiters: { api: { limit: 1, window: 100 } },
+      // @ts-expect-error a namespace default must name a declared limiter
+      queueOptions: { rateLimiters: ['missing'] },
+    })
+    void invalid
+    ns.createWorkflow({
+      id: 'invalid',
+      // @ts-expect-error a workflow must name a declared limiter
+      queueOptions: { rateLimiters: ['missing'] },
+      run: async () => {},
+    })
+    ns.createWorkflow({
+      id: 'default',
+      run: async ({ rateLimit }) => {
+        const check = () => {
+          rateLimit(100)
+          rateLimit(100, 'api')
+          // @ts-expect-error not in the inherited list
+          rateLimit(100, 'other')
+        }
+        void check
+      },
+    })
+    ns.createWorkflow({
+      id: 'several',
+      queueOptions: { rateLimiters: ['api', 'other'] },
+      run: async ({ rateLimit }) => {
+        const check = () => {
+          rateLimit(100, 'api')
+          rateLimit(100, 'other')
+          // @ts-expect-error several limiters require a name
+          rateLimit(100)
+          // @ts-expect-error unknown limiter
+          rateLimit(100, 'missing')
+        }
+        void check
+      },
+    })
+    ns.createWorkflow({
+      id: 'replacement',
+      queueOptions: { rateLimiters: ['other'] },
+      run: async ({ rateLimit }) => {
+        const check = () => {
+          rateLimit(100)
+          rateLimit(100, 'other')
+          // @ts-expect-error the workflow replaced the default
+          rateLimit(100, 'api')
+        }
+        void check
+      },
+    })
+    ns.createWorkflow({
+      id: 'none',
+      queueOptions: { rateLimiters: [] },
+      run: async ({ rateLimit, step }) => {
+        const check = () => {
+          rateLimit(100)
+          // @ts-expect-error a workflow with no limiters takes no name
+          rateLimit(100, 'api')
+          // @ts-expect-error rateLimit exists only on the run context
+          void step.rateLimit
+        }
+        void check
+      },
+    })
+    new WorkflowNamespace({ id: randomUUID() }).createWorkflow({
+      id: 'undeclared',
+      run: async ({ rateLimit }) => {
+        const check = () => {
+          rateLimit(100)
+          // @ts-expect-error no declared or selected limiter
+          rateLimit(100, 'missing')
+        }
+        void check
+      },
+    })
+  })
+})
+
+test('observes each limiter once per meter and traces pauses without errors', async () => {
+  const spanExporter = new InMemorySpanExporter()
+  const tracerProvider = new BasicTracerProvider({
+    spanProcessors: [new SimpleSpanProcessor(spanExporter)],
+  })
+  trace.setGlobalTracerProvider(tracerProvider)
+  const reader = new PeriodicExportingMetricReader({
+    exporter: new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE),
+    exportIntervalMillis: 60_000,
+  })
+  const provider = new MeterProvider({ readers: [reader] })
+  const meter = provider.getMeter('rate-limits')
+  const register = vi.spyOn(meter, 'addBatchObservableCallback')
+  const ns = new WorkflowNamespace({
+    id: randomUUID(),
+    redis: await connect(),
+    autoClose: false,
+    rateLimiters: { api: { limit: 20, window: 400 }, unused: { limit: 1, window: 400 } },
+    queueOptions: { rateLimiters: ['api'] },
+    workerOptions: { metrics: { meter, prefix: 'test' } },
+  })
+  onTestFinished(async () => {
+    await provider.shutdown()
+    await ns.close()
+    await tracerProvider.shutdown()
+    trace.disable()
+  })
+  let calls = 0
+  const wf = ns.createWorkflow({
+    id: randomUUID(),
+    run: async ({ step, rateLimit }) => {
+      await step.do('request', () => {
+        if (++calls === 1) rateLimit(200)
+      })
+    },
+  })
+  const other = ns.createWorkflow({ id: randomUUID(), run: async () => 'ok' })
+  let localCalls = 0
+  const local = ns.createWorkflow({
+    id: randomUUID(),
+    queueOptions: { rateLimiters: [] },
+    run: async ({ rateLimit }) => {
+      if (++localCalls === 1) rateLimit(50)
+    },
+  })
+  await wf.work()
+  await other.work()
+  // Two workflow callbacks, one namespace callback for their shared meter.
+  expect(register).toHaveBeenCalledTimes(3)
+  const job = await wf.run(undefined)
+  await vi.waitFor(async () => {
+    const { api } = await ns.getRateLimiterMetrics()
+    expect(api.pausedMs).toBeGreaterThan(0)
+  })
+  const { resourceMetrics } = await reader.collect()
+  const metrics = resourceMetrics.scopeMetrics.flatMap((scope) => scope.metrics)
+  const starts = metrics.find((metric) => metric.descriptor.name === 'test_rate_limiter_starts')!
+  const paused = metrics.find((metric) => metric.descriptor.name === 'test_rate_limiter_paused_ms')!
+  expect(starts.dataPoints.map((point) => [point.attributes.rate_limiter, point.value])).toEqual([
+    ['api', 1],
+    ['unused', 0],
+  ])
+  expect(paused.dataPoints).toHaveLength(2)
+  expect(
+    paused.dataPoints.find((point) => point.attributes.rate_limiter === 'api')!.value,
+  ).toBeGreaterThan(0)
+  await job.wait(2000)
+  await local.work()
+  const localJob = await local.run(undefined)
+  await localJob.wait(1000)
+  await tracerProvider.forceFlush()
+  const spans = spanExporter.getFinishedSpans()
+  const pausedSpan = spans.find(
+    (span) => span.name === `workflow-worker/${wf.id}` && span.status.code === SpanStatusCode.UNSET,
+  )!
+  expect(pausedSpan.events).toEqual([
+    expect.objectContaining({
+      name: 'workflow.rate_limit',
+      attributes: { 'workflow.rate_limiter': 'api', 'workflow.rate_limit.pause_ms': 200 },
+    }),
+  ])
+  expect(pausedSpan.attributes).not.toHaveProperty('workflow.rate_limiter')
+  const pausedStep = spans.find(
+    (span) => span.name.endsWith('/step/request') && span.status.code === SpanStatusCode.UNSET,
+  )!
+  expect(pausedStep.events).toEqual([])
+  const localSpan = spans.find(
+    (span) =>
+      span.name === `workflow-worker/${local.id}` && span.status.code === SpanStatusCode.UNSET,
+  )!
+  expect(localSpan.events[0]?.attributes).toEqual({ 'workflow.rate_limit.pause_ms': 50 })
+  await sleep(450)
+  expect(await ns.getRateLimiterMetrics()).toEqual({
+    api: { starts: 0, pausedMs: 0 },
+    unused: { starts: 0, pausedMs: 0 },
+  })
 })

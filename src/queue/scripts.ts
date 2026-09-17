@@ -230,7 +230,7 @@ return 1
  * Claim tokens are derived in-script as `<tokenPrefix>:<n>` from the one UUID the caller passes,
  * so a batch needs a single JS UUID and the tokens stay globally unique.
  *
- * Returns `{ jobs, msToNext, msToSchedule, dueSchedules, maxed }`:
+ * Returns `{ jobs, msToNext, msToSchedule, dueSchedules, maxed, msToLimit }`:
  * - `jobs`: array of `{ jobId, groupId, data, attempts, priority, token, steps, queueWait }`, where
  *   `steps` is the job's memoized step hash flattened to `[name, value, …]` and `queueWait` is the
  *   ms since the job became runnable, on the Redis clock
@@ -238,9 +238,19 @@ return 1
  *   promote cap) — the worker's `BRPOP wake` timeout, so the block *is* the delayed-job timer
  * - `msToSchedule`: same, for the nearest cron occurrence
  * - `dueSchedules`: `{ scheduleId, score, … }` of schedules due now, for the JS cron tick
- * - `maxed`: 1 when a concurrency ceiling (not an empty queue) stopped the batch
+ * - `maxed`: 1 when a concurrency ceiling or the rate limit gate (not an empty queue) stopped the batch
+ * - `msToLimit`: ms until the rate limit gate may admit a start again (`-1` when the gate did not
+ *   stop the batch). The worker waits on its local timer while the gate is closed.
  *
- * ARGV: prefix, wfId, nsId, nsCap, wfCap, groupCap, lockMs, tokenPrefix, promoteCap, want
+ * Rate limit gate: one sliding window log per limiter, a ZSET at
+ * `<prefix>:ns:<nsId>:rl:<name>` with one member per start (the claim token) scored by its expiry
+ * (`start + window`). A pause is a `…:paused` string holding `pausedUntil`, set with `PXAT` so it
+ * cleans itself up. The workflow's own pause (no limiters) is `<wf>:paused`. The gate is read
+ * lazily, only when a ready group exists and `want > 0`, and every claimed job records a start in
+ * every limiter before the next job is considered.
+ *
+ * ARGV: prefix, wfId, nsId, nsCap, wfCap, groupCap, lockMs, tokenPrefix, promoteCap, want,
+ *       limiterCount, then `name, limit, window` per limiter
  */
 const RESERVE = `
 ${MAINTAIN_GROUP}
@@ -255,8 +265,15 @@ local lockMs = tonumber(ARGV[7])
 local tokenPrefix = ARGV[8]
 local promoteCap = tonumber(ARGV[9])
 local want = tonumber(ARGV[10])
+local limiterCount = tonumber(ARGV[11]) or 0
 
 local wf = prefix .. ":" .. wfId
+local limiters = {}
+for i = 1, limiterCount do
+  local base = 11 + (i - 1) * 3
+  local key = prefix .. ":ns:" .. nsId .. ":rl:" .. ARGV[base + 1]
+  limiters[i] = { key, tonumber(ARGV[base + 2]), tonumber(ARGV[base + 3]) }
+end
 local nsActive = prefix .. ":ns:" .. nsId .. ":active"
 local wfActive = wf .. ":active"
 local readyKey = wf .. ":ready"
@@ -285,8 +302,32 @@ local function msToHead(key)
   return d
 end
 
+-- How many more starts the gate admits right now, and how long until it admits one when it
+-- admits none. Waiting is the max over every closed limiter: a start needs all of them.
+local function readGate()
+  local allowed = want
+  local wait = math.max(0, redis.call("PTTL", wf .. ":paused"))
+  if wait > 0 then allowed = 0 end
+  for i = 1, #limiters do
+    local key, limit = limiters[i][1], limiters[i][2]
+    local paused = math.max(0, redis.call("PTTL", key .. ":paused"))
+    if paused > 0 then
+      allowed = 0
+      if paused > wait then wait = paused end
+    end
+    redis.call("ZREMRANGEBYSCORE", key, "-inf", now)
+    local count = redis.call("ZCARD", key)
+    limiters[i][4] = count
+    allowed = math.min(allowed, math.max(0, limit - count))
+  end
+  return allowed, wait
+end
+
 local jobs = {}
 local maxed = 0
+local msToLimit = -1
+local allowed = nil
+local wait = 0
 while #jobs < want do
   if redis.call("SCARD", nsActive) >= nsCap or redis.call("ZCARD", wfActive) >= wfCap then
     maxed = 1
@@ -294,6 +335,21 @@ while #jobs < want do
   end
   local head = redis.call("ZRANGE", readyKey, 0, 0)
   if #head == 0 then break end
+  if allowed == nil then allowed, wait = readGate() end
+  if #jobs >= allowed then
+    for i = 1, #limiters do
+      local key, limit = limiters[i][1], limiters[i][2]
+      local count = limiters[i][4] + #jobs
+      if count >= limit then
+        -- Include this batch's starts. A lower budget needs count - limit + 1 expiries.
+        local nth = redis.call("ZRANGE", key, count - limit, count - limit, "WITHSCORES")
+        wait = math.max(wait, tonumber(nth[2]) - now)
+      end
+    end
+    maxed = 1
+    msToLimit = wait
+    break
+  end
   local gid = head[1]
   local popped = redis.call("ZPOPMIN", wf .. ":g:" .. gid .. ":jobs")
   if #popped == 0 then
@@ -311,6 +367,9 @@ while #jobs < want do
     redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
     -- Store the popped packed score so stalled-recovery can requeue at the front of its band.
     redis.call("HSET", jobKey, "state", "active", "deadlineAt", deadline, "score", popped[2])
+    for i = 1, #limiters do
+      redis.call("ZADD", limiters[i][1], now + limiters[i][3], token)
+    end
 
     maintainGroup(wf, gid, groupCap)
 
@@ -325,8 +384,17 @@ while #jobs < want do
   end
 end
 
+-- The log key lives as long as its latest start. Scores are expiries, so the max score is the
+-- right TTL whichever pod (and window) wrote it.
+if #jobs > 0 then
+  for i = 1, #limiters do
+    local last = redis.call("ZRANGE", limiters[i][1], -1, -1, "WITHSCORES")
+    redis.call("PEXPIREAT", limiters[i][1], last[2])
+  end
+end
+
 local dueSchedules = redis.call("ZRANGEBYSCORE", scheduleDueKey, "-inf", now, "WITHSCORES")
-return { jobs, msToHead(delayedKey), msToHead(scheduleDueKey), dueSchedules, maxed }
+return { jobs, msToHead(delayedKey), msToHead(scheduleDueKey), dueSchedules, maxed, msToLimit }
 `
 
 /**
@@ -522,6 +590,50 @@ return recovered
 `
 
 /**
+ * Reactive pause. Always writes `pausedUntil = max(existing, now + ms)` on the named
+ * limiter, or on the workflow itself when `limiter` is empty, because the 429 is real whoever
+ * holds the job. Then, only if the claim token still matches, requeues the job to `waiting` at its
+ * stored packed score (the stalled-recovery path): no `attempts` increment, `:steps` untouched.
+ * `releaseActive` kicks this workflow's and the namespace's wake lists; woken workers `reserve`,
+ * hit the pause and block on `msToLimit`. No other wake is needed: a pause only closes the gate.
+ *
+ * Returns 0 (stale token: pause written, job left alone) or 1 (paused and requeued).
+ * ARGV: prefix, wfId, nsId, jobId, token, ms, limiter, groupCap
+ */
+const RATE_LIMIT = `
+${MAINTAIN_GROUP}
+${RELEASE_ACTIVE}
+${ADD_WAITING}
+local prefix = ARGV[1]
+local wfId = ARGV[2]
+local nsId = ARGV[3]
+local jobId = ARGV[4]
+local token = ARGV[5]
+local ms = math.ceil(tonumber(ARGV[6]))
+local limiter = ARGV[7]
+local groupCap = tonumber(ARGV[8])
+
+local wf = prefix .. ":" .. wfId
+local jobKey = wf .. ":j:" .. jobId
+${NOW}
+
+local pausedKey = wf .. ":paused"
+if limiter ~= "" then pausedKey = prefix .. ":ns:" .. nsId .. ":rl:" .. limiter .. ":paused" end
+local untilAt = now + ms
+local existing = tonumber(redis.call("GET", pausedKey) or 0)
+if existing > untilAt then untilAt = existing end
+redis.call("SET", pausedKey, untilAt, "PXAT", untilAt)
+
+if redis.call("GET", jobKey .. ":lock") ~= token then
+  return 0
+end
+releaseActive(prefix, wfId, jobId, groupCap)
+local meta = redis.call("HMGET", jobKey, "groupId", "score")
+addWaiting(wf, jobKey, jobId, meta[1], 0, groupCap, now, tonumber(meta[2]))
+return 1
+`
+
+/**
  * Cron firing = "JS computes next, Lua commits via CAS-on-score". The JS wake-loop tick
  * reads a due schedule, computes `nextScore = croner.nextRun(now)`, and calls this with the
  * score it saw (`expectedScore`). The CAS bails unless `ZSCORE due scheduleId == expectedScore`,
@@ -586,7 +698,26 @@ redis.call("HSET", scheduleKey, "lastJobId", jobId, "lastFireAt", now)
 return { "fired", jobId }
 `
 
+/** Read every declared limiter against the Redis clock without modifying the start logs. */
+const RATE_LIMITER_METRICS = `
+${NOW}
+local values = {}
+for i = 3, #ARGV do
+  local key = ARGV[1] .. ":ns:" .. ARGV[2] .. ":rl:" .. ARGV[i]
+  values[#values + 1] = {
+    ARGV[i],
+    redis.call("ZCOUNT", key, "(" .. now, "+inf"),
+    math.max(0, redis.call("PTTL", key .. ":paused"))
+  }
+end
+return values
+`
+
 export interface QueueCommands {
+  rateLimiterMetrics: (
+    ...args: string[]
+  ) => Promise<[name: string, starts: number, pausedMs: number][]>
+
   enqueue: (...args: (string | number)[]) => Promise<number>
   reserve: (
     ...args: (string | number)[]
@@ -606,8 +737,10 @@ export interface QueueCommands {
       msToSchedule: number,
       due: string[],
       maxed: number,
+      msToLimit: number,
     ]
   >
+  rateLimit: (...args: (string | number)[]) => Promise<number>
   complete: (...args: (string | number)[]) => Promise<number>
   fail: (...args: (string | number)[]) => Promise<number>
   moveToFailed: (...args: (string | number)[]) => Promise<number>
@@ -631,6 +764,8 @@ export function registerScripts(redis: Redis): QueueRedis {
     redis.defineCommand('moveToFailed', { numberOfKeys: 0, lua: MOVE_TO_FAILED })
     redis.defineCommand('heartbeat', { numberOfKeys: 0, lua: HEARTBEAT })
     redis.defineCommand('recoverStalled', { numberOfKeys: 0, lua: RECOVER_STALLED })
+    redis.defineCommand('rateLimiterMetrics', { numberOfKeys: 0, lua: RATE_LIMITER_METRICS })
+    redis.defineCommand('rateLimit', { numberOfKeys: 0, lua: RATE_LIMIT })
     redis.defineCommand('fireSchedule', { numberOfKeys: 0, lua: FIRE_SCHEDULE })
     registered.add(redis)
   }

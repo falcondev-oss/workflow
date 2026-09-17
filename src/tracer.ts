@@ -1,5 +1,6 @@
 import type { Context, Span, SpanOptions } from '@opentelemetry/api'
 import { SpanStatusCode, trace } from '@opentelemetry/api'
+import { RateLimitError } from './queue/errors'
 
 export function getTracer() {
   return trace.getTracer('falcondev-oss-workflow')
@@ -25,6 +26,7 @@ function runWithSpan<T>(fn: (span: Span) => T) {
       })
       return result
     } catch (err_) {
+      if (err_ instanceof RateLimitError) throw err_
       const err = err_ as Error
       span.recordException(err)
       span.setStatus({

@@ -152,6 +152,59 @@ namespace.createWorkflow({
 })
 ```
 
+### Rate limits
+
+A rate limiter allows at most `limit` job starts in any `window` ms. A start is one claim of a job
+by a worker, so retries and jobs re-claimed after a stall count too. Starts are never refunded,
+even when the job fails at once.
+
+```ts
+const namespace = new WorkflowNamespace({
+  id: 'app',
+  rateLimiters: {
+    'api': { limit: 100, window: 1000 },
+    'api-search': { limit: 10, window: 1000 },
+  },
+  queueOptions: { rateLimiters: ['api'] }, // default for every workflow
+})
+
+namespace.createWorkflow({
+  id: 'search',
+  queueOptions: { rateLimiters: ['api', 'api-search'] }, // replaces the default
+  async run({ step, rateLimit }) {
+    await step.do('search', async () => {
+      const res = await fetch(url)
+      if (res.status === 429) rateLimit(retryAfterMs(res), 'api-search') // retryAfterMs is your code
+    })
+  },
+})
+
+namespace.createWorkflow({
+  id: 'cleanup',
+  queueOptions: { rateLimiters: [] }, // no rate limiters
+  async run() {},
+})
+```
+
+- Starts can burst. `limit: 10, window: 1000` can start 10 jobs in the same millisecond. For even
+  spacing, use `limit: 1, window: 100`.
+- A job starts only when every limiter it uses and every concurrency cap admit it. A limited job
+  stays `waiting` and keeps its place.
+- A workflow's `rateLimiters` replaces the namespace default. The two arrays are not combined, and
+  `[]` removes every limiter.
+- Workflows that share a limiter get starts first come, first served. To guarantee a workflow a
+  share, give it its own limiter with part of the budget.
+- Every worker process in the namespace counts against the same limiter. Each process sends its own
+  `limit` and `window`, so while a rolling deploy changes a budget, the looser budget applies until
+  the old processes are gone.
+
+`rateLimit(ms, name)` throws. It pauses the named limiter for `ms` for every workflow that uses it,
+and puts the job back at the front of `waiting`. The job uses no attempt, and neither `backoff` nor
+`onFailed` applies. Completed steps stay memoized, and the step that called `rateLimit` runs again.
+A pause never shortens an earlier one. The name is optional when the workflow uses one limiter and
+required when it uses several. In a workflow with no limiters, `rateLimit(ms)` pauses only that
+workflow.
+
 ### Options
 
 `WorkflowNamespace` options are shared defaults — each is shallow-merged under the matching
@@ -163,6 +216,7 @@ per-workflow override.
 | `redis`         | new client | Shared connection, owned by the namespace               |
 | `prefix`        | `wf`       | Global key prefix                                       |
 | `concurrency`   | unlimited  | Ceiling across all workflows in the namespace           |
+| `rateLimiters`  | `{}`       | Named budgets of `{ limit, window }`, with window in ms |
 | `logger`        | none       | Inherited by every workflow, queue and worker           |
 | `autoClose`     | `true`     | Close (drain workers, disconnect) on `SIGINT`/`SIGTERM` |
 | `queueOptions`  | —          | Defaults for every workflow's queue                     |
@@ -194,7 +248,15 @@ const namespace = new WorkflowNamespace({
 })
 ```
 
+`namespace.getRateLimiterMetrics()` returns point-in-time `{ starts, pausedMs }` for every declared
+limiter. The meter exports these as `<prefix>_rate_limiter_starts` and
+`<prefix>_rate_limiter_paused_ms`, with a `rate_limiter` attribute. Each limiter is observed once
+per meter, even when workflows share it. Limited jobs remain part of `waiting`.
+
 Spans are emitted for producers, workers and each step via the global OpenTelemetry tracer.
+A handler pause records a `workflow.rate_limit` event with `workflow.rate_limit.pause_ms` and,
+for a named limiter, `workflow.rate_limiter`. The paused span keeps its `UNSET` status and records
+no exception.
 
 ## Inspiration
 

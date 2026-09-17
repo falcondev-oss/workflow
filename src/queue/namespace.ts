@@ -1,6 +1,13 @@
+import type { Meter } from '@opentelemetry/api'
 import type Redis from 'ioredis'
 import type { QueueRedis } from './scripts'
-import type { NamespaceOptions, QueueOptions, WorkflowLogger } from './types'
+import type {
+  NamespaceOptions,
+  QueueOptions,
+  RateLimiterBudget,
+  RateLimiterMetrics,
+  WorkflowLogger,
+} from './types'
 import { Queue } from './queue'
 import { registerScripts, UNLIMITED } from './scripts'
 
@@ -15,11 +22,13 @@ export class Namespace {
   readonly concurrency: number
   readonly redis: QueueRedis
   readonly logger?: WorkflowLogger
+  readonly rateLimiters: Record<string, RateLimiterBudget>
 
   private readonly subscriber: Redis
   private readonly subscriberReady: Promise<unknown>
   private readonly channelListeners = new Map<string, Set<(message: string) => void>>()
   private readonly channelSubscriptions = new Map<string, Promise<unknown>>()
+  private readonly metricsMeters = new WeakSet<Meter>()
   private readonly queues = new Set<Queue>()
 
   constructor(opts: NamespaceOptions) {
@@ -27,6 +36,7 @@ export class Namespace {
     this.prefix = opts.prefix ?? 'wf'
     this.concurrency = opts.concurrency ?? UNLIMITED
     this.logger = opts.logger
+    this.rateLimiters = opts.rateLimiters ?? {}
     this.redis = registerScripts(opts.redis)
 
     this.subscriber = opts.redis.duplicate()
@@ -40,6 +50,43 @@ export class Namespace {
     const queue = new Queue(this, opts)
     this.queues.add(queue)
     return queue
+  }
+
+  async getRateLimiterMetrics(): Promise<Record<string, RateLimiterMetrics>> {
+    const values = await this.redis.rateLimiterMetrics(
+      this.prefix,
+      this.id,
+      ...Object.keys(this.rateLimiters),
+    )
+    return Object.fromEntries(
+      values.map(([name, starts, pausedMs]) => [name, { starts, pausedMs }]),
+    )
+  }
+
+  setupRateLimiterMetrics({ meter, prefix }: { meter: Meter; prefix: string }): void {
+    if (this.metricsMeters.has(meter)) return
+    this.metricsMeters.add(meter)
+    const starts = meter.createObservableGauge(`${prefix}_rate_limiter_starts`, {
+      description: 'Unexpired job starts per rate limiter',
+    })
+    const paused = meter.createObservableGauge(`${prefix}_rate_limiter_paused_ms`, {
+      description: 'Remaining rate limiter pause',
+      unit: 'ms',
+    })
+    meter.addBatchObservableCallback(
+      async (result) => {
+        try {
+          for (const [name, values] of Object.entries(await this.getRateLimiterMetrics())) {
+            const attributes = { rate_limiter: name }
+            result.observe(starts, values.starts, attributes)
+            result.observe(paused, values.pausedMs, attributes)
+          }
+        } catch (err) {
+          this.logger?.error?.('Error collecting rate limiter metrics:', err)
+        }
+      },
+      [starts, paused],
+    )
   }
 
   /** Register a waiter on a pub/sub channel; subscribes on first listener. */
