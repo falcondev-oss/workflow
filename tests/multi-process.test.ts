@@ -11,6 +11,7 @@
 
 import type { Redis } from 'ioredis'
 import type { ChildProcess } from 'node:child_process'
+import type { RateLimiterBudget } from '../src/queue/types'
 import { fork } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import process from 'node:process'
@@ -36,10 +37,18 @@ async function spawnWorker(opts: {
   nsId: string
   wfId: string
   concurrency: number
+  rateLimit?: RateLimiterBudget
 }) {
   const child = fork(
     FIXTURE,
-    [String(process.env.REDIS_PORT), opts.prefix, opts.nsId, opts.wfId, String(opts.concurrency)],
+    [
+      String(process.env.REDIS_PORT),
+      opts.prefix,
+      opts.nsId,
+      opts.wfId,
+      String(opts.concurrency),
+      JSON.stringify(opts.rateLimit ?? null),
+    ],
     { execArgv: ['--import', 'tsx'], stdio: ['ignore', 'inherit', 'inherit', 'ipc'] },
   )
   children.push(child)
@@ -86,3 +95,35 @@ test('four worker processes drain a backlog exactly once each', async () => {
     await ns.close()
   }
 }, 90_000)
+
+test('four worker processes share one start budget', async () => {
+  const prefix = randomUUID()
+  const nsId = randomUUID()
+  const wfId = randomUUID()
+  const rateLimit = { limit: 4, window: 120 }
+  const ns = new WorkflowNamespace({
+    id: nsId,
+    prefix,
+    redis: await createRedis({ host: 'localhost', port: Number(process.env.REDIS_PORT) }),
+    autoClose: false,
+  })
+  const workflow = ns.createWorkflow({ id: wfId, run: async () => 'ok' })
+  try {
+    await Promise.all(
+      Array.from({ length: 4 }, async () =>
+        spawnWorker({ prefix, nsId, wfId, concurrency: 8, rateLimit }),
+      ),
+    )
+    const jobs = await Promise.all(Array.from({ length: 32 }, async () => workflow.run(undefined)))
+    await Promise.all(jobs.map(async (job) => job.wait(10_000)))
+    const recorded = await redis.lrange(`${prefix}:starts`, 0, -1)
+    const starts = recorded.map(Number).sort((a, b) => a - b)
+    expect(starts).toHaveLength(32)
+    for (let i = rateLimit.limit; i < starts.length; i++)
+      expect(starts[i]! - starts[i - rateLimit.limit]!).toBeGreaterThanOrEqual(
+        rateLimit.window - 10,
+      )
+  } finally {
+    await ns.close()
+  }
+}, 30_000)

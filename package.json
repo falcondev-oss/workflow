@@ -50,6 +50,8 @@
   },
   "devDependencies": {
     "@falcondev-oss/configs": "^5.0.2",
+    "@opentelemetry/sdk-metrics": "^2.11.0",
+    "@opentelemetry/sdk-trace-base": "^2.11.0",
     "@testcontainers/redis": "^11.11.0",
     "arktype": "^2.1.29",
     "eslint": "^9.39.2",

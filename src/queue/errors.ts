@@ -24,6 +24,17 @@ export class NonRecoverableError extends Error {
   }
 }
 
+/** Internal control flow for a handler pause. Not exported from the package. */
+export class RateLimitError extends Error {
+  constructor(
+    readonly ms: number,
+    readonly limiter = '',
+  ) {
+    super(`Rate limited for ${ms} ms`)
+    this.name = 'RateLimitError'
+  }
+}
+
 export class TimeoutError extends Error {
   constructor(jobId: string) {
     super(`Timed out waiting for job: ${jobId}`)

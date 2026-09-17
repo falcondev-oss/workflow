@@ -6,11 +6,13 @@
  * the assertion is done.
  */
 
+import type { RateLimiterBudget } from '../../src/queue/types'
 import process from 'node:process'
 import { createRedis, WorkflowNamespace } from '../../src'
 
-const [port, prefix, nsId, wfId, concurrency] = process.argv.slice(2)
+const [port, prefix, nsId, wfId, concurrency, budget] = process.argv.slice(2)
 const host = 'localhost'
+const rateLimit = JSON.parse(budget ?? 'null') as RateLimiterBudget | null
 
 const counter = await createRedis({ host, port: Number(port) })
 const ns = new WorkflowNamespace({
@@ -18,11 +20,14 @@ const ns = new WorkflowNamespace({
   prefix: prefix!,
   redis: await createRedis({ host, port: Number(port) }),
   autoClose: false,
+  rateLimiters: rateLimit ? { api: rateLimit } : {},
+  queueOptions: { rateLimiters: rateLimit ? ['api'] : [] },
 })
 
 const workflow = ns.createWorkflow({
   id: wfId!,
   run: async ({ step }) => {
+    if (rateLimit) await counter.rpush(`${prefix}:starts`, Date.now())
     // Inside a step: a replay would return the cached result without re-incrementing, so the
     // counter measures real executions, not attempts.
     await step.do('count', async () => counter.incr(`${prefix}:runs`))

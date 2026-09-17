@@ -4,7 +4,7 @@ import type { QueueRedis } from './scripts'
 import type { JobContext, ReservedJob, WorkerOptions } from './types'
 import { randomUUID } from 'node:crypto'
 import { expBackoff } from './backoff'
-import { NonRecoverableError } from './errors'
+import { NonRecoverableError, RateLimitError } from './errors'
 import { localTimeZone, nextRunMs } from './schedule'
 
 export type WorkerHandler = (job: ReservedJob, ctx: JobContext) => Promise<string> | string
@@ -37,8 +37,10 @@ interface ReserveResult {
   msToSchedule: number
   /** `[scheduleId, score, …]` of the schedules due right now. */
   dueSchedules: string[]
-  /** A concurrency ceiling, not an empty queue, ended the batch. */
+  /** A concurrency cap or rate limit stopped the batch. */
   maxed: boolean
+  /** Ms until a rate limit admits a start, or -1 if it did not stop the batch. */
+  msToLimit: number
 }
 
 /**
@@ -137,7 +139,7 @@ export class Worker {
       // (capped out), and folding it in would mean `brpop … 0` — which blocks forever, not
       // "immediately" — or a hot `waitForSlot(0)` spin. Falling back to `safetyTimeout` is what
       // the pre-batch code did in exactly this state.
-      const nearest = [res.msToNext, res.msToSchedule].filter((m) => m > 0)
+      const nearest = [res.msToNext, res.msToSchedule, res.msToLimit].filter((m) => m > 0)
       const timeout =
         nearest.length === 0
           ? this.safetyTimeout
@@ -145,7 +147,8 @@ export class Worker {
       // With every slot busy there is nothing Redis could tell us that we could act on, and the
       // next thing we *can* act on — a slot freeing — is local. Park on it and skip the round
       // trip entirely; a completion re-drives the loop the instant it lands.
-      if (saturated) await this.waitForSlot(timeout * 1000)
+      // Redis blocking timeouts can fire 100 ms late. Rate limits need the local timer.
+      if (saturated || res.msToLimit > 0) await this.waitForSlot(timeout * 1000)
       else await this.blockingRedis.brpop(this.wfWake, this.nsWake, timeout)
       // Wake-loop re-poll is the idle-worker stalled-recovery trigger — no dedicated poller.
       if (!this.closing) void this.recoverStalled()
@@ -219,7 +222,7 @@ export class Worker {
 
   /** Claim up to `want` jobs (0 = report only) and read back both wake timers, in one call. */
   private async reserve(want: number): Promise<ReserveResult> {
-    const [jobs, msToNext, msToSchedule, dueSchedules, maxed] = await this.redis.reserve(
+    const [jobs, msToNext, msToSchedule, dueSchedules, maxed, msToLimit] = await this.redis.reserve(
       this.queue.prefix,
       this.queue.id,
       this.queue.ns.id,
@@ -230,6 +233,7 @@ export class Worker {
       randomUUID(),
       this.promoteBatchSize,
       want,
+      ...this.queue.rateLimitArgs,
     )
     return {
       claims: jobs.map(([id, groupId, data, attempts, priority, token, steps, queueWaitMs]) => ({
@@ -248,6 +252,7 @@ export class Worker {
       msToSchedule: Number(msToSchedule),
       dueSchedules,
       maxed: maxed === 1,
+      msToLimit,
     }
   }
 
@@ -307,8 +312,22 @@ export class Worker {
         this.queue.groupConcurrency,
       )
     } catch (err) {
-      if (controller.signal.aborted) return
-      await this.fail(claim, err)
+      if (err instanceof RateLimitError) {
+        try {
+          await this.redis.rateLimit(
+            this.queue.prefix,
+            this.queue.id,
+            this.queue.ns.id,
+            claim.job.id,
+            claim.token,
+            err.ms,
+            err.limiter,
+            this.queue.groupConcurrency,
+          )
+        } catch (err_) {
+          this.onError(err_)
+        }
+      } else if (!controller.signal.aborted) await this.fail(claim, err)
     } finally {
       stopHeartbeat()
     }
