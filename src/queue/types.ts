@@ -19,6 +19,13 @@ export interface NamespaceOptions {
   prefix?: string
   /** Logger inherited by every queue and worker of this namespace. Default: no logging. */
   logger?: WorkflowLogger
+  /** PROTOTYPE: named rate limiters, `limit` starts per `window` ms. */
+  rateLimiters?: Record<string, RateLimiterBudget>
+}
+
+export interface RateLimiterBudget {
+  limit: number
+  window: number
 }
 
 export interface QueueOptions {
@@ -30,6 +37,8 @@ export interface QueueOptions {
   groupConcurrency?: number
   /** TTL (seconds) of the `wait()` result record. Default: 300. */
   resultTtl?: number
+  /** PROTOTYPE: names of the namespace's rate limiters every start must pass. */
+  rateLimiters?: string[]
 }
 
 interface AddOptionsBase {

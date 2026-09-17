@@ -37,12 +37,16 @@ interface RedisAddr {
  * A namespace with a fresh id (key isolation) on its own connection — `namespace.close()`
  * disconnects the connection it was handed, so scenarios cannot share one.
  */
-async function makeNamespace(addr: RedisAddr, opts?: { concurrency?: number }) {
+async function makeNamespace(
+  addr: RedisAddr,
+  opts?: { concurrency?: number; rateLimiters?: Record<string, { limit: number; window: number }> },
+) {
   return new WorkflowNamespace({
     id: randomUUID(),
     redis: await createRedis(addr),
     autoClose: false,
     concurrency: opts?.concurrency,
+    rateLimiters: opts?.rateLimiters,
     // A silently failing job would just stall the scenario forever — make it loud.
     logger: { error: console.error, warn: console.warn },
   })
@@ -102,6 +106,8 @@ interface DrainOptions {
   concurrency: number
   groups: number
   steps: number
+  /** PROTOTYPE: this many limiters, each far above the drain rate, so the gate never closes. */
+  limiters?: number
 }
 
 /** Steady-state drain: jobs are all enqueued up front, then a worker chews through them. */
@@ -109,12 +115,19 @@ async function benchThroughput(addr: RedisAddr, opts: DrainOptions) {
   await best(opts.name, async () => runDrain(addr, opts))
 }
 
-async function runDrain(addr: RedisAddr, { count, concurrency, groups, steps }: DrainOptions) {
-  const ns = await makeNamespace(addr)
+async function runDrain(
+  addr: RedisAddr,
+  { count, concurrency, groups, steps, limiters = 0 }: DrainOptions,
+) {
+  const names = Array.from({ length: limiters }, (_, i) => `l${i}`)
+  const ns = await makeNamespace(addr, {
+    rateLimiters: Object.fromEntries(names.map((n) => [n, { limit: 1_000_000, window: 60_000 }])),
+  })
   const counter = makeCounter(count)
   const wf = ns.createWorkflow({
     id: 'throughput',
     schema: undefined as never,
+    queueOptions: { rateLimiters: names },
     async run({ step }) {
       for (let s = 0; s < steps; s++) await step.do(`s${s}`, () => s)
       counter.hit()
@@ -207,6 +220,24 @@ async function main() {
       concurrency: 50,
       groups: 10,
       steps: 0,
+    })
+    for (const limiters of [1, 3]) {
+      await benchThroughput(addr, {
+        name: `drain c=50, ${limiters} limiter(s) open`,
+        count: 3000,
+        concurrency: 50,
+        groups: 0,
+        steps: 0,
+        limiters,
+      })
+    }
+    await benchThroughput(addr, {
+      name: 'drain c=1, 1 limiter open',
+      count: 500,
+      concurrency: 1,
+      groups: 0,
+      steps: 0,
+      limiters: 1,
     })
     await benchLatency(addr)
     console.log()

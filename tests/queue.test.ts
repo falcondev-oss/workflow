@@ -1646,6 +1646,7 @@ test('a worker held off by a cap another process owns still re-polls and recover
       randomUUID(),
       500,
       1,
+      0,
     )
     const [claimedJobs] = claimed
     expect(claimedJobs).toHaveLength(1)

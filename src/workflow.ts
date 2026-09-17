@@ -4,6 +4,7 @@ import type Redis from 'ioredis'
 import type { IsUnknown } from 'type-fest'
 import type {
   AddOptions,
+  NamespaceOptions,
   QueueOptions,
   ReservedJob,
   Worker,
@@ -52,6 +53,8 @@ export interface WorkflowNamespaceOptions {
   queueOptions?: WorkflowQueueOptions
   workerOptions?: WorkflowWorkerOptions
   jobOptions?: WorkflowJobRunOptions
+  /** PROTOTYPE: untyped plumbing only, the typed API is settled elsewhere. */
+  rateLimiters?: NamespaceOptions['rateLimiters']
 }
 
 export interface CreateWorkflowOptions<
@@ -109,6 +112,7 @@ export class WorkflowNamespace {
         const namespace = new Namespace({
           id: this.opts.id,
           concurrency: this.opts.concurrency,
+          rateLimiters: this.opts.rateLimiters,
           redis,
           prefix: this.opts.prefix,
           logger: this.opts.logger,
@@ -186,6 +190,7 @@ export class Workflow<RunInput, Input, Output, ProgressInput = never, Progress =
           concurrency: this.opts.queueOptions?.concurrency,
           groupConcurrency: this.opts.queueOptions?.groupConcurrency,
           resultTtl: this.opts.queueOptions?.resultTtl,
+          rateLimiters: this.opts.queueOptions?.rateLimiters,
         })
       })()
     }

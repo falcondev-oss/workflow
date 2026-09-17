@@ -3,6 +3,7 @@ export type { ExpBackoffOptions } from './backoff'
 export {
   JobAlreadyExistsError,
   NonRecoverableError,
+  RateLimitError,
   ResultExpiredError,
   TimeoutError,
 } from './errors'

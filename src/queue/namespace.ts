@@ -1,6 +1,6 @@
 import type Redis from 'ioredis'
 import type { QueueRedis } from './scripts'
-import type { NamespaceOptions, QueueOptions, WorkflowLogger } from './types'
+import type { NamespaceOptions, QueueOptions, RateLimiterBudget, WorkflowLogger } from './types'
 import { Queue } from './queue'
 import { registerScripts, UNLIMITED } from './scripts'
 
@@ -15,6 +15,7 @@ export class Namespace {
   readonly concurrency: number
   readonly redis: QueueRedis
   readonly logger?: WorkflowLogger
+  readonly rateLimiters: Record<string, RateLimiterBudget>
 
   private readonly subscriber: Redis
   private readonly subscriberReady: Promise<unknown>
@@ -27,6 +28,7 @@ export class Namespace {
     this.prefix = opts.prefix ?? 'wf'
     this.concurrency = opts.concurrency ?? UNLIMITED
     this.logger = opts.logger
+    this.rateLimiters = opts.rateLimiters ?? {}
     this.redis = registerScripts(opts.redis)
 
     this.subscriber = opts.redis.duplicate()
