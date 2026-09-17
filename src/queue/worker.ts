@@ -154,10 +154,11 @@ export class Worker {
 
   /**
    * The thin JS cron tick, folded into the wake loop — no poller. `reserve` hands back the due
-   * schedules (`[scheduleId, score, …]`), this computes each one's `nextRun(now)` via Croner and
-   * calls the `fireSchedule` CAS script with the score it saw. CAS-on-score = exactly-once across
-   * N workers; computing next in JS *before* the call = crash-safe. A backlog after downtime
-   * collapses to one fire because `nextRun(now)` jumps forward. Errors are best-effort logged.
+   * schedules (`[scheduleId, score, …]`), this computes each one's `nextRun(max(now, score))` via
+   * Croner and calls the `fireSchedule` CAS script with the score it saw. CAS-on-score =
+   * exactly-once across N workers; computing next in JS *before* the call = crash-safe. A backlog
+   * after downtime collapses to one fire because `nextRun(now)` jumps forward. Errors are
+   * best-effort logged.
    */
   private async tickSchedules(due: string[]): Promise<void> {
     try {
@@ -167,7 +168,9 @@ export class Worker {
         const scheduleKey = `${this.queue.prefix}:${this.queue.id}:schedule:${scheduleId}`
         const [pattern, tz] = await this.redis.hmget(scheduleKey, 'pattern', 'tz')
         if (!pattern) continue // removed concurrently
-        const next = nextRunMs(pattern, tz ?? localTimeZone(), new Date())
+        // A worker clock behind Redis would otherwise compute the occurrence being fired again.
+        const from = new Date(Math.max(Date.now(), Number(expectedScore)))
+        const next = nextRunMs(pattern, tz ?? localTimeZone(), from)
         if (next === null) continue // no future occurrence
         await this.redis.fireSchedule(
           this.queue.prefix,

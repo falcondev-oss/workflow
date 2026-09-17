@@ -522,7 +522,8 @@ return recovered
  * so a racing worker that already fired (and advanced the score) is a no-op ⇒ **exactly-once
  * across N workers with no distributed lock**. Because the next score is computed in JS *before*
  * the call, a crash before it is a no-op retry and a crash after is fully done — never a
- * half-fired state.
+ * half-fired state. A `nextScore` that does not advance past `expectedScore` is also stale, so a
+ * caller can never re-arm a schedule at the occurrence it just fired.
  *
  * On a winning CAS: re-arm `ZADD due nextScore` (atomic with the enqueue). Skip-if-running:
  * if enabled and the record's `lastJobId` is still non-terminal (its hash exists and is not
@@ -554,7 +555,7 @@ local dueKey = wf .. ":schedules:due"
 local scheduleKey = wf .. ":schedule:" .. scheduleId
 
 local cur = redis.call("ZSCORE", dueKey, scheduleId)
-if cur == false or cur ~= expectedScore then
+if cur == false or cur ~= expectedScore or nextScore <= tonumber(expectedScore) then
   return { "stale" }
 end
 
