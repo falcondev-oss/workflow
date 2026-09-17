@@ -232,7 +232,7 @@ export class Worker {
       want,
     )
     return {
-      claims: jobs.map(([id, groupId, data, attempts, priority, token, steps]) => ({
+      claims: jobs.map(([id, groupId, data, attempts, priority, token, steps, queueWaitMs]) => ({
         job: Object.freeze({
           id,
           groupId,
@@ -240,6 +240,7 @@ export class Worker {
           attemptsMade: Number(attempts),
           priority: Number(priority),
           steps: flatToMap(steps),
+          queueWaitMs,
         }) as ReservedJob,
         token,
       })),

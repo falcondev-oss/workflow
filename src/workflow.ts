@@ -195,10 +195,22 @@ export class Workflow<RunInput, Input, Output, ProgressInput = never, Progress =
   async work(opts?: WorkflowWorkerOptions): Promise<Worker> {
     const queue = await this.getQueue()
     const { metrics, ...workerOpts } = { ...this.opts.workerOptions, ...opts }
+    const queueWait = metrics?.meter.createHistogram(`${metrics.prefix}_workflow_queue_wait`, {
+      description: 'Time a job waited in the queue before a worker claimed it',
+      unit: 'ms',
+      // The SDK default stops at 10s, too short for a backlog.
+      advice: {
+        explicitBucketBoundaries: [
+          5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 30_000, 60_000, 300_000, 900_000,
+          3_600_000,
+        ],
+      },
+    })
 
     const worker = queue.worker(
       async (job: ReservedJob, ctx) => {
         this.logger?.info?.(`[${this.id}] Processing job ${job.id}`)
+        queueWait?.record(job.queueWaitMs, { workflow_id: this.id })
 
         const deserializedData = deserialize<WorkflowJobPayloadInternal>(job.data)
         const parsedData =
@@ -221,6 +233,7 @@ export class Workflow<RunInput, Input, Output, ProgressInput = never, Progress =
             attributes: {
               'workflow.id': this.id,
               'workflow.job_id': job.id,
+              'workflow.queue_wait_ms': job.queueWaitMs,
             },
             kind: SpanKind.CONSUMER,
           },

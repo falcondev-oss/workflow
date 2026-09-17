@@ -117,10 +117,11 @@ end
  * promotion time), pack the priority score, `ZADD` the group ZSET, and re-evaluate
  * `ready`. The single source of truth for "a job becomes runnable" — shared (included, not
  * copied) by `enqueue`'s immediate path and `reserve`'s delayed-promotion, so the ready
- * logic can never drift between them.
+ * logic can never drift between them. `readyAt` (Redis ms) is when the job became runnable,
+ * which `reserve` turns into the queue wait of the claim.
  */
 const ADD_WAITING = `
-local function addWaiting(wf, jobKey, jobId, groupId, priority, groupCap, scoreArg)
+local function addWaiting(wf, jobKey, jobId, groupId, priority, groupCap, readyAt, scoreArg)
   -- Recovery requeues at the STORED packed score (front of its band); the enqueue/promotion
   -- paths pass no score and stamp a fresh FIFO counter. Either way the ready-set
   -- maintenance below is the single shared source of truth, so recovery can't drift.
@@ -129,7 +130,7 @@ local function addWaiting(wf, jobKey, jobId, groupId, priority, groupCap, scoreA
     local counter = redis.call("INCR", wf .. ":pc") % 4294967296
     score = (${PMAX} - priority) * 4294967296 + counter
   end
-  redis.call("HSET", jobKey, "state", "waiting")
+  redis.call("HSET", jobKey, "state", "waiting", "readyAt", readyAt)
   redis.call("ZADD", wf .. ":g:" .. groupId .. ":jobs", score, jobId)
   maintainGroup(wf, groupId, groupCap)
 end
@@ -148,7 +149,7 @@ local function enqueueNow(prefix, wf, jobKey, jobId, data, groupId, priority, ma
     "data", data, "attempts", 0,
     "maxAttempts", maxAttempts, "stalledCount", 0, "priority", priority,
     "groupId", groupId, "nsId", nsId, "createdAt", now)
-  addWaiting(wf, jobKey, jobId, groupId, priority, groupCap)
+  addWaiting(wf, jobKey, jobId, groupId, priority, groupCap, now)
   local wake = wf .. ":wake"
   redis.call("LPUSH", wake, "1")
   redis.call("LTRIM", wake, 0, 0)
@@ -230,8 +231,9 @@ return 1
  * so a batch needs a single JS UUID and the tokens stay globally unique.
  *
  * Returns `{ jobs, msToNext, msToSchedule, dueSchedules, maxed }`:
- * - `jobs`: array of `{ jobId, groupId, data, attempts, priority, token, steps }`, where `steps`
- *   is the job's memoized step hash flattened to `[name, value, …]`
+ * - `jobs`: array of `{ jobId, groupId, data, attempts, priority, token, steps, queueWait }`, where
+ *   `steps` is the job's memoized step hash flattened to `[name, value, …]` and `queueWait` is the
+ *   ms since the job became runnable, on the Redis clock
  * - `msToNext`: ms until the next due delayed job (`-1` none, `0` due work left behind by the
  *   promote cap) — the worker's `BRPOP wake` timeout, so the block *is* the delayed-job timer
  * - `msToSchedule`: same, for the nearest cron occurrence
@@ -268,8 +270,9 @@ for i = 1, #due do
   local dj = due[i]
   redis.call("ZREM", delayedKey, dj)
   local djKey = wf .. ":j:" .. dj
-  local meta = redis.call("HMGET", djKey, "groupId", "priority")
-  addWaiting(wf, djKey, dj, meta[1], tonumber(meta[2]), groupCap)
+  local meta = redis.call("HMGET", djKey, "groupId", "priority", "runAt")
+  -- The job was runnable from its runAt, not from whenever a worker got round to promoting it.
+  addWaiting(wf, djKey, dj, meta[1], tonumber(meta[2]), groupCap, meta[3])
 end
 
 -- ms until the head of a due-scored ZSET (for an idle worker BRPOP timeout). Returns 0 when
@@ -313,9 +316,12 @@ while #jobs < want do
 
     -- The claim makes this worker the only writer of the step hash, so shipping it with the
     -- job is an exact snapshot: a replay resolves memoized steps with no round-trip at all.
-    local vals = redis.call("HMGET", jobKey, "data", "priority", "attempts")
+    -- Jobs made runnable before readyAt existed fall back to createdAt.
+    local vals = redis.call("HMGET", jobKey, "data", "priority", "attempts", "readyAt", "createdAt")
     local steps = redis.call("HGETALL", jobKey .. ":steps")
-    jobs[#jobs + 1] = { jobId, gid, vals[1], vals[3], vals[2], token, steps }
+    -- Clamped: a retry's or absolute runAt comes from a client clock, which may run ahead of Redis.
+    local queueWait = math.max(0, now - tonumber(vals[4] or vals[5]))
+    jobs[#jobs + 1] = { jobId, gid, vals[1], vals[3], vals[2], token, steps, queueWait }
   end
 end
 
@@ -507,7 +513,7 @@ for i = 1, #candidates do
     else
       local groupId = redis.call("HGET", jobKey, "groupId")
       local score = tonumber(redis.call("HGET", jobKey, "score"))
-      addWaiting(wf, jobKey, jobId, groupId, 0, groupCap, score)
+      addWaiting(wf, jobKey, jobId, groupId, 0, groupCap, now, score)
     end
     recovered = recovered + 1
   end
@@ -594,6 +600,7 @@ export interface QueueCommands {
         priority: string,
         token: string,
         steps: string[],
+        queueWaitMs: number,
       ][],
       msToNext: number,
       msToSchedule: number,

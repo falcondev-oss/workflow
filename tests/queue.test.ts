@@ -1844,3 +1844,29 @@ test('a saturated worker still fires a due cron schedule (it parks locally, not 
     await ns.close()
   }
 })
+
+test('queueWaitMs counts from enqueue, or from runAt for a delayed job', async () => {
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
+  const queue = ns.queue({ id: randomUUID() })
+
+  try {
+    const now = await queue.add('now')
+    const delayed = await queue.add('delayed', { runIn: 100 })
+    await sleep(500)
+
+    const waits = new Map<string, number>()
+    queue.worker((job) => {
+      waits.set(job.id, job.queueWaitMs)
+      return ''
+    })
+    await Promise.all([queue.wait(now.id), queue.wait(delayed.id)])
+
+    // No worker was running, so the delayed job is promoted at claim time: its wait must still
+    // start at runAt, not at promotion (≈0) or at enqueue (≈500).
+    expect(waits.get(now.id)).toBeGreaterThanOrEqual(450)
+    expect(waits.get(delayed.id)).toBeGreaterThanOrEqual(350)
+    expect(waits.get(delayed.id)).toBeLessThan(480)
+  } finally {
+    await ns.close()
+  }
+})
