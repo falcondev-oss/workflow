@@ -1314,6 +1314,85 @@ test('cron fires exactly once under concurrent fire (CAS on score): one fired, o
   }
 })
 
+test('fireSchedule with a non-advancing next score is stale and writes nothing', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const nsId = randomUUID()
+  const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const dueKey = `${prefix}:${wfId}:schedules:due`
+  const groupJobs = `${prefix}:${wfId}:g:sched:jobs`
+
+  try {
+    await queue.upsertSchedule('sched', { pattern: '* * * * *', data: 'x', tz: 'UTC' })
+    const expected = Date.now() - 60_000
+    await redis.zadd(dueKey, expected, 'sched')
+
+    for (const next of [expected, expected - 1]) {
+      const result = await ns.redis.fireSchedule(
+        prefix,
+        wfId,
+        nsId,
+        'sched',
+        expected,
+        next,
+        'occ',
+        1,
+        1,
+      )
+      expect(result).toEqual(['stale'])
+    }
+    expect(Number(await redis.zscore(dueKey, 'sched'))).toBe(expected)
+    expect(await redis.zcard(groupJobs)).toBe(0)
+  } finally {
+    await ns.close()
+  }
+})
+
+test('a worker clock behind Redis fires a due occurrence once, not in a loop', async () => {
+  const prefix = randomUUID()
+  const wfId = randomUUID()
+  const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
+  const queue = ns.queue({ id: wfId })
+  const dueKey = `${prefix}:${wfId}:schedules:due`
+
+  const runs = vi.fn()
+  try {
+    // Yearly, so real time cannot reach the next occurrence while the test runs.
+    await queue.upsertSchedule('sched', {
+      pattern: '0 0 1 1 *',
+      data: 'x',
+      tz: 'UTC',
+      skipIfRunning: false,
+    })
+    // Due by Redis time, but still a minute in the future by the worker's clock.
+    const [seconds] = await redis.time()
+    const year = new Date(Number(seconds) * 1000).getUTCFullYear()
+    const occurrence = Date.UTC(year, 0, 1)
+    await redis.zadd(dueKey, occurrence, 'sched')
+    // `vi.waitFor` advances fake timers, so leave room for that to never reach the occurrence.
+    vi.useFakeTimers({ toFake: ['Date'], now: occurrence - 60_000 })
+
+    queue.worker(
+      () => {
+        runs()
+        return 'ok'
+      },
+      { safetyTimeout: 0.1 },
+    )
+
+    await vi.waitFor(() => {
+      expect(runs).toHaveBeenCalledTimes(1)
+    })
+    await sleep(300)
+    expect(runs).toHaveBeenCalledTimes(1)
+    expect(Number(await redis.zscore(dueKey, 'sched'))).toBe(Date.UTC(year + 1, 0, 1))
+  } finally {
+    vi.useRealTimers()
+    await ns.close()
+  }
+})
+
 test('a long-overdue cron fires once then jumps forward (missed-run = skip, no stampede)', async () => {
   const prefix = randomUUID()
   const wfId = randomUUID()
