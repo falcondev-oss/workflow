@@ -149,6 +149,12 @@ export interface ReservedJob {
    * on a replay it is the complete memo, so resolving a cached step costs no round-trip.
    */
   steps: Map<string, string>
+  /**
+   * Ms this claim waited in `waiting` (Redis clock), from when the job last became runnable:
+   * enqueue, cron fire, delayed `runAt` (including retries) or stalled recovery. A `runAt` set on
+   * a client clock carries that clock's skew.
+   */
+  queueWaitMs: number
 }
 
 export interface JobContext {

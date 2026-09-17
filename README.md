@@ -183,7 +183,9 @@ re-read the same payload.
 ### Metrics
 
 `workflow.getMetrics()` returns point-in-time `{ active, waiting, delayed }` depths. Pass an
-OpenTelemetry meter to export them as gauges:
+OpenTelemetry meter to export them as gauges, plus a `<prefix>_workflow_queue_wait` histogram
+(ms each job waited before a worker claimed it, also set as `workflow.queue_wait_ms` on the job
+span):
 
 ```ts
 const namespace = new WorkflowNamespace({
