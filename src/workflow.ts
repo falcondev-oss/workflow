@@ -250,6 +250,11 @@ export class Workflow<
   async work(opts?: WorkflowWorkerOptions): Promise<Worker> {
     const queue = await this.getQueue()
     const { metrics, ...workerOpts } = { ...this.opts.workerOptions, ...opts }
+    // Caps stack, lowest wins. So a shared `work({ concurrency })` can't widen what a workflow set.
+    const caps = [this.opts.workerOptions?.concurrency, opts?.concurrency].filter(
+      (cap) => cap !== undefined,
+    )
+    if (caps.length > 0) workerOpts.concurrency = Math.min(...caps)
     const queueWait = metrics?.meter.createHistogram(`${metrics.prefix}_workflow_queue_wait`, {
       description: 'Time a job waited in the queue before a worker claimed it',
       unit: 'ms',

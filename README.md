@@ -152,6 +152,20 @@ namespace.createWorkflow({
 })
 ```
 
+Caps stack, lowest wins: namespace across all workflows, `queueOptions.concurrency` per workflow,
+`groupConcurrency` per group, `workerOptions.concurrency` per process.
+
+`work({ concurrency })` stacks too, so it can't widen what the workflow set. Lower still works.
+
+```ts
+const attachments = namespace.createWorkflow({
+  id: 'attachments',
+  workerOptions: { concurrency: 2 }, // each job holds a big buffer
+  run: async () => {},
+})
+await attachments.work({ concurrency: 20 }) // runs 2
+```
+
 ### Rate limits
 
 A rate limiter allows at most `limit` job starts in any `window` ms. A start is one claim of a job

@@ -642,6 +642,46 @@ describe('groups', () => {
   })
 })
 
+/** Run `jobs` overlapping jobs through one worker and report the most ever in flight at once. */
+async function peakInFlight(opts: {
+  declared?: number
+  requested?: number
+  jobs: number
+}): Promise<number> {
+  let inFlight = 0
+  let peak = 0
+  const workflow = namespace().createWorkflow({
+    id: randomUUID(),
+    workerOptions: opts.declared === undefined ? undefined : { concurrency: opts.declared },
+    run: async () => {
+      peak = Math.max(peak, ++inFlight)
+      await sleep(50)
+      inFlight--
+    },
+  })
+  const jobs = await Promise.all(
+    Array.from({ length: opts.jobs }, async () => workflow.run(undefined)),
+  )
+  await workflow.work(opts.requested === undefined ? undefined : { concurrency: opts.requested })
+  await Promise.all(jobs.map(async (job) => job.wait(5000)))
+  return peak
+}
+
+describe('worker concurrency', () => {
+  test("work() cannot raise the workflow's own concurrency", async () => {
+    expect(await peakInFlight({ declared: 2, requested: 8, jobs: 6 })).toBe(2)
+  })
+
+  test('work() can still lower it', async () => {
+    expect(await peakInFlight({ declared: 8, requested: 1, jobs: 4 })).toBe(1)
+  })
+
+  test('either one alone applies', async () => {
+    expect(await peakInFlight({ declared: 3, jobs: 6 })).toBe(3)
+    expect(await peakInFlight({ requested: 3, jobs: 6 })).toBe(3)
+  })
+})
+
 test('job data that no longer matches the schema warns and fails without retrying', async () => {
   const logger = { ...console, warn: vi.fn() }
   const ns = new WorkflowNamespace({
