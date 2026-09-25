@@ -483,6 +483,19 @@ export class Workflow<
     return queue.getSchedules()
   }
 
+  /**
+   * Point-in-time snapshot of a group's unfinished jobs: active, waiting in claim order, then
+   * delayed. `input` is returned as stored, validated at enqueue. Finished jobs are not included.
+   */
+  async getGroupJobs(groupId: string) {
+    const queue = await this.getQueue()
+    const jobs = await queue.getGroupJobs(groupId)
+    return jobs.map(({ data, ...job }) => ({
+      ...job,
+      input: deserialize<WorkflowJobPayloadInternal>(data).input as Input,
+    }))
+  }
+
   /** Point-in-time queue-depth gauges (`active`/`waiting`/`delayed`) for this workflow. */
   async getMetrics() {
     const queue = await this.getQueue()

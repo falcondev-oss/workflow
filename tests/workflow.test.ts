@@ -15,7 +15,7 @@ import {
 } from '@opentelemetry/sdk-trace-base'
 import { type } from 'arktype'
 import { stringify } from 'superjson'
-import { beforeAll, describe, expect, onTestFinished, test, vi } from 'vitest'
+import { beforeAll, describe, expect, expectTypeOf, onTestFinished, test, vi } from 'vitest'
 import { z } from 'zod'
 import { createRedis, ResultExpiredError, TimeoutError, WorkflowNamespace } from '../src'
 
@@ -639,6 +639,36 @@ describe('groups', () => {
 
     // @ts-expect-error groupId is worker-internal, not part of a producer's handle
     expect(job.groupId).toBeUndefined()
+  })
+
+  test("lists a group's active, waiting and delayed jobs with typed input", async () => {
+    const gate = makeGate()
+    const started = vi.fn()
+    const workflow = namespace().createWorkflow({
+      id: randomUUID(),
+      schema: z.object({ day: z.coerce.date() }),
+      run: async () => {
+        started()
+        await gate.wait()
+      },
+    })
+    onTestFinished(gate.open)
+    const day = new Date('2026-01-01')
+    const active = await workflow.run({ day: '2026-01-01' }, { groupId: 'g' })
+    await workflow.work()
+    await vi.waitFor(() => expect(started).toHaveBeenCalled())
+    const waiting = await workflow.run({ day }, { groupId: 'g' })
+    const delayed = await workflow.runIn({ day }, 60_000, { groupId: 'g' })
+    await workflow.runIn({ day }, 60_000, { groupId: 'other' })
+
+    const jobs = await workflow.getGroupJobs('g')
+    expectTypeOf(jobs[0]!.input).toEqualTypeOf<{ day: Date }>()
+    const createdAt: unknown = expect.any(Number)
+    expect(jobs).toEqual([
+      { id: active.id, state: 'active', input: { day }, createdAt },
+      { id: waiting.id, state: 'waiting', input: { day }, createdAt },
+      { id: delayed.id, state: 'delayed', input: { day }, createdAt },
+    ])
   })
 })
 

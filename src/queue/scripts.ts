@@ -713,7 +713,39 @@ end
 return values
 `
 
+/**
+ * Read-only snapshot of one group's unfinished jobs: active, then waiting in claim order, then
+ * delayed in `runAt` order. Delayed jobs have no group index, so the workflow's `delayed` ZSET is
+ * scanned and filtered on each hash's `groupId`.
+ *
+ * ARGV: prefix, wfId, groupId
+ */
+const GROUP_JOBS = `
+local wf = ARGV[1] .. ":" .. ARGV[2]
+local groupId = ARGV[3]
+local jobs = {}
+local function collect(ids)
+  for i = 1, #ids do
+    local jobKey = wf .. ":j:" .. ids[i]
+    if redis.call("HGET", jobKey, "groupId") == groupId then
+      local vals = redis.call("HMGET", jobKey, "state", "data", "createdAt")
+      jobs[#jobs + 1] = { ids[i], vals[1], vals[2], vals[3] }
+    end
+  end
+end
+collect(redis.call("SMEMBERS", wf .. ":g:" .. groupId .. ":active"))
+collect(redis.call("ZRANGE", wf .. ":g:" .. groupId .. ":jobs", 0, -1))
+-- ponytail: O(all delayed jobs) per call. Add a per-group delayed index if that set grows large.
+collect(redis.call("ZRANGE", wf .. ":delayed", 0, -1))
+return jobs
+`
+
 export interface QueueCommands {
+  groupJobs: (
+    ...args: string[]
+  ) => Promise<
+    [id: string, state: 'waiting' | 'delayed' | 'active', data: string, createdAt: string][]
+  >
   rateLimiterMetrics: (
     ...args: string[]
   ) => Promise<[name: string, starts: number, pausedMs: number][]>
@@ -765,6 +797,7 @@ export function registerScripts(redis: Redis): QueueRedis {
     redis.defineCommand('heartbeat', { numberOfKeys: 0, lua: HEARTBEAT })
     redis.defineCommand('recoverStalled', { numberOfKeys: 0, lua: RECOVER_STALLED })
     redis.defineCommand('rateLimiterMetrics', { numberOfKeys: 0, lua: RATE_LIMITER_METRICS })
+    redis.defineCommand('groupJobs', { numberOfKeys: 0, lua: GROUP_JOBS })
     redis.defineCommand('rateLimit', { numberOfKeys: 0, lua: RATE_LIMIT })
     redis.defineCommand('fireSchedule', { numberOfKeys: 0, lua: FIRE_SCHEDULE })
     registered.add(redis)
