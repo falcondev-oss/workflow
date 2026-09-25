@@ -166,6 +166,11 @@ const attachments = namespace.createWorkflow({
 await attachments.work({ concurrency: 20 }) // runs 2
 ```
 
+`workflow.getGroupJobs(groupId)` returns a point-in-time snapshot of the group's unfinished jobs,
+each `{ id, state, input, createdAt }` with `state` one of `active`, `waiting` or `delayed` and
+`input` typed by the schema. Jobs can finish right after the read, so re-read to confirm a group
+has drained.
+
 ### Rate limits
 
 A rate limiter allows at most `limit` job starts in any `window` ms. A start is one claim of a job

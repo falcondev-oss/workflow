@@ -354,6 +354,17 @@ export class Queue {
     return { active, waiting, delayed }
   }
 
+  /** Point-in-time snapshot of a group's unfinished jobs: active, waiting in claim order, delayed. */
+  async getGroupJobs(groupId: string) {
+    const jobs = await this.redis.groupJobs(this.prefix, this.id, groupId)
+    return jobs.map(([id, state, data, createdAt]) => ({
+      id,
+      state,
+      data,
+      createdAt: Number(createdAt),
+    }))
+  }
+
   /** Guard the range that keeps the packed score exact in a ZSET double. */
   private validatePriority(priority: number): void {
     if (!Number.isInteger(priority) || priority < 0 || priority > PMAX)
