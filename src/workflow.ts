@@ -277,11 +277,7 @@ export class WorkflowDefinition<
   // The `this` guards keep `returns()` and `handle()` off a `Workflow`, which already has its handler.
 
   /** Declares the handler's return type, so enqueueing code gets a typed `job.wait()`. */
-  returns<T>(
-    this: WorkflowDefinition<RunInput, Input, Output, ProgressInput, Progress, Names> & {
-      work?: never
-    },
-  ) {
+  returns<T>(this: this & { work?: never }) {
     return new WorkflowDefinition<RunInput, Input, T, ProgressInput, Progress, Names>(
       this.ns,
       this.opts,
@@ -289,9 +285,7 @@ export class WorkflowDefinition<
   }
 
   handle<HandlerOutput extends Output>(
-    this: WorkflowDefinition<RunInput, Input, Output, ProgressInput, Progress, Names> & {
-      work?: never
-    },
+    this: this & { work?: never },
     run: WorkflowHandler<Input, HandlerOutput, ProgressInput, Names>,
   ): Workflow<RunInput, Input, HandlerOutput, ProgressInput, Progress, Names> {
     return new Workflow(this.ns, { ...this.opts, run })
