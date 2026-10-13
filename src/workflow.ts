@@ -287,7 +287,15 @@ export class WorkflowDefinition<
   handle<HandlerOutput extends Output>(
     this: this & { work?: never },
     run: WorkflowHandler<Input, HandlerOutput, ProgressInput, Names>,
-  ): Workflow<RunInput, Input, HandlerOutput, ProgressInput, Progress, Names> {
+  ): Workflow<
+    RunInput,
+    Input,
+    // A declared output wins; only an undeclared one is inferred from the handler.
+    unknown extends Output ? HandlerOutput : Output,
+    ProgressInput,
+    Progress,
+    Names
+  > {
     return new Workflow(this.ns, { ...this.opts, run })
   }
 

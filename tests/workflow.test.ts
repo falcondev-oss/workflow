@@ -914,6 +914,12 @@ test('a definition enqueues jobs that its handled workflow runs', async () => {
     .handle(async () => 1)
     .run(undefined)
   expectTypeOf(counted).toHaveProperty('wait').returns.resolves.toEqualTypeOf<number>()
+  const declared = await namespace()
+    .defineWorkflow({ id: randomUUID() })
+    .returns<number>()
+    .handle(async () => 1)
+    .run(undefined)
+  expectTypeOf(declared).toHaveProperty('wait').returns.resolves.toEqualTypeOf<number>()
 
   await handled.work()
   const job = await sendMail.run({ to: 'a@b.c' })
