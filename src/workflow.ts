@@ -241,7 +241,7 @@ export class WorkflowDefinition<
   Names extends readonly string[] = readonly string[],
 > {
   readonly id: string
-  protected readonly ns: Pick<WorkflowNamespace, 'getNamespace' | 'logger'>
+  private readonly ns: Pick<WorkflowNamespace, 'getNamespace' | 'logger'>
   protected readonly opts: DefineWorkflowOptions<RunInput, Input, ProgressInput, Progress, Names>
   private queue?: Promise<WorkflowQueueInternal>
 
@@ -274,8 +274,9 @@ export class WorkflowDefinition<
     return this.queue
   }
 
-  /** Declares the handler's return type, so enqueuing code gets a typed `job.wait()`. */
-  // `this` excludes a `Workflow`, whose Output already comes from its handler.
+  // The `this` guards keep `returns()` and `handle()` off a `Workflow`, which already has its handler.
+
+  /** Declares the handler's return type, so enqueueing code gets a typed `job.wait()`. */
   returns<T>(
     this: WorkflowDefinition<RunInput, Input, Output, ProgressInput, Progress, Names> & {
       work?: never
@@ -287,9 +288,12 @@ export class WorkflowDefinition<
     )
   }
 
-  handle(
-    run: WorkflowHandler<Input, Output, ProgressInput, Names>,
-  ): Workflow<RunInput, Input, Output, ProgressInput, Progress, Names> {
+  handle<HandlerOutput extends Output>(
+    this: WorkflowDefinition<RunInput, Input, Output, ProgressInput, Progress, Names> & {
+      work?: never
+    },
+    run: WorkflowHandler<Input, HandlerOutput, ProgressInput, Names>,
+  ): Workflow<RunInput, Input, HandlerOutput, ProgressInput, Progress, Names> {
     return new Workflow(this.ns, { ...this.opts, run })
   }
 

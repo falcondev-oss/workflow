@@ -906,6 +906,14 @@ test('a definition enqueues jobs that its handled workflow runs', async () => {
   sendMail.handle(async () => ({ sent: 1 }))
   // @ts-expect-error a handled workflow's output comes from its handler
   handled.returns<string>()
+  // @ts-expect-error a handled workflow already has its handler
+  handled.handle(async () => ({ sent: 'x' }))
+  // Without returns<>(), the handled workflow infers its output from the handler.
+  const counted = await namespace()
+    .defineWorkflow({ id: randomUUID() })
+    .handle(async () => 1)
+    .run(undefined)
+  expectTypeOf(counted).toHaveProperty('wait').returns.resolves.toEqualTypeOf<number>()
 
   await handled.work()
   const job = await sendMail.run({ to: 'a@b.c' })

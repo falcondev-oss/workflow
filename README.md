@@ -65,7 +65,7 @@ console.log(result.engagementLevel)
 
 `createWorkflow` puts the handler in the same module as the workflow, so every module that
 enqueues it also loads everything the handler imports. `defineWorkflow` takes the same options
-without `run`. Enqueuing code imports the definition, and only the worker process imports the
+without `run`. Enqueueing code imports the definition, and only the worker process imports the
 handler.
 
 ```ts
