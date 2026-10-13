@@ -70,6 +70,13 @@ export interface WorkflowNamespaceOptions<
   jobOptions?: WorkflowJobRunOptions
 }
 
+export type WorkflowHandler<
+  Input,
+  Output,
+  ProgressInput = never,
+  Names extends readonly string[] = readonly string[],
+> = (ctx: WorkflowRunContext<Input, ProgressInput, Names[number]>) => Promise<Output>
+
 export interface CreateWorkflowOptions<
   RunInput,
   Input,
@@ -77,11 +84,21 @@ export interface CreateWorkflowOptions<
   ProgressInput = never,
   Progress = ProgressInput,
   Names extends readonly string[] = readonly string[],
+> extends DefineWorkflowOptions<RunInput, Input, ProgressInput, Progress, Names> {
+  run: WorkflowHandler<Input, Output, ProgressInput, Names>
+}
+
+/** `createWorkflow` options without `run`, so enqueueing code never loads the handler. */
+export interface DefineWorkflowOptions<
+  RunInput,
+  Input,
+  ProgressInput = never,
+  Progress = ProgressInput,
+  Names extends readonly string[] = readonly string[],
 > {
   id: string
   schema?: StandardSchemaV1<RunInput, Input>
   progressSchema?: StandardSchemaV1<ProgressInput, Progress>
-  run: (ctx: WorkflowRunContext<Input, ProgressInput, Names[number]>) => Promise<Output>
   getGroupId?: (
     input: IsUnknown<Input> extends true ? undefined : Input,
   ) => string | undefined | Promise<string | undefined>
@@ -165,7 +182,23 @@ export class WorkflowNamespace<
   >(
     opts: CreateWorkflowOptions<RunInput, Input, Output, ProgressInput, Progress, Names>,
   ): Workflow<RunInput, Input, Output, ProgressInput, Progress, Names> {
-    return new Workflow(this, {
+    return this.defineWorkflow(opts).returns<Output>().handle(opts.run)
+  }
+
+  /**
+   * A workflow without its handler: enqueue, schedule and inspect jobs. Attach the handler with
+   * `handle()` in the module the worker process imports.
+   */
+  defineWorkflow<
+    RunInput,
+    Input = RunInput,
+    ProgressInput = never,
+    Progress = ProgressInput,
+    const Names extends readonly (keyof Limiters & string)[] = Defaults,
+  >(
+    opts: DefineWorkflowOptions<RunInput, Input, ProgressInput, Progress, Names>,
+  ): WorkflowDefinition<RunInput, Input, unknown, ProgressInput, Progress, Names> {
+    return new WorkflowDefinition(this, {
       ...opts,
       queueOptions: {
         ...this.opts.queueOptions,
@@ -198,7 +231,8 @@ export class WorkflowNamespace<
   }
 }
 
-export class Workflow<
+/** Enqueues, schedules and inspects jobs. `handle()` attaches the handler a worker runs. */
+export class WorkflowDefinition<
   RunInput,
   Input,
   Output,
@@ -208,30 +242,23 @@ export class Workflow<
 > {
   readonly id: string
   private readonly ns: Pick<WorkflowNamespace, 'getNamespace' | 'logger'>
-  private readonly opts: CreateWorkflowOptions<
-    RunInput,
-    Input,
-    Output,
-    ProgressInput,
-    Progress,
-    Names
-  >
+  protected readonly opts: DefineWorkflowOptions<RunInput, Input, ProgressInput, Progress, Names>
   private queue?: Promise<WorkflowQueueInternal>
 
   constructor(
     ns: Pick<WorkflowNamespace, 'getNamespace' | 'logger'>,
-    opts: CreateWorkflowOptions<RunInput, Input, Output, ProgressInput, Progress, Names>,
+    opts: DefineWorkflowOptions<RunInput, Input, ProgressInput, Progress, Names>,
   ) {
     this.ns = ns
     this.opts = opts
     this.id = opts.id
   }
 
-  private get logger() {
+  protected get logger() {
     return this.ns.logger
   }
 
-  private async getQueue(): Promise<WorkflowQueueInternal> {
+  protected async getQueue(): Promise<WorkflowQueueInternal> {
     if (!this.queue) {
       this.queue = (async () => {
         const namespace = await this.ns.getNamespace()
@@ -247,122 +274,29 @@ export class Workflow<
     return this.queue
   }
 
-  async work(opts?: WorkflowWorkerOptions): Promise<Worker> {
-    const queue = await this.getQueue()
-    const { metrics, ...workerOpts } = { ...this.opts.workerOptions, ...opts }
-    // Caps stack, lowest wins. So a shared `work({ concurrency })` can't widen what a workflow set.
-    const caps = [this.opts.workerOptions?.concurrency, opts?.concurrency].filter(
-      (cap) => cap !== undefined,
+  // The `this` guards keep `returns()` and `handle()` off a `Workflow`, which already has its handler.
+
+  /** Declares the handler's return type, so enqueueing code gets a typed `job.wait()`. */
+  returns<T>(this: this & { work?: never }) {
+    return new WorkflowDefinition<RunInput, Input, T, ProgressInput, Progress, Names>(
+      this.ns,
+      this.opts,
     )
-    if (caps.length > 0) workerOpts.concurrency = Math.min(...caps)
-    const queueWait = metrics?.meter.createHistogram(`${metrics.prefix}_workflow_queue_wait`, {
-      description: 'Time a job waited in the queue before a worker claimed it',
-      unit: 'ms',
-      // The SDK default stops at 10s, too short for a backlog.
-      advice: {
-        explicitBucketBoundaries: [
-          5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 30_000, 60_000, 300_000, 900_000,
-          3_600_000,
-        ],
-      },
-    })
+  }
 
-    const worker = queue.worker(
-      async (job: ReservedJob, ctx) => {
-        this.logger?.info?.(`[${this.id}] Processing job ${job.id}`)
-        queueWait?.record(job.queueWaitMs, { workflow_id: this.id })
-
-        const deserializedData = deserialize<WorkflowJobPayloadInternal>(job.data)
-        const parsedData =
-          this.opts.schema && (await this.opts.schema['~standard'].validate(deserializedData.input))
-        if (parsedData?.issues) {
-          // Stored payload no longer matches the schema — typically a job enqueued before a
-          // schema change. Retrying re-reads the same payload, so this can never succeed.
-          this.logger?.warn?.(
-            `[${this.id}] Job ${job.id} data does not match the workflow schema (stale payload from an older schema version?):`,
-            parsedData.issues,
-          )
-          throw new NonRecoverableError(`Invalid workflow input for job ${job.id}`, {
-            cause: parsedData.issues,
-          })
-        }
-
-        return runWithTracing(
-          `workflow-worker/${this.id}`,
-          {
-            attributes: {
-              'workflow.id': this.id,
-              'workflow.job_id': job.id,
-              'workflow.queue_wait_ms': job.queueWaitMs,
-            },
-            kind: SpanKind.CONSUMER,
-          },
-          async (span) => {
-            const stepPromises = new Set<Promise<any>>()
-            const start = performance.now()
-            try {
-              const result = await this.opts.run({
-                // eslint-disable-next-line ts/no-unsafe-assignment
-                input: parsedData?.value as any,
-                step: new WorkflowStep<ProgressInput>({
-                  queue,
-                  workflowJobId: job.id,
-                  workflowId: this.id,
-                  signal: ctx.signal,
-                  stepPromises,
-                  memo: new Map(job.steps),
-                }),
-                span,
-                rateLimit: ((ms: number, name?: string): never => {
-                  if (!Number.isFinite(ms) || ms <= 0)
-                    throw new Error('rateLimit ms must be a positive finite number')
-                  const limiter = name ?? this.opts.queueOptions?.rateLimiters?.[0] ?? ''
-                  span.addEvent('workflow.rate_limit', {
-                    ...(limiter ? { 'workflow.rate_limiter': limiter } : {}),
-                    'workflow.rate_limit.pause_ms': ms,
-                  })
-                  throw new RateLimitError(ms, limiter)
-                }) as RateLimit<Names[number]>,
-              })
-
-              this.logger?.success?.(
-                `[${this.id}] Completed job ${job.id} in ${(performance.now() - start).toFixed(2)} ms`,
-              )
-              return serialize(result)
-            } catch (err) {
-              if (stepPromises.size > 0) {
-                this.logger?.warn?.(
-                  `[${this.id}] Job failed but there are still ${stepPromises.size} running step(s), waiting for them to finish. Be careful when using 'Promise.all([step0, step1, ...])', as running steps are not canceled when one of them fails.`,
-                )
-                await Promise.allSettled(stepPromises)
-              }
-              throw err
-            }
-          },
-          propagation.extract(
-            ROOT_CONTEXT,
-            deserializedData.tracingHeaders as Record<string, string>,
-          ),
-        )
-      },
-      {
-        ...workerOpts,
-        onFailed:
-          workerOpts.onFailed ??
-          ((job, error) => this.logger?.error?.(`[${this.id}] Job ${job.id} failed:`, error)),
-        onError:
-          workerOpts.onError ?? ((error) => this.logger?.error?.(`[${this.id}] Job error:`, error)),
-      },
-    )
-
-    this.logger?.info?.(`[${this.id}] Worker started`)
-
-    if (metrics) {
-      this.setupMetrics(queue, metrics)
-      queue.ns.setupRateLimiterMetrics(metrics)
-    }
-
-    return worker
+  handle<HandlerOutput extends Output>(
+    this: this & { work?: never },
+    run: WorkflowHandler<Input, HandlerOutput, ProgressInput, Names>,
+  ): Workflow<
+    RunInput,
+    Input,
+    // A declared output wins; only an undeclared one is inferred from the handler.
+    unknown extends Output ? HandlerOutput : Output,
+    ProgressInput,
+    Progress,
+    Names
+  > {
+    return new Workflow(this.ns, { ...this.opts, run })
   }
 
   async run(input: RunInput, opts?: WorkflowJobRunOptions): Promise<WorkflowJob<Output, Progress>> {
@@ -500,6 +434,149 @@ export class Workflow<
   async getMetrics() {
     const queue = await this.getQueue()
     return queue.getMetrics()
+  }
+}
+
+export class Workflow<
+  RunInput,
+  Input,
+  Output,
+  ProgressInput = never,
+  Progress = ProgressInput,
+  Names extends readonly string[] = readonly string[],
+> extends WorkflowDefinition<RunInput, Input, Output, ProgressInput, Progress, Names> {
+  declare protected readonly opts: CreateWorkflowOptions<
+    RunInput,
+    Input,
+    Output,
+    ProgressInput,
+    Progress,
+    Names
+  >
+
+  constructor(
+    ns: Pick<WorkflowNamespace, 'getNamespace' | 'logger'>,
+    opts: CreateWorkflowOptions<RunInput, Input, Output, ProgressInput, Progress, Names>,
+  ) {
+    super(ns, opts)
+  }
+
+  async work(opts?: WorkflowWorkerOptions): Promise<Worker> {
+    const queue = await this.getQueue()
+    const { metrics, ...workerOpts } = { ...this.opts.workerOptions, ...opts }
+    // Caps stack, lowest wins. So a shared `work({ concurrency })` can't widen what a workflow set.
+    const caps = [this.opts.workerOptions?.concurrency, opts?.concurrency].filter(
+      (cap) => cap !== undefined,
+    )
+    if (caps.length > 0) workerOpts.concurrency = Math.min(...caps)
+    const queueWait = metrics?.meter.createHistogram(`${metrics.prefix}_workflow_queue_wait`, {
+      description: 'Time a job waited in the queue before a worker claimed it',
+      unit: 'ms',
+      // The SDK default stops at 10s, too short for a backlog.
+      advice: {
+        explicitBucketBoundaries: [
+          5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 30_000, 60_000, 300_000, 900_000,
+          3_600_000,
+        ],
+      },
+    })
+
+    const worker = queue.worker(
+      async (job: ReservedJob, ctx) => {
+        this.logger?.info?.(`[${this.id}] Processing job ${job.id}`)
+        queueWait?.record(job.queueWaitMs, { workflow_id: this.id })
+
+        const deserializedData = deserialize<WorkflowJobPayloadInternal>(job.data)
+        const parsedData =
+          this.opts.schema && (await this.opts.schema['~standard'].validate(deserializedData.input))
+        if (parsedData?.issues) {
+          // Stored payload no longer matches the schema — typically a job enqueued before a
+          // schema change. Retrying re-reads the same payload, so this can never succeed.
+          this.logger?.warn?.(
+            `[${this.id}] Job ${job.id} data does not match the workflow schema (stale payload from an older schema version?):`,
+            parsedData.issues,
+          )
+          throw new NonRecoverableError(`Invalid workflow input for job ${job.id}`, {
+            cause: parsedData.issues,
+          })
+        }
+
+        return runWithTracing(
+          `workflow-worker/${this.id}`,
+          {
+            attributes: {
+              'workflow.id': this.id,
+              'workflow.job_id': job.id,
+              'workflow.queue_wait_ms': job.queueWaitMs,
+            },
+            kind: SpanKind.CONSUMER,
+          },
+          async (span) => {
+            const stepPromises = new Set<Promise<any>>()
+            const start = performance.now()
+            try {
+              const result = await this.opts.run({
+                // eslint-disable-next-line ts/no-unsafe-assignment
+                input: parsedData?.value as any,
+                step: new WorkflowStep<ProgressInput>({
+                  queue,
+                  workflowJobId: job.id,
+                  workflowId: this.id,
+                  signal: ctx.signal,
+                  stepPromises,
+                  memo: new Map(job.steps),
+                }),
+                span,
+                rateLimit: ((ms: number, name?: string): never => {
+                  if (!Number.isFinite(ms) || ms <= 0)
+                    throw new Error('rateLimit ms must be a positive finite number')
+                  const limiter = name ?? this.opts.queueOptions?.rateLimiters?.[0] ?? ''
+                  span.addEvent('workflow.rate_limit', {
+                    ...(limiter ? { 'workflow.rate_limiter': limiter } : {}),
+                    'workflow.rate_limit.pause_ms': ms,
+                  })
+                  throw new RateLimitError(ms, limiter)
+                }) as RateLimit<Names[number]>,
+              })
+
+              this.logger?.success?.(
+                `[${this.id}] Completed job ${job.id} in ${(performance.now() - start).toFixed(2)} ms`,
+              )
+              return serialize(result)
+            } catch (err) {
+              if (stepPromises.size > 0) {
+                this.logger?.warn?.(
+                  `[${this.id}] Job failed but there are still ${stepPromises.size} running step(s), waiting for them to finish. Be careful when using 'Promise.all([step0, step1, ...])', as running steps are not canceled when one of them fails.`,
+                )
+                await Promise.allSettled(stepPromises)
+              }
+              throw err
+            }
+          },
+          propagation.extract(
+            ROOT_CONTEXT,
+            deserializedData.tracingHeaders as Record<string, string>,
+          ),
+        )
+      },
+      {
+        ...workerOpts,
+        onFailed:
+          workerOpts.onFailed ??
+          ((job, error) => this.logger?.error?.(`[${this.id}] Job ${job.id} failed:`, error)),
+        onError:
+          workerOpts.onError ?? ((error) => this.logger?.error?.(`[${this.id}] Job error:`, error)),
+      },
+    )
+
+    this.logger?.info?.(`[${this.id}] Worker started`)
+
+    if (metrics) {
+      this.setupMetrics(queue, metrics)
+      queue.ns.setupRateLimiterMetrics(metrics)
+    }
+
+    return worker
   }
 
   private setupMetrics(
