@@ -895,6 +895,25 @@ describe('durable sleep', () => {
   })
 })
 
+test('a definition enqueues jobs that its handled workflow runs', async () => {
+  const sendMail = namespace()
+    .defineWorkflow({ id: randomUUID(), schema: z.object({ to: z.string() }) })
+    .returns<{ sent: string }>()
+  expectTypeOf(sendMail).not.toHaveProperty('work')
+
+  const handled = sendMail.handle(async ({ input }) => ({ sent: input.to }))
+  // @ts-expect-error the handler must return the declared output
+  sendMail.handle(async () => ({ sent: 1 }))
+  // @ts-expect-error a handled workflow's output comes from its handler
+  handled.returns<string>()
+
+  await handled.work()
+  const job = await sendMail.run({ to: 'a@b.c' })
+  const output = await job.wait(5000)
+  expectTypeOf(output).toEqualTypeOf<{ sent: string }>()
+  expect(output).toEqual({ sent: 'a@b.c' })
+})
+
 test('priority is numeric — the old high|normal enum is gone', async () => {
   const workflow = namespace().createWorkflow({ id: randomUUID(), run: async () => {} })
 

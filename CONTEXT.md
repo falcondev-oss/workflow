@@ -2,6 +2,16 @@
 
 Durable, type-safe queue workers. Workflows run jobs whose steps are persisted, so a retry replays the job and skips finished steps.
 
+## Workflows
+
+**Definition**:
+A workflow without its handler: its id, schema and options. Enough to enqueue, schedule and inspect jobs, not to run them.
+_Avoid_: Job type, contract
+
+**Handler**:
+The `run` function a worker calls for each job of a workflow.
+_Avoid_: Processor, body
+
 ## Rate limits
 
 **Rate limiter**:

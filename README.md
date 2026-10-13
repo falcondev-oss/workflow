@@ -61,6 +61,44 @@ const result = await job.wait()
 console.log(result.engagementLevel)
 ```
 
+### Definitions and handlers
+
+`createWorkflow` puts the handler in the same module as the workflow, so every module that
+enqueues it also loads everything the handler imports. `defineWorkflow` takes the same options
+without `run`. Enqueuing code imports the definition, and only the worker process imports the
+handler.
+
+```ts
+// jobs/send-mail.ts: imported wherever jobs are enqueued
+export const sendMail = namespace
+  .defineWorkflow({
+    id: 'send-mail',
+    schema: z.object({ to: z.string() }),
+  })
+  .returns<{ messageId: string }>() // optional, types job.wait()
+
+await sendMail.run({ to: 'john@example.com' })
+```
+
+```ts
+// handlers/send-mail.ts: imported only by the worker process
+import { sendMail } from '../jobs/send-mail'
+
+export default sendMail.handle(async ({ input, step }) => {
+  const messageId = await step.do('send', async () => mailer.send(input.to))
+  return { messageId } // checked against returns<>()
+})
+```
+
+```ts
+// worker.ts
+import sendMail from './handlers/send-mail'
+
+await sendMail.work()
+```
+
+A definition has every method of a workflow except `work()`.
+
 ### Watching jobs
 
 Declare a Standard Schema for progress, then emit its input type from any step. Watchers receive
