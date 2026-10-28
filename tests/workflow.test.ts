@@ -893,6 +893,39 @@ describe('durable sleep', () => {
       await ns.close()
     }
   })
+  test('losing the claim aborts the signal of the run and of step.do', async () => {
+    const redis = await connect()
+    const prefix = randomUUID()
+    const wfId = randomUUID()
+    const ns = new WorkflowNamespace({ id: randomUUID(), redis, prefix, autoClose: false })
+    const started = makeGate()
+    const signals: AbortSignal[] = []
+    const workflow = ns.createWorkflow({
+      id: wfId,
+      run: async ({ step, signal }) => {
+        signals.push(signal)
+        await step.do('long', async ({ signal: stepSignal }) => {
+          signals.push(stepSignal)
+          started.open()
+          await new Promise((resolve) => stepSignal.addEventListener('abort', resolve))
+        })
+      },
+    })
+    await workflow.work({ lockMs: 300, safetyTimeout: 30 })
+
+    try {
+      const job = await workflow.run(undefined)
+      await started.wait()
+
+      await redis.set(`${prefix}:${wfId}:j:${job.id}:lock`, 'foreign-token')
+
+      await vi.waitFor(() => {
+        expect(signals.map((signal) => signal.aborted)).toEqual([true, true])
+      })
+    } finally {
+      await ns.close()
+    }
+  })
 })
 
 test('a definition enqueues jobs that its handled workflow runs', async () => {

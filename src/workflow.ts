@@ -527,6 +527,7 @@ export class Workflow<
                   memo: new Map(job.steps),
                 }),
                 span,
+                signal: ctx.signal,
                 rateLimit: ((ms: number, name?: string): never => {
                   if (!Number.isFinite(ms) || ms <= 0)
                     throw new Error('rateLimit ms must be a positive finite number')
@@ -621,6 +622,11 @@ export interface WorkflowRunContext<Input, Progress = never, Names extends strin
   input: IsUnknown<Input> extends true ? undefined : Input
   step: WorkflowStep<Progress>
   span: Span
+  /**
+   * Aborts when the job's claim is lost: its lock expired or another worker re-reserved it.
+   * Pass it to long-running work so it stops instead of running alongside the retry.
+   */
+  signal: AbortSignal
   /**
    * Throws and pauses the limiter for every workflow using it, without using an attempt.
    * A pause never shortens an earlier pause. The name is required with several limiters;
