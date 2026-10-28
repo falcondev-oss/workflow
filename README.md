@@ -153,6 +153,7 @@ step list. If a workflow knows a total, include it in its progress payload as ab
 - `step.do(name, fn)` — run once, memoize the result. Replayed from Redis on a retry.
 - `step.wait(name, ms)` — durable sleep; remaining time is computed from the persisted start.
 - `step.waitUntil(name, date)` — the same, to an absolute time.
+- `signal` — on the run context and on `step.do`'s context. Aborts when the job's claim is lost; pass it to long-running work so it stops instead of running alongside the retry.
 
 Steps nest: the callback receives its own `step` scoped under the parent's name.
 

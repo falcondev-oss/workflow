@@ -49,7 +49,15 @@ export class WorkflowStep<Progress = never> {
     return `${this.stepNamePrefix}${name}`
   }
 
-  async do<R>(stepName: string, run: (ctx: { step: WorkflowStep<Progress>; span: Span }) => R) {
+  async do<R>(
+    stepName: string,
+    run: (ctx: {
+      step: WorkflowStep<Progress>
+      span: Span
+      /** Aborts when the job's claim is lost, see `WorkflowRunContext.signal`. */
+      signal: AbortSignal
+    }) => R,
+  ) {
     const name = this.addNamePrefix(stepName)
 
     // Memoize on completion only: a stored `result` field means the step finished on a prior
@@ -87,6 +95,7 @@ export class WorkflowStep<Progress = never> {
             memo: this.memo,
           }),
           span,
+          signal: this.signal,
         })
 
         await this.updateStepData(name, { type: 'do', result })
