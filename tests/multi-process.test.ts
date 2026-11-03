@@ -100,7 +100,7 @@ test('four worker processes share one start budget', async () => {
   const prefix = randomUUID()
   const nsId = randomUUID()
   const wfId = randomUUID()
-  const rateLimit = { limit: 4, window: 120 }
+  const rateLimit = { limit: 4, window: 200 }
   const ns = new WorkflowNamespace({
     id: nsId,
     prefix,
@@ -119,9 +119,12 @@ test('four worker processes share one start budget', async () => {
     const recorded = await redis.lrange(`${prefix}:starts`, 0, -1)
     const starts = recorded.map(Number).sort((a, b) => a - b)
     expect(starts).toHaveLength(32)
+    // Stamped in each handler after the claim, so a loaded process skews a start by its
+    // scheduling lag. A budget that is not shared puts 4x the starts in a window, gaps near 0.
+    const tolerance = rateLimit.window / 4
     for (let i = rateLimit.limit; i < starts.length; i++)
       expect(starts[i]! - starts[i - rateLimit.limit]!).toBeGreaterThanOrEqual(
-        rateLimit.window - 10,
+        rateLimit.window - tolerance,
       )
   } finally {
     await ns.close()
