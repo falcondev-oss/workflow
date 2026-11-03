@@ -4,6 +4,7 @@ import type Redis from 'ioredis'
 import type { IsUnion, IsUnknown } from 'type-fest'
 import type {
   AddOptions,
+  MetricsOptions,
   QueueOptions,
   ReservedJob,
   Worker,
@@ -18,6 +19,7 @@ import { asyncExitHook } from 'exit-hook'
 import { WorkflowJob } from './job'
 import { Namespace, NonRecoverableError } from './queue'
 import { RateLimitError } from './queue/errors'
+import { createWorkerMetrics } from './queue/metrics'
 import { deserialize, serialize } from './serializer'
 import { defaultRedisConnection } from './settings'
 import { WorkflowStep } from './step'
@@ -36,10 +38,7 @@ export type WorkflowQueueOptions<Names extends readonly string[] = readonly stri
 
 /** Per-workflow worker overrides plus the lib's OTel metrics binding. */
 export type WorkflowWorkerOptions = WorkerOptions & {
-  metrics?: {
-    meter: Meter
-    prefix: string
-  }
+  metrics?: MetricsOptions
 }
 
 /** Per-run enqueue overrides (`runAt`/`runIn` are set by `runAt()`/`runIn()`). */
@@ -430,7 +429,7 @@ export class WorkflowDefinition<
     }))
   }
 
-  /** Point-in-time queue-depth gauges (`active`/`waiting`/`delayed`) for this workflow. */
+  /** Point-in-time queue-depth gauges (`active`/`waiting`/`delayed`/`failed`) for this workflow. */
   async getMetrics() {
     const queue = await this.getQueue()
     return queue.getMetrics()
@@ -469,22 +468,11 @@ export class Workflow<
       (cap) => cap !== undefined,
     )
     if (caps.length > 0) workerOpts.concurrency = Math.min(...caps)
-    const queueWait = metrics?.meter.createHistogram(`${metrics.prefix}_workflow_queue_wait`, {
-      description: 'Time a job waited in the queue before a worker claimed it',
-      unit: 'ms',
-      // The SDK default stops at 10s, too short for a backlog.
-      advice: {
-        explicitBucketBoundaries: [
-          5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 30_000, 60_000, 300_000, 900_000,
-          3_600_000,
-        ],
-      },
-    })
+    const workerMetrics = metrics && createWorkerMetrics(metrics, this.id)
 
     const worker = queue.worker(
       async (job: ReservedJob, ctx) => {
         this.logger?.info?.(`[${this.id}] Processing job ${job.id}`)
-        queueWait?.record(job.queueWaitMs, { workflow_id: this.id })
 
         const deserializedData = deserialize<WorkflowJobPayloadInternal>(job.data)
         const parsedData =
@@ -525,6 +513,7 @@ export class Workflow<
                   signal: ctx.signal,
                   stepPromises,
                   memo: new Map(job.steps),
+                  recordStepDuration: workerMetrics?.recordStep,
                 }),
                 span,
                 signal: ctx.signal,
@@ -568,6 +557,7 @@ export class Workflow<
         onError:
           workerOpts.onError ?? ((error) => this.logger?.error?.(`[${this.id}] Job error:`, error)),
       },
+      workerMetrics,
     )
 
     this.logger?.info?.(`[${this.id}] Worker started`)
@@ -595,19 +585,23 @@ export class Workflow<
     const delayedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_delayed_jobs`, {
       description: 'Number of delayed workflow jobs',
     })
+    const failedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_failed_jobs`, {
+      description: 'Number of retained dead-lettered workflow jobs',
+    })
 
     meter.addBatchObservableCallback(
       async (observableResult) => {
         try {
-          const { active, waiting, delayed } = await queue.getMetrics()
+          const { active, waiting, delayed, failed } = await queue.getMetrics()
           observableResult.observe(activeJobsGauge, active, attributes)
           observableResult.observe(waitingJobsGauge, waiting, attributes)
           observableResult.observe(delayedJobsGauge, delayed, attributes)
+          observableResult.observe(failedJobsGauge, failed, attributes)
         } catch (err) {
           this.logger?.error?.('Error collecting workflow metrics:', err)
         }
       },
-      [activeJobsGauge, waitingJobsGauge, delayedJobsGauge],
+      [activeJobsGauge, waitingJobsGauge, delayedJobsGauge, failedJobsGauge],
     )
   }
 }

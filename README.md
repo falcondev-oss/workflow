@@ -294,10 +294,9 @@ re-read the same payload.
 
 ### Metrics
 
-`workflow.getMetrics()` returns point-in-time `{ active, waiting, delayed }` depths. Pass an
-OpenTelemetry meter to export them as gauges, plus a `<prefix>_workflow_queue_wait` histogram
-(ms each job waited before a worker claimed it, also set as `workflow.queue_wait_ms` on the job
-span):
+`workflow.getMetrics()` returns point-in-time `{ active, waiting, delayed, failed }` depths
+(`failed` counts retained dead letters, bounded by `keepFailed`). Pass an OpenTelemetry meter to
+export them as `<prefix>_workflow_{active,waiting,delayed,failed}_jobs` gauges, plus:
 
 ```ts
 const namespace = new WorkflowNamespace({
@@ -305,6 +304,25 @@ const namespace = new WorkflowNamespace({
   workerOptions: { metrics: { meter, prefix: 'my_app' } },
 })
 ```
+
+| Metric                       | Type              | Attributes                  | Measures                                                                                                   |
+| ---------------------------- | ----------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `_workflow_queue_wait`       | histogram, ms     |                             | Wait before a worker claimed the job, also `workflow.queue_wait_ms` on the job span                        |
+| `_workflow_duration_ms`      | histogram         | `outcome`                   | How long a handler attempt ran                                                                             |
+| `_workflow_jobs`             | counter           | `outcome`                   | Handler attempts                                                                                           |
+| `_workflow_attempts`         | histogram         | `outcome=completed\|failed` | Attempts a job used before it finished                                                                     |
+| `_workflow_end_to_end_ms`    | histogram         | `outcome=completed\|failed` | Enqueue to finish, including retry backoff and any `runAt` delay                                           |
+| `_workflow_stalled`          | counter           | `result=requeued\|failed`   | Jobs recovered from a lost lock, and those that hit `maxStalledCount`                                      |
+| `_schedule_fire_delay_ms`    | histogram         | `schedule_id`               | How late a cron occurrence was enqueued after its due time                                                 |
+| `_workflow_step_duration_ms` | histogram, opt-in | `step`                      | How long each executed `step.do` ran. Enable with `stepDuration: true`; step names can be high-cardinality |
+
+Every metric carries `workflow_id`. `outcome` is `completed` (the handler returned), `retried`
+(it threw and the job was requeued), `failed` (terminal: `NonRecoverableError`, attempts
+exhausted, invalid input) or `rate_limited` (it called `rateLimit()`). An attempt is recorded once
+Redis commits its outcome, so an attempt that lost its claim is counted only under
+`_workflow_stalled`, and a stalled job that is dead-lettered does not appear under `outcome=failed`.
+With several worker processes, every one observes the same depth gauges: aggregate them with
+`max by (workflow_id)`, and the counters and histograms with `sum`.
 
 `namespace.getRateLimiterMetrics()` returns point-in-time `{ starts, pausedMs }` for every declared
 limiter. The meter exports these as `<prefix>_rate_limiter_starts` and

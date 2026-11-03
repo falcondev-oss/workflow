@@ -1,4 +1,5 @@
 import type Redis from 'ioredis'
+import type { AttemptOutcome, WorkerMetrics } from './metrics'
 import type { Queue } from './queue'
 import type { QueueRedis } from './scripts'
 import type { JobContext, ReservedJob, WorkerOptions } from './types'
@@ -27,6 +28,8 @@ function flatToMap(flat: string[]): Map<string, string> {
 interface Claim {
   job: ReservedJob
   token: string
+  /** Ms since enqueue at claim time (Redis clock), the base of the end-to-end duration. */
+  ageMs: number
 }
 
 interface ReserveResult {
@@ -83,6 +86,7 @@ export class Worker {
     private readonly queue: Queue,
     readonly handler: WorkerHandler,
     opts?: WorkerOptions,
+    private readonly metrics?: WorkerMetrics,
   ) {
     this.concurrency = opts?.concurrency ?? 1
     this.lockMs = opts?.lockMs ?? 30_000
@@ -175,7 +179,7 @@ export class Worker {
         const from = new Date(Math.max(Date.now(), Number(expectedScore)))
         const next = nextRunMs(pattern, tz ?? localTimeZone(), from)
         if (next === null) continue // no future occurrence
-        await this.redis.fireSchedule(
+        const [fired] = await this.redis.fireSchedule(
           this.queue.prefix,
           this.queue.id,
           this.queue.ns.id,
@@ -186,6 +190,8 @@ export class Worker {
           1,
           this.queue.groupConcurrency,
         )
+        if (fired === 'fired')
+          this.metrics?.fired(scheduleId, Math.max(0, Date.now() - Number(expectedScore)))
       }
     } catch (err) {
       this.onError(err)
@@ -203,7 +209,7 @@ export class Worker {
     if (now - this.lastStalledScan < this.stalledInterval) return
     this.lastStalledScan = now
     try {
-      await this.redis.recoverStalled(
+      const [requeued, failed] = await this.redis.recoverStalled(
         this.queue.prefix,
         this.queue.id,
         this.queue.groupConcurrency,
@@ -213,6 +219,7 @@ export class Worker {
         this.queue.resultTtl,
         this.keepFailed,
       )
+      this.metrics?.stalled(requeued, failed)
     } catch (err) {
       // The scan never happened, so it must not count against the local throttle.
       this.lastStalledScan = 0
@@ -236,18 +243,21 @@ export class Worker {
       ...this.queue.rateLimitArgs,
     )
     return {
-      claims: jobs.map(([id, groupId, data, attempts, priority, token, steps, queueWaitMs]) => ({
-        job: Object.freeze({
-          id,
-          groupId,
-          data,
-          attemptsMade: Number(attempts),
-          priority: Number(priority),
-          steps: flatToMap(steps),
-          queueWaitMs,
-        }) as ReservedJob,
-        token,
-      })),
+      claims: jobs.map(
+        ([id, groupId, data, attempts, priority, token, steps, queueWaitMs, ageMs]) => ({
+          job: Object.freeze({
+            id,
+            groupId,
+            data,
+            attemptsMade: Number(attempts),
+            priority: Number(priority),
+            steps: flatToMap(steps),
+            queueWaitMs,
+          }) as ReservedJob,
+          token,
+          ageMs,
+        }),
+      ),
       msToNext: Number(msToNext),
       msToSchedule: Number(msToSchedule),
       dueSchedules,
@@ -288,6 +298,17 @@ export class Worker {
   private async process(claim: Claim): Promise<void> {
     const controller = new AbortController()
     const stopHeartbeat = this.startHeartbeat(claim, controller)
+    this.metrics?.claimed(claim.job.queueWaitMs)
+    const start = performance.now()
+    let durationMs = 0
+    // Recorded only once Redis commits the outcome: a stale-token finalize is another claim's.
+    const settled = (outcome: AttemptOutcome) =>
+      this.metrics?.attempt(
+        outcome,
+        durationMs,
+        claim.job.attemptsMade + 1,
+        claim.ageMs + performance.now() - start,
+      )
     try {
       const started = this.queue
         .publish(claim.job.id, {
@@ -295,14 +316,19 @@ export class Worker {
           attempt: claim.job.attemptsMade + 1,
         })
         .catch(this.onError)
-      const result = await this.handler(claim.job, { signal: controller.signal })
+      let result: string
+      try {
+        result = await this.handler(claim.job, { signal: controller.signal })
+      } finally {
+        durationMs = performance.now() - start
+      }
       await started
       // Abort-on-lost-claim: the heartbeat aborted because the claim was recovered
       // and re-reserved elsewhere — drop the job without committing. The token-guard on
       // complete/fail makes those no-ops anyway, but skipping avoids the wasted round-trip.
       if (controller.signal.aborted) return
       const record = JSON.stringify({ state: 'completed', value: result })
-      await this.redis.complete(
+      const completed = await this.redis.complete(
         this.queue.prefix,
         this.queue.id,
         claim.job.id,
@@ -311,10 +337,11 @@ export class Worker {
         this.queue.resultTtl,
         this.queue.groupConcurrency,
       )
+      if (completed === 1) settled('completed')
     } catch (err) {
       if (err instanceof RateLimitError) {
         try {
-          await this.redis.rateLimit(
+          const requeued = await this.redis.rateLimit(
             this.queue.prefix,
             this.queue.id,
             this.queue.ns.id,
@@ -324,10 +351,14 @@ export class Worker {
             err.limiter,
             this.queue.groupConcurrency,
           )
+          if (requeued === 1) settled('rate_limited')
         } catch (err_) {
           this.onError(err_)
         }
-      } else if (!controller.signal.aborted) await this.fail(claim, err)
+      } else if (!controller.signal.aborted) {
+        const failed = await this.fail(claim, err)
+        if (failed !== 0) settled(failed === 2 ? 'retried' : 'failed')
+      }
     } finally {
       stopHeartbeat()
     }
@@ -378,14 +409,15 @@ export class Worker {
    * dead-letters. `attemptsMade` counts prior attempts, so the attempt that just failed is
    * `attemptsMade + 1`. Backoff `runAt` is computed here (JS) and stored verbatim as the score.
    */
-  private async fail(claim: Claim, err: unknown): Promise<void> {
+  /** Returns the `fail` script's result: 0 stale token, 1 dead-lettered, 2 requeued. */
+  private async fail(claim: Claim, err: unknown): Promise<number> {
     const error = err instanceof Error ? err : new Error(String(err))
     // Best-effort local failure notification — fires on every handler failure, retryable or
     // terminal.
     this.onFailed(claim.job, error)
     const runAt = Date.now() + this.backoff(claim.job.attemptsMade + 1)
     try {
-      await this.redis.fail(
+      return await this.redis.fail(
         this.queue.prefix,
         this.queue.id,
         claim.job.id,
@@ -400,6 +432,7 @@ export class Worker {
       )
     } catch (failErr) {
       this.onError(failErr)
+      return 0
     }
   }
 
