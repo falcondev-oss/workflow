@@ -231,9 +231,9 @@ return 1
  * so a batch needs a single JS UUID and the tokens stay globally unique.
  *
  * Returns `{ jobs, msToNext, msToSchedule, dueSchedules, maxed, msToLimit }`:
- * - `jobs`: array of `{ jobId, groupId, data, attempts, priority, token, steps, queueWait }`, where
+ * - `jobs`: array of `{ jobId, groupId, data, attempts, priority, token, steps, queueWait, age }`, where
  *   `steps` is the job's memoized step hash flattened to `[name, value, …]` and `queueWait` is the
- *   ms since the job became runnable, on the Redis clock
+ *   ms since the job became runnable, and `age` the ms since it was enqueued, both on the Redis clock
  * - `msToNext`: ms until the next due delayed job (`-1` none, `0` due work left behind by the
  *   promote cap) — the worker's `BRPOP wake` timeout, so the block *is* the delayed-job timer
  * - `msToSchedule`: same, for the nearest cron occurrence
@@ -380,7 +380,8 @@ while #jobs < want do
     local steps = redis.call("HGETALL", jobKey .. ":steps")
     -- Clamped: a retry's or absolute runAt comes from a client clock, which may run ahead of Redis.
     local queueWait = math.max(0, now - tonumber(vals[4] or vals[5]))
-    jobs[#jobs + 1] = { jobId, gid, vals[1], vals[3], vals[2], token, steps, queueWait }
+    local age = math.max(0, now - tonumber(vals[5]))
+    jobs[#jobs + 1] = { jobId, gid, vals[1], vals[3], vals[2], token, steps, queueWait, age }
   end
 end
 
@@ -537,7 +538,7 @@ return 1
 /**
  * The single throttled stalled-recovery scan, never folded into reserve. Gated by
  * `SET wf:stalled-check <now> NX PX interval` so only one worker per interval scans; returns
- * 0 immediately when the gate is held. Detection is a pure deadline-compare over the
+ * `{ 0, {} }` immediately when the gate is held. Detection is a pure deadline-compare over the
  * deadline-scored active ZSET (`ZRANGEBYSCORE wf:active 0 now`, batch-capped) — no `stalled`
  * SET, no two-pass. Per candidate: a `state == "active"` fence (skips a job mid-`completing`,
  * closing the complete-vs-recover race) → the shared `releaseActive` (frees every slot and
@@ -545,6 +546,8 @@ return 1
  * path as `moveToFailed` (`finalizeFailed`, bypassing backoff/retry); otherwise requeue at the
  * stored packed score via the shared `addWaiting`. `releaseActive` already kicks both wake lists.
  *
+ * Returns `{ requeued, deadLettered }`: the requeued count, and `[attempts, ageMs]` per job
+ * dead-lettered, where `attempts` includes the stalled one and `ageMs` is the time since enqueue.
  * ARGV: prefix, wfId, groupCap, maxStalledCount, interval, batchSize, resultTtl, keepFailed
  */
 const RECOVER_STALLED = `
@@ -565,11 +568,12 @@ local wf = prefix .. ":" .. wfId
 ${NOW}
 
 if redis.call("SET", wf .. ":stalled-check", now, "NX", "PX", interval) == false then
-  return 0
+  return { 0, {} }
 end
 
 local candidates = redis.call("ZRANGEBYSCORE", wf .. ":active", 0, now, "LIMIT", 0, batchSize)
-local recovered = 0
+local requeued = 0
+local deadLettered = {}
 for i = 1, #candidates do
   local jobId = candidates[i]
   local jobKey = wf .. ":j:" .. jobId
@@ -577,16 +581,18 @@ for i = 1, #candidates do
     releaseActive(prefix, wfId, jobId, groupCap)
     local stalledCount = redis.call("HINCRBY", jobKey, "stalledCount", 1)
     if stalledCount > maxStalledCount then
+      local vals = redis.call("HMGET", jobKey, "attempts", "createdAt")
+      deadLettered[#deadLettered + 1] = { tonumber(vals[1]) + 1, math.max(0, now - tonumber(vals[2])) }
       finalizeFailed(prefix, wfId, jobId, "stalled more than allowable limit", "", resultTtl, groupCap, keepFailed)
     else
       local groupId = redis.call("HGET", jobKey, "groupId")
       local score = tonumber(redis.call("HGET", jobKey, "score"))
       addWaiting(wf, jobKey, jobId, groupId, 0, groupCap, now, score)
+      requeued = requeued + 1
     end
-    recovered = recovered + 1
   end
 end
-return recovered
+return { requeued, deadLettered }
 `
 
 /**
@@ -764,6 +770,7 @@ export interface QueueCommands {
         token: string,
         steps: string[],
         queueWaitMs: number,
+        ageMs: number,
       ][],
       msToNext: number,
       msToSchedule: number,
@@ -777,7 +784,9 @@ export interface QueueCommands {
   fail: (...args: (string | number)[]) => Promise<number>
   moveToFailed: (...args: (string | number)[]) => Promise<number>
   heartbeat: (...args: (string | number)[]) => Promise<number>
-  recoverStalled: (...args: (string | number)[]) => Promise<number>
+  recoverStalled: (
+    ...args: (string | number)[]
+  ) => Promise<[requeued: number, deadLettered: [attempts: number, ageMs: number][]]>
   fireSchedule: (...args: (string | number)[]) => Promise<(string | number)[]>
 }
 

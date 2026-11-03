@@ -24,6 +24,7 @@ export class WorkflowStep<Progress = never> {
   private stepPromises
   private logger
   private memo
+  private recordStepDuration
 
   constructor(opts: {
     queue: WorkflowQueueInternal
@@ -34,6 +35,7 @@ export class WorkflowStep<Progress = never> {
     stepPromises: Set<Promise<any>>
     /** The job's persisted step data, shipped with the claim — the memo's initial contents. */
     memo: Map<string, string>
+    recordStepDuration?: (step: string, durationMs: number) => void
   }) {
     this.queue = opts.queue
     this.workflowJobId = opts.workflowJobId
@@ -43,6 +45,7 @@ export class WorkflowStep<Progress = never> {
     this.stepPromises = opts.stepPromises
     this.logger = opts.queue.logger
     this.memo = opts.memo
+    this.recordStepDuration = opts.recordStepDuration
   }
 
   private addNamePrefix(name: string) {
@@ -84,19 +87,26 @@ export class WorkflowStep<Progress = never> {
         },
       },
       async (span) => {
-        const result = await run({
-          step: new WorkflowStep<Progress>({
-            queue: this.queue,
-            workflowId: this.workflowId,
-            workflowJobId: this.workflowJobId,
-            stepNamePrefix: name,
+        const start = performance.now()
+        let result: Awaited<R>
+        try {
+          result = await run({
+            step: new WorkflowStep<Progress>({
+              queue: this.queue,
+              workflowId: this.workflowId,
+              workflowJobId: this.workflowJobId,
+              stepNamePrefix: name,
+              signal: this.signal,
+              stepPromises: this.stepPromises,
+              memo: this.memo,
+              recordStepDuration: this.recordStepDuration,
+            }),
+            span,
             signal: this.signal,
-            stepPromises: this.stepPromises,
-            memo: this.memo,
-          }),
-          span,
-          signal: this.signal,
-        })
+          })
+        } finally {
+          this.recordStepDuration?.(name, performance.now() - start)
+        }
 
         await this.updateStepData(name, { type: 'do', result })
 

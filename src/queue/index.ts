@@ -6,6 +6,7 @@ export {
   ResultExpiredError,
   TimeoutError,
 } from './errors'
+export type { MetricsOptions } from './metrics'
 export { Namespace } from './namespace'
 export { Queue } from './queue'
 export type {

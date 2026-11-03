@@ -1120,7 +1120,7 @@ test('a job in state=completing is fenced from recovery', async () => {
     await redis.zadd(`${prefix}:${wfId}:active`, Date.now() - 60_000, jobId)
 
     const recovered = await ns.redis.recoverStalled(prefix, wfId, 1, 1, 1000, 500, 300, 100)
-    expect(recovered).toBe(0)
+    expect(recovered).toEqual([0, []])
     expect(await redis.hget(jobKey, 'stalledCount')).toBe('0') // budget untouched
     expect(await redis.hget(jobKey, 'state')).toBe('completing') // state unchanged
     expect(await redis.zscore(`${prefix}:${wfId}:g:g:jobs`, jobId)).toBeNull() // not requeued
@@ -1141,11 +1141,21 @@ test('a job past maxStalledCount is dead-lettered instead of requeued', async ()
   try {
     // Already at the budget (maxStalledCount 1); the next stall (→ 2) exceeds it.
     // prettier-ignore
-    await redis.hset(jobKey, 'state', 'active', 'groupId', 'g', 'nsId', nsId, 'stalledCount', '1', 'score', '123', 'maxAttempts', '1')
+    await redis.hset(jobKey, 'state', 'active', 'groupId', 'g', 'nsId', nsId, 'stalledCount', '1', 'score', '123', 'maxAttempts', '1', 'attempts', '0', 'createdAt', Date.now() - 60_000)
     await redis.zadd(wfActive, Date.now() - 60_000, jobId)
 
-    const recovered = await ns.redis.recoverStalled(prefix, wfId, 1, 1, 1000, 500, 300, 100)
-    expect(recovered).toBe(1)
+    const [requeued, [[attempts, ageMs] = []]] = await ns.redis.recoverStalled(
+      prefix,
+      wfId,
+      1,
+      1,
+      1000,
+      500,
+      300,
+      100,
+    )
+    expect([requeued, attempts]).toEqual([0, 1])
+    expect(ageMs).toBeGreaterThanOrEqual(60_000)
 
     // Routed through the shared moveToFailed/finalizeFailed dead-letter path (bypasses retry).
     expect(await redis.zscore(`${prefix}:${wfId}:failed`, jobId)).not.toBeNull()
@@ -1523,7 +1533,7 @@ test('getMetrics reports active/waiting/delayed; a drained group leaves the grou
     await queue.add('d2', { runAt: Date.now() + 3_600_000 })
 
     await vi.waitFor(async () => {
-      expect(await queue.getMetrics()).toEqual({ active: 1, waiting: 3, delayed: 2 })
+      expect(await queue.getMetrics()).toEqual({ active: 1, waiting: 3, delayed: 2, failed: 0 })
     })
 
     // The drained active group is gone from the metrics set; only the two waiting groups remain

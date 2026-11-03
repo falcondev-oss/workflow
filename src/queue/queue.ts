@@ -1,3 +1,4 @@
+import type { WorkerMetrics } from './metrics'
 import type { Namespace } from './namespace'
 import type { QueueRedis } from './scripts'
 import type {
@@ -91,8 +92,8 @@ export class Queue {
     return { id, groupId }
   }
 
-  worker(handler: Worker['handler'], opts?: WorkerOptions): Worker {
-    const worker = new Worker(this, handler, opts)
+  worker(handler: Worker['handler'], opts?: WorkerOptions, metrics?: WorkerMetrics): Worker {
+    const worker = new Worker(this, handler, opts, metrics)
     this.workers.add(worker)
     return worker
   }
@@ -339,9 +340,10 @@ export class Queue {
    */
   async getMetrics(): Promise<QueueMetrics> {
     const wf = `${this.prefix}:${this.id}`
-    const [active, delayed, groups] = await Promise.all([
+    const [active, delayed, failed, groups] = await Promise.all([
       this.redis.zcard(`${wf}:active`),
       this.redis.zcard(`${wf}:delayed`),
+      this.redis.zcard(`${wf}:failed`),
       this.redis.smembers(`${wf}:groups`),
     ])
     let waiting = 0
@@ -351,7 +353,7 @@ export class Queue {
       const results = await pipeline.exec()
       for (const [, count] of results ?? []) waiting += Number(count ?? 0)
     }
-    return { active, waiting, delayed }
+    return { active, waiting, delayed, failed }
   }
 
   /** Point-in-time snapshot of a group's unfinished jobs: active, waiting in claim order, delayed. */

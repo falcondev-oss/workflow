@@ -17,7 +17,13 @@ import { type } from 'arktype'
 import { stringify } from 'superjson'
 import { beforeAll, describe, expect, expectTypeOf, onTestFinished, test, vi } from 'vitest'
 import { z } from 'zod'
-import { createRedis, ResultExpiredError, TimeoutError, WorkflowNamespace } from '../src'
+import {
+  createRedis,
+  NonRecoverableError,
+  ResultExpiredError,
+  TimeoutError,
+  WorkflowNamespace,
+} from '../src'
 
 let sharedRedis: Awaited<ReturnType<typeof createRedis>>
 
@@ -1192,7 +1198,7 @@ describe('rate limits', () => {
     const low = await wf.runAndWatch('low')
     const high = await wf.runAndWatch('high', { priority: 2, groupId: 'group' })
     const next = await wf.runAndWatch('next', { priority: 2, groupId: 'group' })
-    expect(await wf.getMetrics()).toEqual({ active: 0, waiting: 3, delayed: 0 })
+    expect(await wf.getMetrics()).toEqual({ active: 0, waiting: 3, delayed: 0, failed: 0 })
     const events = await Promise.all([low, high, next].map(async (job) => collect(job.events)))
     expect(order).toEqual(['first', 'high', 'next', 'low'])
     for (const stream of events)
@@ -1230,7 +1236,7 @@ describe('rate limits', () => {
     await expect(replacement.wait(200)).resolves.toBe('replaced')
     const optedOut = await unlimited.run(undefined)
     await expect(optedOut.wait(200)).resolves.toBe('unlimited')
-    expect(await inherited.getMetrics()).toEqual({ active: 0, waiting: 1, delayed: 0 })
+    expect(await inherited.getMetrics()).toEqual({ active: 0, waiting: 1, delayed: 0, failed: 0 })
     expect(await ns.getRateLimiterMetrics()).toEqual({
       api: { starts: 1, pausedMs: 0 },
       other: { starts: 1, pausedMs: 0 },
@@ -1324,11 +1330,11 @@ describe('rate limits', () => {
       const { api } = await ns.getRateLimiterMetrics()
       expect(api.pausedMs).toBeGreaterThan(0)
     })
-    expect(await wf.getMetrics()).toEqual({ active: 0, waiting: 2, delayed: 0 })
+    expect(await wf.getMetrics()).toEqual({ active: 0, waiting: 2, delayed: 0, failed: 0 })
     finish.open()
     await expect(activeJob.wait(100)).resolves.toBe('finished')
     const blocked = await sibling.run(undefined)
-    expect(await sibling.getMetrics()).toEqual({ active: 0, waiting: 1, delayed: 0 })
+    expect(await sibling.getMetrics()).toEqual({ active: 0, waiting: 1, delayed: 0, failed: 0 })
     await Promise.all([first.job.wait(2000), second.wait(2000), blocked.wait(2000)])
     expect(order).toEqual(['first', 'first', 'second'])
     expect(completed).toHaveBeenCalledTimes(2)
@@ -1456,7 +1462,7 @@ describe('rate limits', () => {
       const { api } = await ns.getRateLimiterMetrics()
       expect(api.pausedMs).toBeGreaterThan(0)
     })
-    expect(await wf.getMetrics()).toEqual({ active: 1, waiting: 0, delayed: 0 })
+    expect(await wf.getMetrics()).toEqual({ active: 1, waiting: 0, delayed: 0, failed: 0 })
     expect(onFailed).not.toHaveBeenCalled()
   })
 
@@ -1739,5 +1745,131 @@ test('observes each limiter once per meter and traces pauses without errors', as
   expect(await ns.getRateLimiterMetrics()).toEqual({
     api: { starts: 0, pausedMs: 0 },
     unused: { starts: 0, pausedMs: 0 },
+  })
+})
+
+test('records attempt outcomes, attempts, stalls, steps and cron fire delay', async () => {
+  const reader = new PeriodicExportingMetricReader({
+    exporter: new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE),
+    exportIntervalMillis: 60_000,
+  })
+  const provider = new MeterProvider({ readers: [reader] })
+  const prefix = randomUUID()
+  const redis = await connect()
+  const ns = new WorkflowNamespace({
+    id: randomUUID(),
+    redis,
+    prefix,
+    autoClose: false,
+    workerOptions: {
+      metrics: { meter: provider.getMeter('worker'), prefix: 'test', stepDuration: true },
+    },
+  })
+  onTestFinished(async () => {
+    await provider.shutdown()
+    await ns.close()
+  })
+  const stalled = makeGate()
+  const seen = new Set<string>()
+  const wf = ns.createWorkflow({
+    id: randomUUID(),
+    schema: passthrough<'ok' | 'retry' | 'fatal' | 'limit' | 'stall'>(),
+    workerOptions: { maxAttempts: 2 },
+    run: async ({ input, step, rateLimit }) => {
+      const first = !seen.has(input)
+      seen.add(input)
+      if (input === 'ok') await step.do('a', () => 1)
+      if (first && input === 'retry') throw new Error('retry me')
+      if (input === 'fatal') throw new NonRecoverableError('fatal')
+      if (first && input === 'limit') rateLimit(20)
+      if (first && input === 'stall') {
+        stalled.open()
+        await step.wait('until-recovery', 10_000)
+      }
+    },
+  })
+  await wf.work({
+    backoff: () => 0,
+    concurrency: 5,
+    lockMs: 90,
+    stalledInterval: 25,
+    safetyTimeout: 0.05,
+  })
+  const jobs = await Promise.all(
+    (['ok', 'retry', 'fatal', 'limit', 'stall'] as const).map(async (input) => wf.run(input)),
+  )
+  await stalled.wait()
+  await redis.del(`${prefix}:${wf.id}:j:${jobs[4]!.id}:lock`)
+  await Promise.allSettled(jobs.map(async (job) => job.wait(3000)))
+
+  const doomedStarted = makeGate()
+  const doomed = ns.createWorkflow({
+    id: randomUUID(),
+    run: async ({ step }) => {
+      doomedStarted.open()
+      await step.wait('forever', 10_000)
+    },
+  })
+  await doomed.work({ maxStalledCount: 0, lockMs: 90, stalledInterval: 25, safetyTimeout: 0.05 })
+  const doomedJob = await doomed.run(undefined)
+  await doomedStarted.wait()
+  await redis.del(`${prefix}:${doomed.id}:j:${doomedJob.id}:lock`)
+  await expect(doomedJob.wait(3000)).rejects.toThrow('stalled')
+
+  const cron = ns.createWorkflow({ id: randomUUID(), run: async () => {} })
+  await cron.work()
+  await cron.upsertSchedule('every-second', { pattern: '* * * * * *', input: undefined })
+  await vi.waitFor(
+    async () => {
+      const [schedule] = await cron.getSchedules()
+      expect(schedule?.lastJobId).toBeTruthy()
+    },
+    { timeout: 2000 },
+  )
+
+  const { resourceMetrics } = await reader.collect()
+  const metrics = resourceMetrics.scopeMetrics.flatMap((scope) => scope.metrics)
+  const metric = (name: string) => metrics.find((m) => m.descriptor.name === `test_${name}`)!
+  const points = (name: string, workflowId = wf.id) =>
+    metric(name)
+      .dataPoints.filter((point) => point.attributes.workflow_id === workflowId)
+      .map(({ attributes: { workflow_id, ...attributes }, value }) => ({
+        ...attributes,
+        value: typeof value === 'number' ? value : (value as { count: number; sum: number }).count,
+      }))
+  const byOutcome = [
+    { outcome: 'completed', value: 4 },
+    { outcome: 'retried', value: 1 },
+    { outcome: 'failed', value: 1 },
+    { outcome: 'rate_limited', value: 1 },
+  ]
+  expect(points('workflow_jobs')).toEqual(expect.arrayContaining(byOutcome))
+  expect(points('workflow_jobs')).toHaveLength(4)
+  // Every claim: retry, limit and stall are claimed twice.
+  expect(points('workflow_queue_wait_ms')).toEqual([{ value: 8 }])
+  expect(points('workflow_duration_ms')).toEqual(expect.arrayContaining(byOutcome))
+  const terminal = [
+    { outcome: 'completed', value: 4 },
+    { outcome: 'failed', value: 1 },
+  ]
+  expect(points('workflow_attempts')).toEqual(expect.arrayContaining(terminal))
+  expect(points('workflow_end_to_end_ms')).toEqual(expect.arrayContaining(terminal))
+  const completedAttempts = metric('workflow_attempts').dataPoints.find(
+    (point) => point.attributes.outcome === 'completed' && point.attributes.workflow_id === wf.id,
+  )!.value as { sum: number }
+  // ok, limit and stall finish on their first attempt, retry on its second.
+  expect(completedAttempts.sum).toBe(5)
+  expect(points('workflow_stalled')).toEqual([{ result: 'requeued', value: 1 }])
+  expect(points('workflow_step_duration_ms')).toEqual([{ step: 'a', value: 1 }])
+  expect(points('workflow_failed_jobs')).toEqual([{ value: 1 }])
+  // A stall dead-letter is no handler attempt, but it ends the job.
+  const deadLettered = [{ outcome: 'failed', value: 1 }]
+  expect(points('workflow_stalled', doomed.id)).toEqual([{ result: 'failed', value: 1 }])
+  expect(points('workflow_attempts', doomed.id)).toEqual(deadLettered)
+  expect(points('workflow_end_to_end_ms', doomed.id)).toEqual(deadLettered)
+  expect(points('workflow_jobs', doomed.id)).toEqual([])
+  expect(metric('schedule_fire_delay_ms').dataPoints[0]!.attributes).toEqual({
+    workflow_id: cron.id,
+    schedule_id: 'every-second',
   })
 })

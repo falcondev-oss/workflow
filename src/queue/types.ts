@@ -132,6 +132,8 @@ export interface QueueMetrics {
   waiting: number
   /** Jobs parked for a future `runAt` (`ZCARD wf:delayed`). */
   delayed: number
+  /** Dead-lettered jobs still retained, bounded by `keepFailed` (`ZCARD wf:failed`). */
+  failed: number
 }
 
 export interface WaitOptions {
