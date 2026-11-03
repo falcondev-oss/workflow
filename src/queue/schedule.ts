@@ -2,7 +2,7 @@ import { Cron } from 'croner'
 
 /** The queuer's local IANA zone, captured at registration when no explicit `tz` is given. */
 export function localTimeZone(): string {
-  return Intl.DateTimeFormat().resolvedOptions().timeZone
+  return new Intl.DateTimeFormat().resolvedOptions().timeZone
 }
 
 /**

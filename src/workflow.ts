@@ -126,15 +126,21 @@ export class WorkflowNamespace<
   const Limiters extends Record<string, RateLimiterBudget> = Record<never, never>,
   const Defaults extends readonly (keyof Limiters & string)[] = [],
 > {
-  readonly id: string
-  readonly logger?: WorkflowLogger
   private readonly opts: WorkflowNamespaceOptions<Limiters, Defaults>
   private namespace?: Promise<Namespace>
   private unregisterExitHook?: () => void
+  readonly id: string
+  readonly logger?: WorkflowLogger
 
   constructor(opts: WorkflowNamespaceOptions<Limiters, Defaults>) {
-    for (const [name, { limit, window }] of Object.entries(opts.rateLimiters ?? {})) {
-      if (!Number.isInteger(limit) || limit <= 0 || !Number.isInteger(window) || window <= 0)
+    const rateLimiters = Object.entries(opts.rateLimiters ?? {})
+    for (const [name, { limit, window }] of rateLimiters) {
+      if (
+        !Number.isSafeInteger(limit) ||
+        limit <= 0 ||
+        !Number.isSafeInteger(window) ||
+        window <= 0
+      )
         throw new Error(`Rate limiter "${name}" requires positive integer limit and window`)
     }
     this.id = opts.id
@@ -203,8 +209,7 @@ export class WorkflowNamespace<
         ...this.opts.queueOptions,
         ...opts.queueOptions,
         rateLimiters: (opts.queueOptions?.rateLimiters ?? this.opts.queueOptions?.rateLimiters) as
-          | Names
-          | undefined,
+          Names | undefined,
       },
       workerOptions: { ...this.opts.workerOptions, ...opts.workerOptions },
       jobOptions: { ...this.opts.jobOptions, ...opts.jobOptions },
@@ -214,9 +219,7 @@ export class WorkflowNamespace<
   /** Point-in-time starts in the current window and pausedMs remaining, per declared limiter. */
   async getRateLimiterMetrics(): Promise<Record<keyof Limiters & string, RateLimiterMetrics>> {
     const namespace = await this.getNamespace()
-    return namespace.getRateLimiterMetrics() as Promise<
-      Record<keyof Limiters & string, RateLimiterMetrics>
-    >
+    return namespace.getRateLimiterMetrics()
   }
 
   /** Top-level cascade: closes every queue/worker and disconnects the shared connections. */
@@ -239,10 +242,10 @@ export class WorkflowDefinition<
   Progress = ProgressInput,
   Names extends readonly string[] = readonly string[],
 > {
-  readonly id: string
   private readonly ns: Pick<WorkflowNamespace, 'getNamespace' | 'logger'>
-  protected readonly opts: DefineWorkflowOptions<RunInput, Input, ProgressInput, Progress, Names>
   private queue?: Promise<WorkflowQueueInternal>
+  readonly id: string
+  protected readonly opts: DefineWorkflowOptions<RunInput, Input, ProgressInput, Progress, Names>
 
   constructor(
     ns: Pick<WorkflowNamespace, 'getNamespace' | 'logger'>,
@@ -251,6 +254,58 @@ export class WorkflowDefinition<
     this.ns = ns
     this.opts = opts
     this.id = opts.id
+  }
+
+  private async enqueue(
+    input: RunInput,
+    opts?: WorkflowJobRunOptions & { runAt?: number; runIn?: number },
+  ): Promise<WorkflowJob<Output, Progress>> {
+    const parsedInput = this.opts.schema && (await this.opts.schema['~standard'].validate(input))
+    if (parsedInput?.issues) throw new Error('Invalid workflow input')
+
+    const queue = await this.getQueue()
+
+    const groupId =
+      opts?.groupId ??
+      (await this.opts.getGroupId?.(
+        parsedInput?.value as IsUnknown<Input> extends true ? undefined : Input,
+      )) ??
+      this.opts.jobOptions?.groupId
+
+    return runWithTracing(
+      `workflow-producer/${this.id}`,
+      {
+        attributes: { 'workflow.id': this.id },
+        kind: SpanKind.PRODUCER,
+      },
+      async () => {
+        const tracingHeaders = {}
+        propagation.inject(context.active(), tracingHeaders)
+
+        const job = await queue.add(
+          serialize({ input: parsedInput?.value ?? input, tracingHeaders }),
+          {
+            groupId,
+            priority: opts?.priority ?? this.opts.jobOptions?.priority,
+            // `maxAttempts` is applied per-job at enqueue time, so a per-workflow retry default
+            // only takes effect if it is passed here.
+            maxAttempts:
+              opts?.maxAttempts ??
+              this.opts.jobOptions?.maxAttempts ??
+              this.opts.workerOptions?.maxAttempts,
+            jobId: opts?.jobId ?? this.opts.jobOptions?.jobId,
+            // `runAt`/`runIn` are mutually exclusive; pass only the one that was set.
+            ...(opts?.runIn === undefined ? { runAt: opts?.runAt } : { runIn: opts.runIn }),
+          },
+        )
+
+        return new WorkflowJob<Output, Progress>({
+          queue,
+          jobId: job.id,
+          progressSchema: this.opts.progressSchema,
+        })
+      },
+    )
   }
 
   protected get logger() {
@@ -335,58 +390,6 @@ export class WorkflowDefinition<
     return this.enqueue(input, { ...opts, runAt: date.getTime() })
   }
 
-  private async enqueue(
-    input: RunInput,
-    opts?: WorkflowJobRunOptions & { runAt?: number; runIn?: number },
-  ): Promise<WorkflowJob<Output, Progress>> {
-    const parsedInput = this.opts.schema && (await this.opts.schema['~standard'].validate(input))
-    if (parsedInput?.issues) throw new Error('Invalid workflow input')
-
-    const queue = await this.getQueue()
-
-    const groupId =
-      opts?.groupId ??
-      (await this.opts.getGroupId?.(
-        parsedInput?.value as IsUnknown<Input> extends true ? undefined : Input,
-      )) ??
-      this.opts.jobOptions?.groupId
-
-    return runWithTracing(
-      `workflow-producer/${this.id}`,
-      {
-        attributes: { 'workflow.id': this.id },
-        kind: SpanKind.PRODUCER,
-      },
-      async () => {
-        const tracingHeaders = {}
-        propagation.inject(context.active(), tracingHeaders)
-
-        const job = await queue.add(
-          serialize({ input: parsedInput?.value ?? input, tracingHeaders }),
-          {
-            groupId,
-            priority: opts?.priority ?? this.opts.jobOptions?.priority,
-            // `maxAttempts` is applied per-job at enqueue time, so a per-workflow retry default
-            // only takes effect if it is passed here.
-            maxAttempts:
-              opts?.maxAttempts ??
-              this.opts.jobOptions?.maxAttempts ??
-              this.opts.workerOptions?.maxAttempts,
-            jobId: opts?.jobId ?? this.opts.jobOptions?.jobId,
-            // `runAt`/`runIn` are mutually exclusive; pass only the one that was set.
-            ...(opts?.runIn === undefined ? { runAt: opts?.runAt } : { runIn: opts.runIn }),
-          },
-        )
-
-        return new WorkflowJob<Output, Progress>({
-          queue,
-          jobId: job.id,
-          progressSchema: this.opts.progressSchema,
-        })
-      },
-    )
-  }
-
   /**
    * Register (or idempotently replace) a cron schedule. The typed `input` is validated against
    * `schema` at registration time (fail fast) and stored pre-serialized as opaque `data`.
@@ -460,6 +463,41 @@ export class Workflow<
     super(ns, opts)
   }
 
+  private setupMetrics(
+    queue: WorkflowQueueInternal,
+    { meter, prefix }: { meter: Meter; prefix: string },
+  ) {
+    const attributes = { workflow_id: this.id }
+
+    const activeJobsGauge = meter.createObservableGauge(`${prefix}_workflow_active_jobs`, {
+      description: 'Number of active workflow jobs',
+    })
+    const waitingJobsGauge = meter.createObservableGauge(`${prefix}_workflow_waiting_jobs`, {
+      description: 'Number of waiting workflow jobs',
+    })
+    const delayedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_delayed_jobs`, {
+      description: 'Number of delayed workflow jobs',
+    })
+    const failedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_failed_jobs`, {
+      description: 'Number of retained dead-lettered workflow jobs',
+    })
+
+    meter.addBatchObservableCallback(
+      async (observableResult) => {
+        try {
+          const { active, waiting, delayed, failed } = await queue.getMetrics()
+          observableResult.observe(activeJobsGauge, active, attributes)
+          observableResult.observe(waitingJobsGauge, waiting, attributes)
+          observableResult.observe(delayedJobsGauge, delayed, attributes)
+          observableResult.observe(failedJobsGauge, failed, attributes)
+        } catch (err) {
+          this.logger?.error?.('Error collecting workflow metrics:', err)
+        }
+      },
+      [activeJobsGauge, waitingJobsGauge, delayedJobsGauge, failedJobsGauge],
+    )
+  }
+
   async work(opts?: WorkflowWorkerOptions): Promise<Worker> {
     const queue = await this.getQueue()
     const { metrics, ...workerOpts } = { ...this.opts.workerOptions, ...opts }
@@ -517,16 +555,16 @@ export class Workflow<
                 }),
                 span,
                 signal: ctx.signal,
-                rateLimit: ((ms: number, name?: string): never => {
+                rateLimit: (ms: number, name?: string): never => {
                   if (!Number.isFinite(ms) || ms <= 0)
                     throw new Error('rateLimit ms must be a positive finite number')
                   const limiter = name ?? this.opts.queueOptions?.rateLimiters?.[0] ?? ''
                   span.addEvent('workflow.rate_limit', {
-                    ...(limiter ? { 'workflow.rate_limiter': limiter } : {}),
+                    ...(limiter && { 'workflow.rate_limiter': limiter }),
                     'workflow.rate_limit.pause_ms': ms,
                   })
                   throw new RateLimitError(ms, limiter)
-                }) as RateLimit<Names[number]>,
+                },
               })
 
               this.logger?.success?.(
@@ -568,41 +606,6 @@ export class Workflow<
     }
 
     return worker
-  }
-
-  private setupMetrics(
-    queue: WorkflowQueueInternal,
-    { meter, prefix }: { meter: Meter; prefix: string },
-  ) {
-    const attributes = { workflow_id: this.id }
-
-    const activeJobsGauge = meter.createObservableGauge(`${prefix}_workflow_active_jobs`, {
-      description: 'Number of active workflow jobs',
-    })
-    const waitingJobsGauge = meter.createObservableGauge(`${prefix}_workflow_waiting_jobs`, {
-      description: 'Number of waiting workflow jobs',
-    })
-    const delayedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_delayed_jobs`, {
-      description: 'Number of delayed workflow jobs',
-    })
-    const failedJobsGauge = meter.createObservableGauge(`${prefix}_workflow_failed_jobs`, {
-      description: 'Number of retained dead-lettered workflow jobs',
-    })
-
-    meter.addBatchObservableCallback(
-      async (observableResult) => {
-        try {
-          const { active, waiting, delayed, failed } = await queue.getMetrics()
-          observableResult.observe(activeJobsGauge, active, attributes)
-          observableResult.observe(waitingJobsGauge, waiting, attributes)
-          observableResult.observe(delayedJobsGauge, delayed, attributes)
-          observableResult.observe(failedJobsGauge, failed, attributes)
-        } catch (err) {
-          this.logger?.error?.('Error collecting workflow metrics:', err)
-        }
-      },
-      [activeJobsGauge, waitingJobsGauge, delayedJobsGauge, failedJobsGauge],
-    )
   }
 }
 
