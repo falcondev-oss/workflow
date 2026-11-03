@@ -538,7 +538,7 @@ return 1
 /**
  * The single throttled stalled-recovery scan, never folded into reserve. Gated by
  * `SET wf:stalled-check <now> NX PX interval` so only one worker per interval scans; returns
- * `{ 0, 0 }` immediately when the gate is held. Detection is a pure deadline-compare over the
+ * `{ 0, {} }` immediately when the gate is held. Detection is a pure deadline-compare over the
  * deadline-scored active ZSET (`ZRANGEBYSCORE wf:active 0 now`, batch-capped) — no `stalled`
  * SET, no two-pass. Per candidate: a `state == "active"` fence (skips a job mid-`completing`,
  * closing the complete-vs-recover race) → the shared `releaseActive` (frees every slot and
@@ -546,7 +546,8 @@ return 1
  * path as `moveToFailed` (`finalizeFailed`, bypassing backoff/retry); otherwise requeue at the
  * stored packed score via the shared `addWaiting`. `releaseActive` already kicks both wake lists.
  *
- * Returns `{ requeued, failed }` counts.
+ * Returns `{ requeued, deadLettered }`: the requeued count, and `[attempts, ageMs]` per job
+ * dead-lettered, where `attempts` includes the stalled one and `ageMs` is the time since enqueue.
  * ARGV: prefix, wfId, groupCap, maxStalledCount, interval, batchSize, resultTtl, keepFailed
  */
 const RECOVER_STALLED = `
@@ -567,12 +568,12 @@ local wf = prefix .. ":" .. wfId
 ${NOW}
 
 if redis.call("SET", wf .. ":stalled-check", now, "NX", "PX", interval) == false then
-  return { 0, 0 }
+  return { 0, {} }
 end
 
 local candidates = redis.call("ZRANGEBYSCORE", wf .. ":active", 0, now, "LIMIT", 0, batchSize)
 local requeued = 0
-local failed = 0
+local deadLettered = {}
 for i = 1, #candidates do
   local jobId = candidates[i]
   local jobKey = wf .. ":j:" .. jobId
@@ -580,8 +581,9 @@ for i = 1, #candidates do
     releaseActive(prefix, wfId, jobId, groupCap)
     local stalledCount = redis.call("HINCRBY", jobKey, "stalledCount", 1)
     if stalledCount > maxStalledCount then
+      local vals = redis.call("HMGET", jobKey, "attempts", "createdAt")
+      deadLettered[#deadLettered + 1] = { tonumber(vals[1]) + 1, math.max(0, now - tonumber(vals[2])) }
       finalizeFailed(prefix, wfId, jobId, "stalled more than allowable limit", "", resultTtl, groupCap, keepFailed)
-      failed = failed + 1
     else
       local groupId = redis.call("HGET", jobKey, "groupId")
       local score = tonumber(redis.call("HGET", jobKey, "score"))
@@ -590,7 +592,7 @@ for i = 1, #candidates do
     end
   end
 end
-return { requeued, failed }
+return { requeued, deadLettered }
 `
 
 /**
@@ -782,7 +784,9 @@ export interface QueueCommands {
   fail: (...args: (string | number)[]) => Promise<number>
   moveToFailed: (...args: (string | number)[]) => Promise<number>
   heartbeat: (...args: (string | number)[]) => Promise<number>
-  recoverStalled: (...args: (string | number)[]) => Promise<[requeued: number, failed: number]>
+  recoverStalled: (
+    ...args: (string | number)[]
+  ) => Promise<[requeued: number, deadLettered: [attempts: number, ageMs: number][]]>
   fireSchedule: (...args: (string | number)[]) => Promise<(string | number)[]>
 }
 

@@ -319,8 +319,9 @@ const namespace = new WorkflowNamespace({
 Every metric carries `workflow_id`. `outcome` is `completed` (the handler returned), `retried`
 (it threw and the job was requeued), `failed` (terminal: `NonRecoverableError`, attempts
 exhausted, invalid input) or `rate_limited` (it called `rateLimit()`). An attempt is recorded once
-Redis commits its outcome, so an attempt that lost its claim is counted only under
-`_workflow_stalled`, and a stalled job that is dead-lettered does not appear under `outcome=failed`.
+Redis commits its outcome, so an attempt that lost its claim is counted under `_workflow_stalled`,
+not `_workflow_jobs` or `_workflow_duration_ms`. A stalled job that is dead-lettered still records
+`_workflow_attempts` and `_workflow_end_to_end_ms` with `outcome=failed`.
 With several worker processes, every one observes the same depth gauges: aggregate them with
 `max by (workflow_id)`, and the counters and histograms with `sum`.
 

@@ -1120,7 +1120,7 @@ test('a job in state=completing is fenced from recovery', async () => {
     await redis.zadd(`${prefix}:${wfId}:active`, Date.now() - 60_000, jobId)
 
     const recovered = await ns.redis.recoverStalled(prefix, wfId, 1, 1, 1000, 500, 300, 100)
-    expect(recovered).toEqual([0, 0])
+    expect(recovered).toEqual([0, []])
     expect(await redis.hget(jobKey, 'stalledCount')).toBe('0') // budget untouched
     expect(await redis.hget(jobKey, 'state')).toBe('completing') // state unchanged
     expect(await redis.zscore(`${prefix}:${wfId}:g:g:jobs`, jobId)).toBeNull() // not requeued
@@ -1145,7 +1145,7 @@ test('a job past maxStalledCount is dead-lettered instead of requeued', async ()
     await redis.zadd(wfActive, Date.now() - 60_000, jobId)
 
     const recovered = await ns.redis.recoverStalled(prefix, wfId, 1, 1, 1000, 500, 300, 100)
-    expect(recovered).toEqual([0, 1])
+    expect(recovered).toEqual([0, [[1, expect.any(Number)]]])
 
     // Routed through the shared moveToFailed/finalizeFailed dead-letter path (bypasses retry).
     expect(await redis.zscore(`${prefix}:${wfId}:failed`, jobId)).not.toBeNull()

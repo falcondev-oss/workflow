@@ -70,9 +70,15 @@ export function createWorkerMetrics(
         endToEnd.record(endToEndMs, outcomeAttributes)
       }
     },
-    stalled(requeued: number, failed: number) {
+    stalled(requeued: number, deadLettered: [attempts: number, ageMs: number][]) {
       if (requeued > 0) stalled.add(requeued, { ...attributes, result: 'requeued' })
-      if (failed > 0) stalled.add(failed, { ...attributes, result: 'failed' })
+      if (deadLettered.length === 0) return
+      stalled.add(deadLettered.length, { ...attributes, result: 'failed' })
+      const failed = { ...attributes, outcome: 'failed' }
+      for (const [attemptsUsed, ageMs] of deadLettered) {
+        attempts.record(attemptsUsed, failed)
+        endToEnd.record(ageMs, failed)
+      }
     },
     fired(scheduleId: string, delayMs: number) {
       fireDelay.record(delayMs, { ...attributes, schedule_id: scheduleId })

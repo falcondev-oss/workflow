@@ -1802,6 +1802,20 @@ test('records attempt outcomes, attempts, stalls, steps and cron fire delay', as
   await redis.del(`${prefix}:${wf.id}:j:${jobs[4]!.id}:lock`)
   await Promise.allSettled(jobs.map(async (job) => job.wait(3000)))
 
+  const doomedStarted = makeGate()
+  const doomed = ns.createWorkflow({
+    id: randomUUID(),
+    run: async ({ step }) => {
+      doomedStarted.open()
+      await step.wait('forever', 10_000)
+    },
+  })
+  await doomed.work({ maxStalledCount: 0, lockMs: 90, stalledInterval: 25, safetyTimeout: 0.05 })
+  const doomedJob = await doomed.run(undefined)
+  await doomedStarted.wait()
+  await redis.del(`${prefix}:${doomed.id}:j:${doomedJob.id}:lock`)
+  await expect(doomedJob.wait(3000)).rejects.toThrow('stalled')
+
   const cron = ns.createWorkflow({ id: randomUUID(), run: async () => {} })
   await cron.work()
   await cron.upsertSchedule('every-second', { pattern: '* * * * * *', input: undefined })
@@ -1815,10 +1829,10 @@ test('records attempt outcomes, attempts, stalls, steps and cron fire delay', as
 
   const { resourceMetrics } = await reader.collect()
   const metrics = resourceMetrics.scopeMetrics.flatMap((scope) => scope.metrics)
-  const points = (name: string) =>
-    metrics
-      .find((metric) => metric.descriptor.name === `test_${name}`)!
-      .dataPoints.filter((point) => point.attributes.workflow_id === wf.id)
+  const metric = (name: string) => metrics.find((m) => m.descriptor.name === `test_${name}`)!
+  const points = (name: string, workflowId = wf.id) =>
+    metric(name)
+      .dataPoints.filter((point) => point.attributes.workflow_id === workflowId)
       .map(({ attributes: { workflow_id, ...attributes }, value }) => ({
         ...attributes,
         value: typeof value === 'number' ? value : (value as { count: number; sum: number }).count,
@@ -1838,8 +1852,7 @@ test('records attempt outcomes, attempts, stalls, steps and cron fire delay', as
   ]
   expect(points('workflow_attempts')).toEqual(expect.arrayContaining(terminal))
   expect(points('workflow_end_to_end_ms')).toEqual(expect.arrayContaining(terminal))
-  const attempts = metrics.find((metric) => metric.descriptor.name === 'test_workflow_attempts')!
-  const completedAttempts = attempts.dataPoints.find(
+  const completedAttempts = metric('workflow_attempts').dataPoints.find(
     (point) => point.attributes.outcome === 'completed' && point.attributes.workflow_id === wf.id,
   )!.value as { sum: number }
   // ok, limit and stall finish on their first attempt, retry on its second.
@@ -1847,8 +1860,13 @@ test('records attempt outcomes, attempts, stalls, steps and cron fire delay', as
   expect(points('workflow_stalled')).toEqual([{ result: 'requeued', value: 1 }])
   expect(points('workflow_step_duration_ms')).toEqual([{ step: 'a', value: 1 }])
   expect(points('workflow_failed_jobs')).toEqual([{ value: 1 }])
-  const fired = metrics.find((metric) => metric.descriptor.name === 'test_schedule_fire_delay_ms')!
-  expect(fired.dataPoints[0]!.attributes).toEqual({
+  // A stall dead-letter is no handler attempt, but it ends the job.
+  const deadLettered = [{ outcome: 'failed', value: 1 }]
+  expect(points('workflow_stalled', doomed.id)).toEqual([{ result: 'failed', value: 1 }])
+  expect(points('workflow_attempts', doomed.id)).toEqual(deadLettered)
+  expect(points('workflow_end_to_end_ms', doomed.id)).toEqual(deadLettered)
+  expect(points('workflow_jobs', doomed.id)).toEqual([])
+  expect(metric('schedule_fire_delay_ms').dataPoints[0]!.attributes).toEqual({
     workflow_id: cron.id,
     schedule_id: 'every-second',
   })

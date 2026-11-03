@@ -209,7 +209,7 @@ export class Worker {
     if (now - this.lastStalledScan < this.stalledInterval) return
     this.lastStalledScan = now
     try {
-      const [requeued, failed] = await this.redis.recoverStalled(
+      const [requeued, deadLettered] = await this.redis.recoverStalled(
         this.queue.prefix,
         this.queue.id,
         this.queue.groupConcurrency,
@@ -219,7 +219,7 @@ export class Worker {
         this.queue.resultTtl,
         this.keepFailed,
       )
-      this.metrics?.stalled(requeued, failed)
+      this.metrics?.stalled(requeued, deadLettered)
     } catch (err) {
       // The scan never happened, so it must not count against the local throttle.
       this.lastStalledScan = 0
@@ -408,8 +408,8 @@ export class Worker {
    * and either requeues via the delayed ZSET after `backoff` (releasing all slots) or
    * dead-letters. `attemptsMade` counts prior attempts, so the attempt that just failed is
    * `attemptsMade + 1`. Backoff `runAt` is computed here (JS) and stored verbatim as the score.
+   * Returns the script's result: 0 stale token, 1 dead-lettered, 2 requeued.
    */
-  /** Returns the `fail` script's result: 0 stale token, 1 dead-lettered, 2 requeued. */
   private async fail(claim: Claim, err: unknown): Promise<number> {
     const error = err instanceof Error ? err : new Error(String(err))
     // Best-effort local failure notification — fires on every handler failure, retryable or
