@@ -126,7 +126,7 @@ const exportPdf = namespace.createWorkflow({
 const { job, events } = await exportPdf.runAndWatch({ reportId: '1' })
 for await (const event of events) {
   if (event.type === 'progress') console.log(event.data.label)
-  if (event.type === 'completed') console.log(event.output)
+  else if (event.type === 'completed') console.log(event.output)
 }
 ```
 

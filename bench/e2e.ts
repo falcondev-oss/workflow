@@ -127,7 +127,7 @@ async function runDrain(
   const counter = makeCounter(count)
   const wf = ns.createWorkflow({
     id: 'throughput',
-    schema: undefined as never,
+    schema: undefined,
     queueOptions: { rateLimiters: names },
     async run({ step }) {
       for (let s = 0; s < steps; s++) await step.do(`s${s}`, () => s)
@@ -137,7 +137,7 @@ async function runDrain(
   })
 
   await enqueueAll(
-    async (i) => wf.run({ i } as never, { groupId: groups === 0 ? undefined : `g${i % groups}` }),
+    async (i) => wf.run({ i }, { groupId: groups === 0 ? undefined : `g${i % groups}` }),
     count,
     100,
   )
@@ -158,18 +158,18 @@ async function benchLatency(addr: RedisAddr) {
   const ns = await makeNamespace(addr)
   const wf = ns.createWorkflow({
     id: 'latency',
-    schema: undefined as never,
+    schema: undefined,
     run: async () => 1,
   })
   const worker = await wf.work({ concurrency: 1 })
 
-  const warmup = await wf.run(undefined as never)
+  const warmup = await wf.run(undefined)
   await warmup.wait()
 
   const samples: number[] = []
   for (let i = 0; i < count * RUNS; i++) {
     const start = performance.now()
-    const job = await wf.run(undefined as never)
+    const job = await wf.run(undefined)
     await job.wait()
     samples.push(performance.now() - start)
   }

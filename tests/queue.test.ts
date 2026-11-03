@@ -131,10 +131,7 @@ function makeTracker() {
 
 /** A latch every gated handler awaits, so jobs pile up "running" until released. */
 function makeGate() {
-  let open!: () => void
-  const promise = new Promise<void>((resolve) => {
-    open = resolve
-  })
+  const { promise, resolve: open } = Promise.withResolvers<void>()
   return { wait: async () => promise, open }
 }
 
@@ -1314,7 +1311,10 @@ test('cron fires exactly once under concurrent fire (CAS on score): one fired, o
     ])
 
     // Exactly one enqueued the occurrence; the other saw the re-armed score and bailed stale.
-    expect([a[0], b[0]].sort()).toEqual(['fired', 'stale'])
+    expect([a[0], b[0]].toSorted((x, y) => String(x).localeCompare(String(y)))).toEqual([
+      'fired',
+      'stale',
+    ])
     expect(await redis.zcard(groupJobs)).toBe(1) // a single occurrence waiting, never two
     // Re-armed exactly once, forward to the next occurrence.
     expect(await redis.zcard(dueKey)).toBe(1)
@@ -1539,7 +1539,7 @@ test('getMetrics reports active/waiting/delayed; a drained group leaves the grou
     // The drained active group is gone from the metrics set; only the two waiting groups remain
     // (delayed jobs never enter it). A missing SREM would leave `active-grp` here.
     const groups = await redis.smembers(`${prefix}:${wfId}:groups`)
-    expect(groups.sort()).toEqual(['g1', 'g2'])
+    expect(groups.toSorted((x, y) => x.localeCompare(y))).toEqual(['g1', 'g2'])
   } finally {
     gate.open()
     await ns.close()

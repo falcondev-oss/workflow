@@ -1,11 +1,10 @@
-onlyBuiltDependencies:
-  - cpu-features
-  - esbuild
-  - msgpackr-extract
-  - protobufjs
-  - ssh2
-  - unrs-resolver
-
 publicHoistPattern:
   - eslint-plugin-*
   - '@prettier/plugin-*'
+allowBuilds:
+  cpu-features: true
+  esbuild: true
+  msgpackr-extract: true
+  protobufjs: true
+  ssh2: true
+  unrs-resolver: true

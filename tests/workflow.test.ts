@@ -8,11 +8,7 @@ import {
   MeterProvider,
   PeriodicExportingMetricReader,
 } from '@opentelemetry/sdk-metrics'
-import {
-  BasicTracerProvider,
-  InMemorySpanExporter,
-  SimpleSpanProcessor,
-} from '@opentelemetry/sdk-trace-base'
+import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider } from '@opentelemetry/sdk-trace'
 import { type } from 'arktype'
 import { stringify } from 'superjson'
 import { beforeAll, describe, expect, expectTypeOf, onTestFinished, test, vi } from 'vitest'
@@ -47,10 +43,7 @@ async function connect() {
 
 /** A one-shot latch: `open()` resolves everyone awaiting `wait()`. */
 function makeGate() {
-  let open!: () => void
-  const promise = new Promise<void>((resolve) => {
-    open = resolve
-  })
+  const { promise, resolve: open } = Promise.withResolvers<void>()
   return { wait: async () => promise, open }
 }
 
@@ -66,9 +59,7 @@ function passthrough<T>(): StandardSchemaV1<T, T> {
 }
 
 async function collect<T>(events: AsyncIterable<T>): Promise<T[]> {
-  const result: T[] = []
-  for await (const event of events) result.push(event)
-  return result
+  return Array.fromAsync(events)
 }
 
 describe('input', () => {
@@ -396,11 +387,13 @@ describe('watch', () => {
     await workflow.work()
 
     for await (const event of events) {
-      if (event.type === 'progress') {
-        event.data.value satisfies number
-        event.data.label satisfies string
-        expect(event.data).toEqual({ value: 42, label: 'Working' })
+      if (event.type !== 'progress') {
+        continue
       }
+
+      event.data.value satisfies number
+      event.data.label satisfies string
+      expect(event.data).toEqual({ value: 42, label: 'Working' })
     }
   })
 
@@ -658,7 +651,7 @@ describe('groups', () => {
         await gate.wait()
       },
     })
-    onTestFinished(gate.open)
+    onTestFinished(() => gate.open())
     const day = new Date('2026-01-01')
     const active = await workflow.run({ day: '2026-01-01' }, { groupId: 'g' })
     await workflow.work()
@@ -1408,7 +1401,7 @@ describe('rate limits', () => {
     expect(await ns.getRateLimiterMetrics()).toEqual({})
   })
 
-  test.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+  test.each([0, -1, NaN, Infinity, -Infinity])(
     'rejects an invalid pause of %s through normal failure handling',
     async (ms) => {
       const ns = new WorkflowNamespace({
@@ -1550,7 +1543,7 @@ describe('rate limits', () => {
     pause.mockRestore()
   })
 
-  test.each([0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY])(
+  test.each([0, -1, 0.5, NaN, Infinity])(
     'rejects invalid budgets of %s in the constructor',
     (value) => {
       for (const budget of [
@@ -1652,8 +1645,8 @@ describe('rate limits', () => {
 
 test('observes each limiter once per meter and traces pauses without errors', async () => {
   const spanExporter = new InMemorySpanExporter()
-  const tracerProvider = new BasicTracerProvider({
-    spanProcessors: [new SimpleSpanProcessor(spanExporter)],
+  const tracerProvider = new TracerProvider({
+    spanProcessors: [new SimpleSpanProcessor({ exporter: spanExporter })],
   })
   trace.setGlobalTracerProvider(tracerProvider)
   const reader = new PeriodicExportingMetricReader({

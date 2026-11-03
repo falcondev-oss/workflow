@@ -17,19 +17,19 @@ import { registerScripts, UNLIMITED } from './scripts'
  * `wait()`, so waiting works from a pure producer with no worker.
  */
 export class Namespace {
-  readonly id: string
-  readonly prefix: string
-  readonly concurrency: number
-  readonly redis: QueueRedis
-  readonly logger?: WorkflowLogger
-  readonly rateLimiters: Record<string, RateLimiterBudget>
-
   private readonly subscriber: Redis
   private readonly subscriberReady: Promise<unknown>
   private readonly channelListeners = new Map<string, Set<(message: string) => void>>()
   private readonly channelSubscriptions = new Map<string, Promise<unknown>>()
   private readonly metricsMeters = new WeakSet<Meter>()
   private readonly queues = new Set<Queue>()
+
+  readonly id: string
+  readonly prefix: string
+  readonly concurrency: number
+  readonly redis: QueueRedis
+  readonly logger?: WorkflowLogger
+  readonly rateLimiters: Record<string, RateLimiterBudget>
 
   constructor(opts: NamespaceOptions) {
     this.id = opts.id
@@ -42,7 +42,8 @@ export class Namespace {
     this.subscriber = opts.redis.duplicate()
     this.subscriberReady = this.subscriber.connect().catch(() => {})
     this.subscriber.on('message', (channel: string, message: string) => {
-      for (const cb of this.channelListeners.get(channel) ?? []) cb(message)
+      const listeners = this.channelListeners.get(channel) ?? []
+      for (const cb of listeners) cb(message)
     })
   }
 
@@ -76,7 +77,8 @@ export class Namespace {
     meter.addBatchObservableCallback(
       async (result) => {
         try {
-          for (const [name, values] of Object.entries(await this.getRateLimiterMetrics())) {
+          const metrics = await this.getRateLimiterMetrics()
+          for (const [name, values] of Object.entries(metrics)) {
             const attributes = { rate_limiter: name }
             result.observe(starts, values.starts, attributes)
             result.observe(paused, values.pausedMs, attributes)

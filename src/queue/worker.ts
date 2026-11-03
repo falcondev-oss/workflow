@@ -253,7 +253,7 @@ export class Worker {
             priority: Number(priority),
             steps: flatToMap(steps),
             queueWaitMs,
-          }) as ReservedJob,
+          }),
           token,
           ageMs,
         }),

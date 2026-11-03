@@ -24,6 +24,8 @@ import { Worker } from './worker'
  * an opaque string end-to-end; serialization is the caller's job.
  */
 export class Queue {
+  private readonly workers = new Set<Worker>()
+
   readonly id: string
   readonly concurrency: number
   readonly groupConcurrency: number
@@ -31,8 +33,6 @@ export class Queue {
   readonly redis: QueueRedis
   /** `reserve`'s trailing ARGV: `count, name, limit, window, …`. */
   readonly rateLimitArgs: (string | number)[]
-
-  private readonly workers = new Set<Worker>()
 
   constructor(
     readonly ns: Namespace,
@@ -51,6 +51,70 @@ export class Queue {
         return [name, budget.limit, budget.window]
       }),
     ]
+  }
+
+  /** Guard the range that keeps the packed score exact in a ZSET double. */
+  private validatePriority(priority: number): void {
+    if (!Number.isSafeInteger(priority) || priority < 0 || priority > PMAX)
+      throw new RangeError(`priority must be an integer in 0…${PMAX}, got ${priority}`)
+  }
+
+  /**
+   * Turn a `done` publish into the result. The finalize scripts publish the record itself, so
+   * this is normally pure JS — no second read of the key the notification just carried.
+   *
+   * The fallback is not dead: the payload is a wire format shared with *other processes*, which
+   * may be running an older build whose `complete` publishes a bare `"1"`. During any rolling
+   * deploy both shapes are on the channel at once, so a non-record payload is treated as a bare
+   * wake-up and re-read from the result key (`ResultExpiredError` if it has aged out) — exactly
+   * the pre-change behaviour.
+   */
+  private async parsePublished(jobId: string, published: string): Promise<QueueEvent> {
+    if (!published.startsWith('{')) {
+      const stored = await this.redis.get(`${this.prefix}:${this.id}:result:${jobId}`)
+      if (stored === null) throw new ResultExpiredError(jobId)
+      return this.parsePublished(jobId, stored)
+    }
+    const record: unknown = JSON.parse(published)
+    if (typeof record !== 'object' || record === null)
+      throw new Error(`Invalid job event for ${jobId}`)
+    if (
+      'type' in record &&
+      record.type === 'started' &&
+      'attempt' in record &&
+      typeof record.attempt === 'number' &&
+      Number.isSafeInteger(record.attempt) &&
+      record.attempt > 0
+    )
+      return { type: 'started', attempt: record.attempt }
+    if (
+      'type' in record &&
+      record.type === 'progress' &&
+      'data' in record &&
+      typeof record.data === 'string'
+    )
+      return { type: 'progress', data: record.data }
+    if (
+      'state' in record &&
+      record.state === 'failed' &&
+      'reason' in record &&
+      typeof record.reason === 'string' &&
+      (!('stack' in record) || typeof record.stack === 'string')
+    ) {
+      const error = new Error(record.reason)
+      if ('stack' in record && typeof record.stack === 'string' && record.stack)
+        // eslint-disable-next-line unicorn/no-error-property-assignment -- rehydrates the remote stack
+        error.stack = record.stack
+      return { type: 'failed', error }
+    }
+    if (
+      'state' in record &&
+      record.state === 'completed' &&
+      'value' in record &&
+      typeof record.value === 'string'
+    )
+      return { type: 'completed', output: record.value }
+    throw new Error(`Invalid job event for ${jobId}`)
   }
 
   get prefix(): string {
@@ -112,7 +176,8 @@ export class Queue {
         ? undefined
         : setTimeout(() => controller.abort(new TimeoutError(jobId)), opts.timeoutMs)
     try {
-      for await (const event of await this.watch(jobId, { signal: controller.signal })) {
+      const events = await this.watch(jobId, { signal: controller.signal })
+      for await (const event of events) {
         if (event.type === 'completed') return event.output
         if (event.type === 'failed') throw event.error
       }
@@ -211,63 +276,6 @@ export class Queue {
   }
 
   /**
-   * Turn a `done` publish into the result. The finalize scripts publish the record itself, so
-   * this is normally pure JS — no second read of the key the notification just carried.
-   *
-   * The fallback is not dead: the payload is a wire format shared with *other processes*, which
-   * may be running an older build whose `complete` publishes a bare `"1"`. During any rolling
-   * deploy both shapes are on the channel at once, so a non-record payload is treated as a bare
-   * wake-up and re-read from the result key (`ResultExpiredError` if it has aged out) — exactly
-   * the pre-change behaviour.
-   */
-  private async parsePublished(jobId: string, published: string): Promise<QueueEvent> {
-    if (!published.startsWith('{')) {
-      const stored = await this.redis.get(`${this.prefix}:${this.id}:result:${jobId}`)
-      if (stored === null) throw new ResultExpiredError(jobId)
-      return this.parsePublished(jobId, stored)
-    }
-    const record: unknown = JSON.parse(published)
-    if (typeof record !== 'object' || record === null)
-      throw new Error(`Invalid job event for ${jobId}`)
-    if (
-      'type' in record &&
-      record.type === 'started' &&
-      'attempt' in record &&
-      typeof record.attempt === 'number' &&
-      Number.isInteger(record.attempt) &&
-      record.attempt > 0
-    )
-      return { type: 'started', attempt: record.attempt }
-    if (
-      'type' in record &&
-      record.type === 'progress' &&
-      'data' in record &&
-      typeof record.data === 'string'
-    )
-      return { type: 'progress', data: record.data }
-    if (
-      'state' in record &&
-      record.state === 'failed' &&
-      'reason' in record &&
-      typeof record.reason === 'string' &&
-      (!('stack' in record) || typeof record.stack === 'string')
-    ) {
-      const error = new Error(record.reason)
-      if ('stack' in record && typeof record.stack === 'string' && record.stack)
-        error.stack = record.stack
-      return { type: 'failed', error }
-    }
-    if (
-      'state' in record &&
-      record.state === 'completed' &&
-      'value' in record &&
-      typeof record.value === 'string'
-    )
-      return { type: 'completed', output: record.value }
-    throw new Error(`Invalid job event for ${jobId}`)
-  }
-
-  /**
    * Register (or idempotently replace) a recurring cron schedule keyed by `(wfId, scheduleId)`.
    * Structurally cannot duplicate: the `schedule:<id>` hash and the single `schedules:due` member
    * are addressed by `scheduleId`, so upserting the same id twice overwrites in place — one hash,
@@ -307,7 +315,7 @@ export class Queue {
   /** List registered schedules with their next-fire time and last-fire bookkeeping. */
   async getSchedules(): Promise<ScheduleInfo[]> {
     const dueKey = `${this.prefix}:${this.id}:schedules:due`
-    const entries = await this.redis.zrange(dueKey, 0, -1, 'WITHSCORES')
+    const entries = await this.redis.zrange(dueKey, 0, '-1', 'WITHSCORES')
     const schedules: ScheduleInfo[] = []
     for (let i = 0; i < entries.length; i += 2) {
       const scheduleId = entries[i]!
@@ -350,8 +358,8 @@ export class Queue {
     if (groups.length > 0) {
       const pipeline = this.redis.pipeline()
       for (const groupId of groups) pipeline.zcard(`${wf}:g:${groupId}:jobs`)
-      const results = await pipeline.exec()
-      for (const [, count] of results ?? []) waiting += Number(count ?? 0)
+      const results = (await pipeline.exec()) ?? []
+      for (const [, count] of results) waiting += Number(count ?? 0)
     }
     return { active, waiting, delayed, failed }
   }
@@ -365,12 +373,6 @@ export class Queue {
       data,
       createdAt: Number(createdAt),
     }))
-  }
-
-  /** Guard the range that keeps the packed score exact in a ZSET double. */
-  private validatePriority(priority: number): void {
-    if (!Number.isInteger(priority) || priority < 0 || priority > PMAX)
-      throw new RangeError(`priority must be an integer in 0…${PMAX}, got ${priority}`)
   }
 
   /** Releases queue-owned handles: closes workers and unsubscribes any `wait()` channels. */

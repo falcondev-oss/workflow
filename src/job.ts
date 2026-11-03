@@ -4,8 +4,8 @@ import type { QueueEvent } from './queue/types'
 import { deserialize } from './serializer'
 
 export type WorkflowEvent<Output, Progress = never> =
-  | { type: 'started'; attempt: number }
   | ([Progress] extends [never] ? never : { type: 'progress'; data: Progress })
+  | { type: 'started'; attempt: number }
   | { type: 'completed'; output: Output }
   | { type: 'failed'; error: Error }
 

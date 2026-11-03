@@ -28,7 +28,8 @@ beforeAll(async () => {
 
 const children: ChildProcess[] = []
 afterEach(() => {
-  for (const child of children.splice(0)) child.kill('SIGKILL')
+  for (const child of children) child.kill('SIGKILL')
+  children.length = 0
 })
 
 /** Fork a worker process and resolve once it has started draining. */
@@ -117,7 +118,7 @@ test('four worker processes share one start budget', async () => {
     const jobs = await Promise.all(Array.from({ length: 32 }, async () => workflow.run(undefined)))
     await Promise.all(jobs.map(async (job) => job.wait(10_000)))
     const recorded = await redis.lrange(`${prefix}:starts`, 0, -1)
-    const starts = recorded.map(Number).sort((a, b) => a - b)
+    const starts = recorded.map(Number).toSorted((a, b) => a - b)
     expect(starts).toHaveLength(32)
     // Stamped in each handler after the claim, so a loaded process skews a start by its
     // scheduling lag. A budget that is not shared puts 4x the starts in a window, gaps near 0.

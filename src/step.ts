@@ -52,6 +52,29 @@ export class WorkflowStep<Progress = never> {
     return `${this.stepNamePrefix}${name}`
   }
 
+  /**
+   * Read a step's persisted data. The memo is seeded from the step hash that came back with the
+   * claim and kept in step with every write, so this is always local — the durability round-trip
+   * happens on write, never on read.
+   */
+  private getStepData<T extends WorkflowStepData['type']>(type: T, stepName: string) {
+    const raw = this.memo.get(stepName)
+    if (raw === undefined) return
+
+    const stepData = deserialize<WorkflowStepData>(raw)
+    if (stepData.type !== type)
+      throw new Error(`Step "${stepName}" is of type "${stepData.type}", expected "${type}"`)
+
+    return stepData as Extract<WorkflowStepData, { type: T }>
+  }
+
+  /** Per-field superjson persist — a single atomic `HSET` on the job's `:steps` hash. */
+  private async updateStepData(stepName: string, data: WorkflowStepData) {
+    const raw = serialize(data)
+    await this.queue.setStepData(this.workflowJobId, stepName, raw)
+    this.memo.set(stepName, raw)
+  }
+
   async do<R>(
     stepName: string,
     run: (ctx: {
@@ -164,28 +187,5 @@ export class WorkflowStep<Progress = never> {
     const targetTime = date.getTime()
     const durationMs = Math.max(0, targetTime - now)
     return this.wait(stepName, durationMs)
-  }
-
-  /**
-   * Read a step's persisted data. The memo is seeded from the step hash that came back with the
-   * claim and kept in step with every write, so this is always local — the durability round-trip
-   * happens on write, never on read.
-   */
-  private getStepData<T extends WorkflowStepData['type']>(type: T, stepName: string) {
-    const raw = this.memo.get(stepName)
-    if (raw === undefined) return
-
-    const stepData = deserialize<WorkflowStepData>(raw)
-    if (stepData.type !== type)
-      throw new Error(`Step "${stepName}" is of type "${stepData.type}", expected "${type}"`)
-
-    return stepData as Extract<WorkflowStepData, { type: T }>
-  }
-
-  /** Per-field superjson persist — a single atomic `HSET` on the job's `:steps` hash. */
-  private async updateStepData(stepName: string, data: WorkflowStepData) {
-    const raw = serialize(data)
-    await this.queue.setStepData(this.workflowJobId, stepName, raw)
-    this.memo.set(stepName, raw)
   }
 }
