@@ -297,8 +297,8 @@ export class Worker {
 
   private async process(claim: Claim): Promise<void> {
     const controller = new AbortController()
-    const stopHeartbeat = this.startHeartbeat(claim, controller)
     this.metrics?.claimed(claim.job.queueWaitMs)
+    const stopHeartbeat = this.startHeartbeat(claim, controller)
     const start = performance.now()
     let durationMs = 0
     // Recorded only once Redis commits the outcome: a stale-token finalize is another claim's.

@@ -1141,11 +1141,21 @@ test('a job past maxStalledCount is dead-lettered instead of requeued', async ()
   try {
     // Already at the budget (maxStalledCount 1); the next stall (→ 2) exceeds it.
     // prettier-ignore
-    await redis.hset(jobKey, 'state', 'active', 'groupId', 'g', 'nsId', nsId, 'stalledCount', '1', 'score', '123', 'maxAttempts', '1')
+    await redis.hset(jobKey, 'state', 'active', 'groupId', 'g', 'nsId', nsId, 'stalledCount', '1', 'score', '123', 'maxAttempts', '1', 'attempts', '0', 'createdAt', Date.now() - 60_000)
     await redis.zadd(wfActive, Date.now() - 60_000, jobId)
 
-    const recovered = await ns.redis.recoverStalled(prefix, wfId, 1, 1, 1000, 500, 300, 100)
-    expect(recovered).toEqual([0, [[1, expect.any(Number)]]])
+    const [requeued, [[attempts, ageMs] = []]] = await ns.redis.recoverStalled(
+      prefix,
+      wfId,
+      1,
+      1,
+      1000,
+      500,
+      300,
+      100,
+    )
+    expect([requeued, attempts]).toEqual([0, 1])
+    expect(ageMs).toBeGreaterThanOrEqual(60_000)
 
     // Routed through the shared moveToFailed/finalizeFailed dead-letter path (bypasses retry).
     expect(await redis.zscore(`${prefix}:${wfId}:failed`, jobId)).not.toBeNull()
