@@ -2,7 +2,7 @@
   "name": "@falcondev-oss/workflow",
   "type": "module",
   "version": "0.18.0",
-  "packageManager": "pnpm@10.28.2",
+  "packageManager": "pnpm@12.16.1",
   "description": "Durable, type-safe queue workers on Redis with memoized steps, cron schedules, group ordering, OpenTelemetry tracing.",
   "license": "MIT",
   "repository": "github:falcondev-oss/workflow",
@@ -25,8 +25,8 @@
     "dist"
   ],
   "engines": {
-    "node": "24",
-    "pnpm": "10"
+    "node": "26",
+    "pnpm": "12"
   },
   "scripts": {
     "build": "tsdown",
@@ -39,29 +39,30 @@
   },
   "dependencies": {
     "@antfu/utils": "^9.3.0",
-    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/api": "^1.10.0",
     "@standard-schema/spec": "^1.1.0",
-    "@types/node": "^25.1.0",
-    "croner": "^10.0.1",
-    "exit-hook": "^5.0.1",
-    "ioredis": "^5.9.2",
+    "@types/node": "^26.6.6",
+    "croner": "^11.0.0",
+    "exit-hook": "^5.1.0",
+    "ioredis": "^6.0.0",
     "superjson": "^2.2.6",
-    "type-fest": "^5.4.2"
+    "type-fest": "^5.10.0"
   },
   "devDependencies": {
-    "@falcondev-oss/configs": "^5.0.2",
-    "@opentelemetry/sdk-metrics": "^2.11.0",
-    "@opentelemetry/sdk-trace-base": "^2.11.0",
-    "@testcontainers/redis": "^11.11.0",
-    "arktype": "^2.1.29",
-    "eslint": "^9.39.2",
-    "prettier": "^3.8.1",
-    "rolldown": "1.0.0-rc.2",
-    "tsdown": "0.19.0-beta.5",
-    "tsx": "^4.21.0",
-    "typescript": "^5.9.3",
-    "vitest": "^4.0.18",
-    "zod": "^4.3.6"
+    "@falcondev-oss/configs": "^6.0.6",
+    "@opentelemetry/sdk-metrics": "^3.0.0",
+    "@opentelemetry/sdk-trace": "^3.0.0",
+    "@testcontainers/redis": "^12.2.1",
+    "@typescript/native": "npm:typescript@^7.0.2",
+    "arktype": "^2.2.9",
+    "eslint": "^10.14.0",
+    "prettier": "^3.9.10",
+    "rolldown": "1.2.16",
+    "tsdown": "0.23.4",
+    "tsx": "^4.23.15",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "vitest": "^5.0.5",
+    "zod": "^4.6.7"
   },
   "publishConfig": {
     "types": "./dist/index.d.mts",

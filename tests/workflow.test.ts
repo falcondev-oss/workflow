@@ -9,10 +9,10 @@ import {
   PeriodicExportingMetricReader,
 } from '@opentelemetry/sdk-metrics'
 import {
-  BasicTracerProvider,
   InMemorySpanExporter,
   SimpleSpanProcessor,
-} from '@opentelemetry/sdk-trace-base'
+  TracerProvider,
+} from '@opentelemetry/sdk-trace'
 import { type } from 'arktype'
 import { stringify } from 'superjson'
 import { beforeAll, describe, expect, expectTypeOf, onTestFinished, test, vi } from 'vitest'
@@ -1652,8 +1652,8 @@ describe('rate limits', () => {
 
 test('observes each limiter once per meter and traces pauses without errors', async () => {
   const spanExporter = new InMemorySpanExporter()
-  const tracerProvider = new BasicTracerProvider({
-    spanProcessors: [new SimpleSpanProcessor(spanExporter)],
+  const tracerProvider = new TracerProvider({
+    spanProcessors: [new SimpleSpanProcessor({ exporter: spanExporter })],
   })
   trace.setGlobalTracerProvider(tracerProvider)
   const reader = new PeriodicExportingMetricReader({

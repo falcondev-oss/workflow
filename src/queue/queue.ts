@@ -307,7 +307,7 @@ export class Queue {
   /** List registered schedules with their next-fire time and last-fire bookkeeping. */
   async getSchedules(): Promise<ScheduleInfo[]> {
     const dueKey = `${this.prefix}:${this.id}:schedules:due`
-    const entries = await this.redis.zrange(dueKey, 0, -1, 'WITHSCORES')
+    const entries = await this.redis.zrange(dueKey, 0, '-1', 'WITHSCORES')
     const schedules: ScheduleInfo[] = []
     for (let i = 0; i < entries.length; i += 2) {
       const scheduleId = entries[i]!
