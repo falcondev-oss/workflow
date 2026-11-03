@@ -307,7 +307,7 @@ const namespace = new WorkflowNamespace({
 
 | Metric                       | Type              | Attributes                  | Measures                                                                                                   |
 | ---------------------------- | ----------------- | --------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `_workflow_queue_wait`       | histogram, ms     |                             | Wait before a worker claimed the job, also `workflow.queue_wait_ms` on the job span                        |
+| `_workflow_queue_wait_ms`    | histogram, ms     |                             | Wait before a worker claimed the job, also `workflow.queue_wait_ms` on the job span                        |
 | `_workflow_duration_ms`      | histogram         | `outcome`                   | How long a handler attempt ran                                                                             |
 | `_workflow_jobs`             | counter           | `outcome`                   | Handler attempts                                                                                           |
 | `_workflow_attempts`         | histogram         | `outcome=completed\|failed` | Attempts a job used before it finished                                                                     |

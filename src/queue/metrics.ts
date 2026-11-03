@@ -30,7 +30,7 @@ export function createWorkerMetrics(
     })
 
   const queueWait = ms(
-    'workflow_queue_wait',
+    'workflow_queue_wait_ms',
     'Time a job waited in the queue before a worker claimed it',
   )
   const duration = ms('workflow_duration_ms', 'Time a handler attempt ran')

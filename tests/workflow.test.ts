@@ -1845,6 +1845,8 @@ test('records attempt outcomes, attempts, stalls, steps and cron fire delay', as
   ]
   expect(points('workflow_jobs')).toEqual(expect.arrayContaining(byOutcome))
   expect(points('workflow_jobs')).toHaveLength(4)
+  // Every claim: retry, limit and stall are claimed twice.
+  expect(points('workflow_queue_wait_ms')).toEqual([{ value: 8 }])
   expect(points('workflow_duration_ms')).toEqual(expect.arrayContaining(byOutcome))
   const terminal = [
     { outcome: 'completed', value: 4 },
