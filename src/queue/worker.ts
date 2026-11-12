@@ -18,6 +18,9 @@ export type WorkerHandler = (job: ReservedJob, ctx: JobContext) => Promise<strin
  */
 const RESERVE_BATCH_CAP = 64
 
+/** Delay before the wake loop retries after a Redis error. Capped low: Redis restarts take seconds. */
+const redisRetryBackoff = expBackoff({ base: 250, cap: 5000 })
+
 /** Redis' `[field, value, …]` hash reply as a Map. */
 function flatToMap(flat: string[]): Map<string, string> {
   const map = new Map<string, string>()
@@ -110,53 +113,72 @@ export class Worker {
     this.loopPromise = this.loop()
   }
 
+  /**
+   * Runs passes until `close`. A Redis error (connection refused, a restart, a failed command)
+   * never ends the loop: it goes to `onError`, and the loop retries after a backoff while ioredis
+   * reconnects. Nothing awaits `loopPromise` before `close`, so a rejection here would be an
+   * unhandled rejection that exits the process.
+   */
   private async loop(): Promise<void> {
-    if (this.blockingRedis.status === 'wait') await this.blockingRedis.connect()
+    let failures = 0
     while (!this.closing) {
-      // One round-trip per pass: claim a batch, promote due delayed jobs, and read both timers.
-      // A locally saturated worker still calls it with `want = 0` — promotion and the cron tick
-      // must keep happening while every slot is busy.
-      const want = Math.min(this.concurrency - this.inFlight, RESERVE_BATCH_CAP)
-      const res = await this.reserve(want)
-      // Start what we claimed even while closing: these jobs hold real locks and slots in Redis,
-      // and dropping them here would strand them until stalled-recovery — on every clean
-      // shutdown. `close` drains `inProgress`, so starting them is what makes the drain honest.
-      for (const claim of res.claims) this.start(claim)
-      if (this.closing) break
-
-      // Fire any due cron occurrences into waiting — no separate poller; the tick folds into
-      // this same wake loop. Firing kicks `wake`, so the next pass picks the occurrence up.
-      if (res.dueSchedules.length > 0) {
-        await this.tickSchedules(res.dueSchedules)
-        continue
+      try {
+        if (this.blockingRedis.status === 'wait') await this.blockingRedis.connect()
+        await this.pass()
+        failures = 0
+      } catch (err) {
+        this.onError(err)
+        // `close` wakes this wait, so a worker without Redis still shuts down at once.
+        if (!this.closing) await this.waitForSlot(redisRetryBackoff(++failures))
       }
-      const saturated = this.inFlight >= this.concurrency
-      // The batch cap, not an empty queue, ended this pass — go straight back for the next chunk.
-      if (!saturated && res.claims.length === want) continue
-      // Due work remained past the promote cap — re-reserve at once to drain the next chunk,
-      // unless a ceiling (not an empty queue) is what stopped us, which would spin.
-      if (!saturated && res.msToNext === 0 && !res.maxed) continue
-      // Block until woken (new work / freed slot / enqueued delay), the next delayed job or
-      // schedule comes due, or the safety re-poll fires — whichever is sooner. The block is the
-      // timer for both delayed jobs and schedules.
-      // Only *future* timers count: a `0` here means due work we just decided we cannot take
-      // (capped out), and folding it in would mean `brpop … 0` — which blocks forever, not
-      // "immediately" — or a hot `waitForSlot(0)` spin. Falling back to `safetyTimeout` is what
-      // the pre-batch code did in exactly this state.
-      const nearest = [res.msToNext, res.msToSchedule, res.msToLimit].filter((m) => m > 0)
-      const timeout =
-        nearest.length === 0
-          ? this.safetyTimeout
-          : Math.min(Math.min(...nearest) / 1000, this.safetyTimeout)
-      // With every slot busy there is nothing Redis could tell us that we could act on, and the
-      // next thing we *can* act on — a slot freeing — is local. Park on it and skip the round
-      // trip entirely; a completion re-drives the loop the instant it lands.
-      // Redis blocking timeouts can fire 100 ms late. Rate limits need the local timer.
-      if (saturated || res.msToLimit > 0) await this.waitForSlot(timeout * 1000)
-      else await this.blockingRedis.brpop(this.wfWake, this.nsWake, timeout)
-      // Wake-loop re-poll is the idle-worker stalled-recovery trigger — no dedicated poller.
-      if (!this.closing) void this.recoverStalled()
     }
+  }
+
+  /** One wake-loop pass: claim and start a batch, then park until there is more to do. */
+  private async pass(): Promise<void> {
+    // One round-trip per pass: claim a batch, promote due delayed jobs, and read both timers.
+    // A locally saturated worker still calls it with `want = 0` — promotion and the cron tick
+    // must keep happening while every slot is busy.
+    const want = Math.min(this.concurrency - this.inFlight, RESERVE_BATCH_CAP)
+    const res = await this.reserve(want)
+    // Start what we claimed even while closing: these jobs hold real locks and slots in Redis,
+    // and dropping them here would strand them until stalled-recovery — on every clean
+    // shutdown. `close` drains `inProgress`, so starting them is what makes the drain honest.
+    for (const claim of res.claims) this.start(claim)
+    if (this.closing) return
+
+    // Fire any due cron occurrences into waiting — no separate poller; the tick folds into
+    // this same wake loop. Firing kicks `wake`, so the next pass picks the occurrence up.
+    if (res.dueSchedules.length > 0) {
+      await this.tickSchedules(res.dueSchedules)
+      return
+    }
+    const saturated = this.inFlight >= this.concurrency
+    // The batch cap, not an empty queue, ended this pass — go straight back for the next chunk.
+    if (!saturated && res.claims.length === want) return
+    // Due work remained past the promote cap — re-reserve at once to drain the next chunk,
+    // unless a ceiling (not an empty queue) is what stopped us, which would spin.
+    if (!saturated && res.msToNext === 0 && !res.maxed) return
+    // Block until woken (new work / freed slot / enqueued delay), the next delayed job or
+    // schedule comes due, or the safety re-poll fires — whichever is sooner. The block is the
+    // timer for both delayed jobs and schedules.
+    // Only *future* timers count: a `0` here means due work we just decided we cannot take
+    // (capped out), and folding it in would mean `brpop … 0` — which blocks forever, not
+    // "immediately" — or a hot `waitForSlot(0)` spin. Falling back to `safetyTimeout` is what
+    // the pre-batch code did in exactly this state.
+    const nearest = [res.msToNext, res.msToSchedule, res.msToLimit].filter((m) => m > 0)
+    const timeout =
+      nearest.length === 0
+        ? this.safetyTimeout
+        : Math.min(Math.min(...nearest) / 1000, this.safetyTimeout)
+    // With every slot busy there is nothing Redis could tell us that we could act on, and the
+    // next thing we *can* act on — a slot freeing — is local. Park on it and skip the round
+    // trip entirely; a completion re-drives the loop the instant it lands.
+    // Redis blocking timeouts can fire 100 ms late. Rate limits need the local timer.
+    if (saturated || res.msToLimit > 0) await this.waitForSlot(timeout * 1000)
+    else await this.blockingRedis.brpop(this.wfWake, this.nsWake, timeout)
+    // Wake-loop re-poll is the idle-worker stalled-recovery trigger — no dedicated poller.
+    if (!this.closing) void this.recoverStalled()
   }
 
   /**
