@@ -33,7 +33,6 @@ export class WorkflowStep<Progress = never> {
     stepNamePrefix?: string
     signal: AbortSignal
     stepPromises: Set<Promise<any>>
-    /** The job's persisted step data, shipped with the claim — the memo's initial contents. */
     memo: Map<string, string>
     recordStepDuration?: (step: string, durationMs: number) => void
   }) {
@@ -52,11 +51,6 @@ export class WorkflowStep<Progress = never> {
     return `${this.stepNamePrefix}${name}`
   }
 
-  /**
-   * Read a step's persisted data. The memo is seeded from the step hash that came back with the
-   * claim and kept in step with every write, so this is always local — the durability round-trip
-   * happens on write, never on read.
-   */
   private getStepData<T extends WorkflowStepData['type']>(type: T, stepName: string) {
     const raw = this.memo.get(stepName)
     if (raw === undefined) return
@@ -68,7 +62,6 @@ export class WorkflowStep<Progress = never> {
     return stepData as Extract<WorkflowStepData, { type: T }>
   }
 
-  /** Per-field superjson persist — a single atomic `HSET` on the job's `:steps` hash. */
   private async updateStepData(stepName: string, data: WorkflowStepData) {
     const raw = serialize(data)
     await this.queue.setStepData(this.workflowJobId, stepName, raw)
@@ -77,17 +70,10 @@ export class WorkflowStep<Progress = never> {
 
   async do<R>(
     stepName: string,
-    run: (ctx: {
-      step: WorkflowStep<Progress>
-      span: Span
-      /** Aborts when the job's claim is lost, see `WorkflowRunContext.signal`. */
-      signal: AbortSignal
-    }) => R,
+    run: (ctx: { step: WorkflowStep<Progress>; span: Span; signal: AbortSignal }) => R,
   ) {
     const name = this.addNamePrefix(stepName)
 
-    // Memoize on completion only: a stored `result` field means the step finished on a prior
-    // attempt, so a job-level retry replays it from cache and only re-runs the failed step.
     const stepData = this.getStepData('do', name)
     if (stepData && 'result' in stepData) {
       this.logger?.debug?.(
@@ -96,7 +82,6 @@ export class WorkflowStep<Progress = never> {
       return stepData.result as R
     }
 
-    // Cooperative cancellation: bail before starting new work if the claim was lost.
     this.signal.throwIfAborted()
 
     this.logger?.debug?.(`[${this.workflowId}/${this.workflowJobId}] Running step '${name}'`)
@@ -174,8 +159,6 @@ export class WorkflowStep<Progress = never> {
         this.logger?.debug?.(
           `[${this.workflowId}/${this.workflowJobId}] Waiting in step '${name}' for ${durationMs} ms`,
         )
-        // Durable sleep survives resume: remaining time is computed from the persisted start.
-        // Signal-aware so a lost claim aborts the sleep instead of holding slots until it elapses.
         const remainingMs = Math.max(0, stepData.startedAt + stepData.durationMs - Date.now())
         await setTimeout(remainingMs, undefined, { signal: this.signal })
       },

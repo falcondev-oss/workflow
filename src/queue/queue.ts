@@ -19,10 +19,6 @@ import { localTimeZone, nextRunMs } from './schedule'
 import { PMAX, UNLIMITED } from './scripts'
 import { Worker } from './worker'
 
-/**
- * One workflow instance. Enqueues jobs, mints workers, and blocks on `wait()`. `data` is
- * an opaque string end-to-end; serialization is the caller's job.
- */
 export class Queue {
   private readonly workers = new Set<Worker>()
 
@@ -31,7 +27,6 @@ export class Queue {
   readonly groupConcurrency: number
   readonly resultTtl: number
   readonly redis: QueueRedis
-  /** `reserve`'s trailing ARGV: `count, name, limit, window, …`. */
   readonly rateLimitArgs: (string | number)[]
 
   constructor(
@@ -53,22 +48,11 @@ export class Queue {
     ]
   }
 
-  /** Guard the range that keeps the packed score exact in a ZSET double. */
   private validatePriority(priority: number): void {
     if (!Number.isSafeInteger(priority) || priority < 0 || priority > PMAX)
       throw new RangeError(`priority must be an integer in 0…${PMAX}, got ${priority}`)
   }
 
-  /**
-   * Turn a `done` publish into the result. The finalize scripts publish the record itself, so
-   * this is normally pure JS — no second read of the key the notification just carried.
-   *
-   * The fallback is not dead: the payload is a wire format shared with *other processes*, which
-   * may be running an older build whose `complete` publishes a bare `"1"`. During any rolling
-   * deploy both shapes are on the channel at once, so a non-record payload is treated as a bare
-   * wake-up and re-read from the result key (`ResultExpiredError` if it has aged out) — exactly
-   * the pre-change behaviour.
-   */
   private async parsePublished(jobId: string, published: string): Promise<QueueEvent> {
     if (!published.startsWith('{')) {
       const stored = await this.redis.get(`${this.prefix}:${this.id}:result:${jobId}`)
@@ -103,7 +87,7 @@ export class Queue {
     ) {
       const error = new Error(record.reason)
       if ('stack' in record && typeof record.stack === 'string' && record.stack)
-        // eslint-disable-next-line unicorn/no-error-property-assignment -- rehydrates the remote stack
+        // eslint-disable-next-line unicorn/no-error-property-assignment
         error.stack = record.stack
       return { type: 'failed', error }
     }
@@ -125,12 +109,10 @@ export class Queue {
     return this.ns.logger
   }
 
-  /** Enqueue an immediate job. Throws `JobAlreadyExistsError` on a live id collision. */
   async add(data: string, opts?: AddOptions): Promise<{ id: string; groupId: string }> {
     const id = opts?.jobId ?? randomUUID()
     const groupId = opts?.groupId ?? randomUUID()
     const priority = opts?.priority ?? 0
-    // An out-of-range or fractional priority would corrupt score packing / ordering.
     this.validatePriority(priority)
     if (opts?.runAt !== undefined && opts?.runIn !== undefined)
       throw new Error('`runAt` and `runIn` are mutually exclusive')
@@ -162,13 +144,6 @@ export class Queue {
     return worker
   }
 
-  /**
-   * Block until `jobId` finishes and return its raw result string. Subscribes to the
-   * done channel *before* reading the result key, so the terminal publish can't be missed.
-   * The publish carries the result record itself, so the common path is one `GET` (the
-   * already-finished check) and then the notification — never a second read.
-   * Throws `TimeoutError`, `ResultExpiredError`, or the job's own failure.
-   */
   async wait(jobId: string, opts?: WaitOptions): Promise<string> {
     const controller = new AbortController()
     const timer =
@@ -187,7 +162,6 @@ export class Queue {
     }
   }
 
-  /** Subscribe before checking for an existing result, then stream every later lifecycle event. */
   async watch(jobId: string, opts?: WatchOptions): Promise<ReadableStream<QueueEvent>> {
     const channel = `${this.prefix}:${this.id}:done:${jobId}`
     const resultKey = `${this.prefix}:${this.id}:result:${jobId}`
@@ -240,8 +214,6 @@ export class Queue {
       if (opts?.signal?.aborted) abort()
       else {
         const result = await this.redis.get(resultKey)
-        // GET and Pub/Sub use separate connections. PING the subscriber before using the snapshot
-        // so every event Redis published before that GET is already in `processing`.
         await this.ns.flushWaiters()
         await processing
         if (!done && result !== null) await emit(result)
@@ -262,7 +234,6 @@ export class Queue {
     return events
   }
 
-  /** Publish a transient lifecycle record. Nothing is persisted. */
   async publish(
     jobId: string,
     event: Extract<QueueEvent, { type: 'started' | 'progress' }>,
@@ -270,18 +241,10 @@ export class Queue {
     await this.redis.publish(`${this.prefix}:${this.id}:done:${jobId}`, JSON.stringify(event))
   }
 
-  /** Persist a step's data (opaque string) — a single atomic `HSET` on the `:steps` hash. */
   async setStepData(jobId: string, stepName: string, value: string): Promise<void> {
     await this.redis.hset(`${this.prefix}:${this.id}:j:${jobId}:steps`, stepName, value)
   }
 
-  /**
-   * Register (or idempotently replace) a recurring cron schedule keyed by `(wfId, scheduleId)`.
-   * Structurally cannot duplicate: the `schedule:<id>` hash and the single `schedules:due` member
-   * are addressed by `scheduleId`, so upserting the same id twice overwrites in place — one hash,
-   * one due entry — with no `removeRepeatingJob` dance. The timezone is captured from the queuer's
-   * local IANA zone unless overridden. `lastJobId`/`lastFireAt` are preserved across upserts.
-   */
   async upsertSchedule(scheduleId: string, opts: ScheduleOptions): Promise<void> {
     const tz = opts.tz ?? localTimeZone()
     const priority = opts.priority ?? 0
@@ -305,14 +268,12 @@ export class Queue {
       .exec()
   }
 
-  /** Remove a schedule by id: drops its due entry and its record hash. Idempotent. */
   async removeSchedule(scheduleId: string): Promise<void> {
     const scheduleKey = `${this.prefix}:${this.id}:schedule:${scheduleId}`
     const dueKey = `${this.prefix}:${this.id}:schedules:due`
     await this.redis.multi().del(scheduleKey).zrem(dueKey, scheduleId).exec()
   }
 
-  /** List registered schedules with their next-fire time and last-fire bookkeeping. */
   async getSchedules(): Promise<ScheduleInfo[]> {
     const dueKey = `${this.prefix}:${this.id}:schedules:due`
     const entries = await this.redis.zrange(dueKey, 0, '-1', 'WITHSCORES')
@@ -340,12 +301,6 @@ export class Queue {
     return schedules
   }
 
-  /**
-   * Point-in-time queue-depth gauges, read on demand — no counters are maintained. `active` and
-   * `delayed` are O(1) `ZCARD`s; `waiting` sums the per-group waiting ZSETs over the `groups`
-   * membership SET (O(groups)), which is kept in exact step with the waiting jobs so a drained
-   * group is never enumerated.
-   */
   async getMetrics(): Promise<QueueMetrics> {
     const wf = `${this.prefix}:${this.id}`
     const [active, delayed, failed, groups] = await Promise.all([
@@ -364,7 +319,6 @@ export class Queue {
     return { active, waiting, delayed, failed }
   }
 
-  /** Point-in-time snapshot of a group's unfinished jobs: active, waiting in claim order, delayed. */
   async getGroupJobs(groupId: string) {
     const jobs = await this.redis.groupJobs(this.prefix, this.id, groupId)
     return jobs.map(([id, state, data, createdAt]) => ({
@@ -375,7 +329,6 @@ export class Queue {
     }))
   }
 
-  /** Releases queue-owned handles: closes workers and unsubscribes any `wait()` channels. */
   async close(): Promise<void> {
     await Promise.all([...this.workers].map(async (w) => w.close()))
     this.workers.clear()

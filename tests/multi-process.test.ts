@@ -1,14 +1,3 @@
-/**
- * The acceptance criterion the in-process tests structurally cannot cover: several workers in
- * separate OS processes* against one Redis.
- *
- * This matters specifically for the perf rework, which moved three decisions out of Redis and
- * into each worker's own heap — the batch claim, the local slot park, and the local
- * stalled-scan throttle. Every one of those is invisible to peers by construction, so only real
- * processes can show that the Redis-side invariants (exactly-once, the caps, recovery of a
- * killed* process's claims) still hold between them.
- */
-
 import type { Redis } from 'ioredis'
 import type { ChildProcess } from 'node:child_process'
 import type { RateLimiterBudget } from '../src/queue/types'
@@ -32,7 +21,6 @@ afterEach(() => {
   children.length = 0
 })
 
-/** Fork a worker process and resolve once it has started draining. */
 async function spawnWorker(opts: {
   prefix: string
   nsId: string
@@ -76,8 +64,6 @@ test('four worker processes drain a backlog exactly once each', async () => {
   const workflow = ns.createWorkflow({ id: wfId, run: async () => 'ok' })
 
   try {
-    // Enqueue the whole backlog first, so every worker starts against a full queue and they all
-    // race to batch-claim from it — the case where a greedy batch could double-claim.
     const jobs = await Promise.all(
       Array.from({ length: JOBS }, async () => workflow.run(undefined)),
     )
@@ -88,7 +74,6 @@ test('four worker processes drain a backlog exactly once each', async () => {
 
     await Promise.all(jobs.map(async (job) => job.wait(60_000)))
 
-    // Exactly-once across processes: one increment per job, no more.
     expect(await redis.get(`${prefix}:runs`)).toBe(String(JOBS))
     expect(await redis.zcard(`${prefix}:${wfId}:active`)).toBe(0)
     expect(await redis.scard(`${prefix}:ns:${nsId}:active`)).toBe(0)
@@ -120,8 +105,6 @@ test('four worker processes share one start budget', async () => {
     const recorded = await redis.lrange(`${prefix}:starts`, 0, -1)
     const starts = recorded.map(Number).toSorted((a, b) => a - b)
     expect(starts).toHaveLength(32)
-    // Stamped in each handler after the claim, so a loaded process skews a start by its
-    // scheduling lag. A budget that is not shared puts 4x the starts in a window, gaps near 0.
     const tolerance = rateLimit.window / 4
     for (let i = rateLimit.limit; i < starts.length; i++)
       expect(starts[i]! - starts[i - rateLimit.limit]!).toBeGreaterThanOrEqual(

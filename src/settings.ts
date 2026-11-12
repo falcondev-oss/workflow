@@ -9,7 +9,6 @@ const defaultRedisOptions: RedisOptions = {
   enableOfflineQueue: false,
 }
 
-/** Fallback connection for namespaces created without an explicit `redis`, shared process-wide. */
 export const defaultRedisConnection = createSingletonPromise(async () => {
   const redis = new IORedis(defaultRedisOptions)
   await redis.connect()

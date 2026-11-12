@@ -27,7 +27,6 @@ beforeAll(async () => {
   sharedRedis = await connect()
 })
 
-/** Mint a fresh namespace so each test is key-isolated by its random workflow/namespace ids. */
 function namespace() {
   return new WorkflowNamespace({
     id: randomUUID(),
@@ -41,13 +40,11 @@ async function connect() {
   return createRedis({ host: 'localhost', port: Number(process.env.REDIS_PORT) })
 }
 
-/** A one-shot latch: `open()` resolves everyone awaiting `wait()`. */
 function makeGate() {
   const { promise, resolve: open } = Promise.withResolvers<void>()
   return { wait: async () => promise, open }
 }
 
-/** An identity Standard Schema — passes any value straight through (superjson-decoded input). */
 function passthrough<T>(): StandardSchemaV1<T, T> {
   return {
     '~standard': {
@@ -123,7 +120,6 @@ describe('wait', () => {
     await workflow.work({ backoff: () => 0 })
     const job = await workflow.run(undefined)
 
-    // The rejection is a real Error carrying the workflow's own failure reason as its message.
     const err = await job.wait().catch((err_: unknown) => err_)
     expect(err).toBeInstanceOf(Error)
     expect((err as Error).message).toBe('boom')
@@ -132,7 +128,7 @@ describe('wait', () => {
   test('throws TimeoutError when the deadline elapses', async () => {
     const workflow = namespace().createWorkflow({
       id: randomUUID(),
-      run: async () => 'never', // no worker started ⇒ the job never finishes
+      run: async () => 'never',
     })
     const job = await workflow.run(undefined)
 
@@ -140,8 +136,6 @@ describe('wait', () => {
   })
 
   test('throws ResultExpiredError when notified but the result is gone', async () => {
-    // Drive under the seam exactly as the module test does: no worker ever writes a result, so a
-    // `done` publish with no result key must surface as ResultExpiredError through WorkflowJob.wait.
     const redis = await connect()
     const prefix = randomUUID()
     const wfId = randomUUID()
@@ -157,7 +151,6 @@ describe('wait', () => {
     try {
       const job = await workflow.run(undefined)
       const waiting = job.wait()
-      // Race the subscribe registration: keep publishing `done` (no result key) until observed.
       const channel = `${prefix}:${wfId}:done:${job.id}`
       const pump = setInterval(() => void redis.publish(channel, '1'), 20)
       await expect(waiting).rejects.toBeInstanceOf(ResultExpiredError)
@@ -558,7 +551,6 @@ describe('step', () => {
     const step1 = vi.fn(() => 'one')
     let step2Attempt = 0
     const step2 = vi.fn(() => {
-      // Fails on the first attempt only; the job-level retry must re-run just this step.
       if (step2Attempt++ === 0) throw new Error('step2 boom')
       return 'two'
     })
@@ -575,8 +567,8 @@ describe('step', () => {
     const job = await workflow.run(undefined)
 
     await expect(job.wait()).resolves.toEqual({ a: 'one', b: 'two' })
-    expect(step1).toHaveBeenCalledOnce() // completed step is NOT re-executed on replay
-    expect(step2).toHaveBeenCalledTimes(2) // only the failed step re-ran
+    expect(step1).toHaveBeenCalledOnce()
+    expect(step2).toHaveBeenCalledTimes(2)
   })
 
   test('step.do has no step-level retry — a throw fails the whole job (default maxAttempts 1)', async () => {
@@ -587,11 +579,10 @@ describe('step', () => {
       id: randomUUID(),
       run: async ({ step }) => step.do('s', stepHandler),
     })
-    await workflow.work() // maxAttempts default 1 ⇒ no retry at all
+    await workflow.work()
 
     const job = await workflow.run(undefined)
     await expect(job.wait()).rejects.toThrow('flaky')
-    // A retired step-level retry would have re-invoked the handler; it runs exactly once.
     expect(stepHandler).toHaveBeenCalledOnce()
   })
 
@@ -671,7 +662,6 @@ describe('groups', () => {
   })
 })
 
-/** Run `jobs` overlapping jobs through one worker and report the most ever in flight at once. */
 async function peakInFlight(opts: {
   declared?: number
   requested?: number
@@ -721,9 +711,6 @@ test('job data that no longer matches the schema warns and fails without retryin
   })
   const wfId = randomUUID()
 
-  // Enqueue under the old (permissive) schema, then work it under the new (stricter) one —
-  // exactly the shape of a job left in the queue across a schema change.
-  // A retry would re-read the same stored payload, so the budget must go unused.
   const oldVersion = ns.createWorkflow({
     id: wfId,
     run: async () => 'ok',
@@ -808,7 +795,6 @@ test('upsertSchedule is idempotent — re-upserting the same id replaces, never 
     tz: 'UTC',
   })
 
-  // Keyed by (workflow, scheduleId): the second upsert overwrites in place — no duplicate.
   const schedules = await workflow.getSchedules()
   expect(schedules).toHaveLength(1)
   expect(schedules[0]).toMatchObject({ scheduleId: 'nightly', pattern: '*/5 * * * *' })
@@ -825,7 +811,6 @@ describe('durable sleep', () => {
         const start = Date.now()
         await step.wait('nap', DURATION)
         waitMs.push(Date.now() - start)
-        // Force one retry so the SECOND run resumes an already-elapsed sleep.
         if (waitMs.length === 1) throw new Error('force retry')
         return 'done'
       },
@@ -834,16 +819,11 @@ describe('durable sleep', () => {
     const job = await workflow.run(undefined)
 
     await expect(job.wait()).resolves.toBe('done')
-    // First attempt sleeps ~full duration; the resumed attempt computes remaining≈0 from the
-    // persisted startedAt and returns near-instantly. A resume that re-slept the full duration
-    // (ignoring startedAt) would push waitMs[1] up near DURATION.
     expect(waitMs[0]).toBeGreaterThanOrEqual(DURATION - 50)
     expect(waitMs[1]).toBeLessThan(DURATION / 2)
   })
 
   test('step.wait is signal-aware: losing the claim aborts the sleep and skips the commit', async () => {
-    // Covers cancellation end-to-end: a stolen claim aborts ctx.signal, the signal-aware sleep
-    // rejects, and the token-guarded commit never writes a result (no double-commit).
     const redis = await connect()
     const prefix = randomUUID()
     const wfId = randomUUID()
@@ -862,31 +842,27 @@ describe('durable sleep', () => {
       run: async ({ step }) => {
         started.open()
         try {
-          await step.wait('long', 10_000) // signal-aware in-process sleep
+          await step.wait('long', 10_000)
         } catch {
-          aborted = true // the AbortError from the lost claim propagated cooperatively
+          aborted = true
           throw new Error('aborted')
         }
         committed = true
         return 'done'
       },
     })
-    // Short lock ⇒ heartbeat ~100ms detects the stolen token fast; long re-poll so no background
-    // recovery re-reserves the claim mid-test.
     await workflow.work({ lockMs: 300, safetyTimeout: 30 })
 
     try {
       const job = await workflow.run(undefined)
       await started.wait()
 
-      // Steal the claim: overwrite the lock with a foreign token (as recovery + re-reserve would).
       await redis.set(`${prefix}:${wfId}:j:${job.id}:lock`, 'foreign-token')
 
       await vi.waitFor(() => {
-        expect(aborted).toBe(true) // heartbeat CAS returned 0 ⇒ ctx.signal aborted the sleep
+        expect(aborted).toBe(true)
       })
       expect(committed).toBe(false)
-      // Token-safe: the aborted worker committed nothing (no result record written).
       expect(await redis.exists(`${prefix}:${wfId}:result:${job.id}`)).toBe(0)
     } finally {
       await ns.close()
@@ -940,7 +916,6 @@ test('a definition enqueues jobs that its handled workflow runs', async () => {
   handled.returns<string>()
   // @ts-expect-error a handled workflow already has its handler
   handled.handle(async () => ({ sent: 'x' }))
-  // Without returns<>(), the handled workflow infers its output from the handler.
   const counted = await namespace()
     .defineWorkflow({ id: randomUUID() })
     .handle(async () => 1)
@@ -963,7 +938,6 @@ test('a definition enqueues jobs that its handled workflow runs', async () => {
 test('priority is numeric — the old high|normal enum is gone', async () => {
   const workflow = namespace().createWorkflow({ id: randomUUID(), run: async () => {} })
 
-  // A string priority is both a type error (enum retired) and rejected at runtime (RangeError).
   await expect(
     // @ts-expect-error priority is a raw number now; 'high'|'normal' was dropped
     workflow.run(undefined, { priority: 'high' }),
@@ -991,10 +965,10 @@ describe('serialization', () => {
     const job = await workflow.run(payload)
     const result = await job.wait()
 
-    expect(seenInput).toEqual(payload) // input round-trips through the payload
+    expect(seenInput).toEqual(payload)
     expect(result.echo).toEqual(payload)
-    expect(result.stepOut).toEqual(new Map([['x', 7n]])) // step-data hash round-trips
-    expect(result.total).toBe(49n) // BigInt arithmetic proves it stayed a real bigint end-to-end
+    expect(result.stepOut).toEqual(new Map([['x', 7n]]))
+    expect(result.total).toBe(49n)
   })
 })
 
@@ -1002,12 +976,10 @@ test('retired surface is absent (keepCompleted / step retry / repeat / removeRep
   const workflow = namespace().createWorkflow({
     id: randomUUID(),
     run: async ({ step }) =>
-      // step.do takes no options bag — step-level `retry` was retired.
       // @ts-expect-error step-level retry option no longer exists
       step.do('s', () => 1, { retry: 3 }),
   })
 
-  // The groupmq-era `removeRepeatingJob` patch is gone from the workflow surface entirely.
   expect((workflow as unknown as Record<string, unknown>).removeRepeatingJob).toBeUndefined()
 
   await workflow.work({
@@ -1019,25 +991,11 @@ test('retired surface is absent (keepCompleted / step retry / repeat / removeRep
     // @ts-expect-error `repeat` was retired from run options (use upsertSchedule)
     repeat: '* * * * *',
   })
-  // The retired options are ignored, not honored: the job still runs once and completes.
   await expect(job.wait()).resolves.toBe(1)
 })
 
-// ---------------------------------------------------------------------------
-// Step memo prefetch + `done` publish payload (perf rework)
-//
-// Step data now rides along with the claim instead of being read per step, and the `done`
-// publish carries the result record instead of a bare wake-up. Both are cross-process wire
-// contracts, so they need to hold for a worker that never saw the earlier attempt and for a
-// peer still running the older shape.
-// ---------------------------------------------------------------------------
-
 describe('step memo prefetch', () => {
   test('a retry picked up by a different worker still replays completed steps', async () => {
-    // The memo is seeded from the step hash that `reserve` ships with the claim. Two workers on
-    // separate connections means the retry can land on a worker whose heap never held this
-    // job's step data — the prefetch is the only thing that can carry it across.
-    // `namespace()` shares the suite-wide connection, so it must not be closed here.
     const ns = namespace()
     const stepA = vi.fn(async () => 'a')
     const stepB = vi.fn(async () => 'b')
@@ -1060,7 +1018,6 @@ describe('step memo prefetch', () => {
     const job = await workflow.run(undefined, { maxAttempts: 5 })
     await expect(job.wait(15_000)).resolves.toBe('done')
 
-    // Step 'a' completed on attempt 1; the replay must return its cached result, not re-run it.
     expect(stepA).toHaveBeenCalledOnce()
     expect(stepB).toHaveBeenCalledOnce()
     expect(attempts).toBe(2)
@@ -1068,9 +1025,6 @@ describe('step memo prefetch', () => {
 })
 
 test('a bare "1" done publish (an older peer) still resolves via the result key', async () => {
-  // The publish payload is a wire format shared with other processes. During a rolling deploy a
-  // peer running the previous build publishes `"1"` with the record only in the result key —
-  // that must still resolve, not be parsed as a result.
   const redis = await connect()
   const prefix = randomUUID()
   const wfId = randomUUID()
@@ -1087,7 +1041,6 @@ test('a bare "1" done publish (an older peer) still resolves via the result key'
     const job = await workflow.run(undefined)
     const waiting = job.wait(10_000)
 
-    // Write the record the way the old code did, then ring the old doorbell.
     const resultKey = `${prefix}:${wfId}:result:${job.id}`
     const channel = `${prefix}:${wfId}:done:${job.id}`
     const record = { state: 'completed', value: stringify('legacy') }
@@ -1164,7 +1117,6 @@ describe('rate limits', () => {
     ).toEqual([1, 2, 3, 4, 5])
     for (let i = 1; i < starts.length; i++)
       expect(starts[i]! - starts[i - 1]!).toBeGreaterThanOrEqual(90)
-    // BRPOP at Redis's default hz can add another 100 ms to each interval.
     expect(starts.at(-1)! - starts[0]!).toBeLessThan(650)
   })
 
@@ -1271,7 +1223,6 @@ describe('rate limits', () => {
     const nextJob = await a.run(undefined)
     const next = await nextJob.wait(1000)
     expect(next - first).toBeGreaterThanOrEqual(190)
-    // The short writer must also preserve the long start when extending the log's TTL.
     expect(await long.getRateLimiterMetrics()).toEqual({ api: { starts: 2, pausedMs: 0 } })
   })
 
@@ -1690,7 +1641,6 @@ test('observes each limiter once per meter and traces pauses without errors', as
   })
   await wf.work()
   await other.work()
-  // Two workflow callbacks, one namespace callback for their shared meter.
   expect(register).toHaveBeenCalledTimes(3)
   const job = await wf.run(undefined)
   await vi.waitFor(async () => {
@@ -1838,7 +1788,6 @@ test('records attempt outcomes, attempts, stalls, steps and cron fire delay', as
   ]
   expect(points('workflow_jobs')).toEqual(expect.arrayContaining(byOutcome))
   expect(points('workflow_jobs')).toHaveLength(4)
-  // Every claim: retry, limit and stall are claimed twice.
   expect(points('workflow_queue_wait_ms')).toEqual([{ value: 8 }])
   expect(points('workflow_duration_ms')).toEqual(expect.arrayContaining(byOutcome))
   const terminal = [
@@ -1850,12 +1799,10 @@ test('records attempt outcomes, attempts, stalls, steps and cron fire delay', as
   const completedAttempts = metric('workflow_attempts').dataPoints.find(
     (point) => point.attributes.outcome === 'completed' && point.attributes.workflow_id === wf.id,
   )!.value as { sum: number }
-  // ok, limit and stall finish on their first attempt, retry on its second.
   expect(completedAttempts.sum).toBe(5)
   expect(points('workflow_stalled')).toEqual([{ result: 'requeued', value: 1 }])
   expect(points('workflow_step_duration_ms')).toEqual([{ step: 'a', value: 1 }])
   expect(points('workflow_failed_jobs')).toEqual([{ value: 1 }])
-  // A stall dead-letter is no handler attempt, but it ends the job.
   const deadLettered = [{ outcome: 'failed', value: 1 }]
   expect(points('workflow_stalled', doomed.id)).toEqual([{ result: 'failed', value: 1 }])
   expect(points('workflow_attempts', doomed.id)).toEqual(deadLettered)

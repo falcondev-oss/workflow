@@ -10,15 +10,10 @@ import { localTimeZone, nextRunMs } from './schedule'
 
 export type WorkerHandler = (job: ReservedJob, ctx: JobContext) => Promise<string> | string
 
-/**
- * Max jobs claimed per `reserve`. Redis runs Lua single-threaded, so the batch is a pause for
- * every* client sharing the instance — a worker with `concurrency: 500` must not turn one wake
- * into thousands of serialized commands. Filling a larger `concurrency` just takes more passes,
- * which cost one round-trip each and keep the instance responsive in between.
- */
 const RESERVE_BATCH_CAP = 64
 
-/** Redis' `[field, value, …]` hash reply as a Map. */
+const redisRetryBackoff = expBackoff({ base: 250, cap: 5000 })
+
 function flatToMap(flat: string[]): Map<string, string> {
   const map = new Map<string, string>()
   for (let i = 0; i < flat.length; i += 2) map.set(flat[i]!, flat[i + 1]!)
@@ -28,35 +23,18 @@ function flatToMap(flat: string[]): Map<string, string> {
 interface Claim {
   job: ReservedJob
   token: string
-  /** Ms since enqueue at claim time (Redis clock), the base of the end-to-end duration. */
   ageMs: number
 }
 
 interface ReserveResult {
   claims: Claim[]
-  /** Ms until the next delayed job is due (`-1` none, `0` already due). */
   msToNext: number
-  /** Ms until the nearest cron occurrence (`-1` none, `0` already due). */
   msToSchedule: number
-  /** `[scheduleId, score, …]` of the schedules due right now. */
   dueSchedules: string[]
-  /** A concurrency cap or rate limit stopped the batch. */
   maxed: boolean
-  /** Ms until a rate limit admits a start, or -1 if it did not stop the batch. */
   msToLimit: number
 }
 
-/**
- * Runs jobs for one workflow. A JS-local semaphore (`concurrency`) is the per-worker cap —
- * no Redis round-trip. Each pass makes exactly one `reserve` call that claims a batch (capped at
- * `RESERVE_BATCH_CAP`) and reports the delayed/cron timers, then parks one of two ways:
- *
- * - **slots free** — `BRPOP wf:wake ns:wake <safetyTimeout>` on its own connection. Enqueue and
- *   every release `LPUSH` those wake lists, so new work anywhere re-drives the loop.
- * - **every slot busy** — an in-process wait for a slot to free. Nothing Redis could say is
- *   actionable while saturated, and the next actionable event is local, so this costs no
- *   round-trip; a completion re-drives the loop the instant it lands.
- */
 export class Worker {
   private readonly concurrency: number
   private readonly lockMs: number
@@ -90,8 +68,6 @@ export class Worker {
   ) {
     this.concurrency = opts?.concurrency ?? 1
     this.lockMs = opts?.lockMs ?? 30_000
-    // Derived, not exposed: renew ~3× within lockMs, capped at 10s so long locks still
-    // renew often enough that a single missed tick can't stall a healthy job.
     this.heartbeatInterval = Math.min(this.lockMs / 3, 10_000)
     this.maxStalledCount = opts?.maxStalledCount ?? 1
     this.stalledInterval = opts?.stalledInterval ?? 30_000
@@ -111,62 +87,42 @@ export class Worker {
   }
 
   private async loop(): Promise<void> {
-    if (this.blockingRedis.status === 'wait') await this.blockingRedis.connect()
+    let failures = 0
     while (!this.closing) {
-      // One round-trip per pass: claim a batch, promote due delayed jobs, and read both timers.
-      // A locally saturated worker still calls it with `want = 0` — promotion and the cron tick
-      // must keep happening while every slot is busy.
-      const want = Math.min(this.concurrency - this.inFlight, RESERVE_BATCH_CAP)
-      const res = await this.reserve(want)
-      // Start what we claimed even while closing: these jobs hold real locks and slots in Redis,
-      // and dropping them here would strand them until stalled-recovery — on every clean
-      // shutdown. `close` drains `inProgress`, so starting them is what makes the drain honest.
-      for (const claim of res.claims) this.start(claim)
-      if (this.closing) break
-
-      // Fire any due cron occurrences into waiting — no separate poller; the tick folds into
-      // this same wake loop. Firing kicks `wake`, so the next pass picks the occurrence up.
-      if (res.dueSchedules.length > 0) {
-        await this.tickSchedules(res.dueSchedules)
-        continue
+      try {
+        if (this.blockingRedis.status === 'wait') await this.blockingRedis.connect()
+        await this.pass()
+        failures = 0
+      } catch (err) {
+        this.onError(err)
+        if (!this.closing) await this.waitForSlot(redisRetryBackoff(++failures))
       }
-      const saturated = this.inFlight >= this.concurrency
-      // The batch cap, not an empty queue, ended this pass — go straight back for the next chunk.
-      if (!saturated && res.claims.length === want) continue
-      // Due work remained past the promote cap — re-reserve at once to drain the next chunk,
-      // unless a ceiling (not an empty queue) is what stopped us, which would spin.
-      if (!saturated && res.msToNext === 0 && !res.maxed) continue
-      // Block until woken (new work / freed slot / enqueued delay), the next delayed job or
-      // schedule comes due, or the safety re-poll fires — whichever is sooner. The block is the
-      // timer for both delayed jobs and schedules.
-      // Only *future* timers count: a `0` here means due work we just decided we cannot take
-      // (capped out), and folding it in would mean `brpop … 0` — which blocks forever, not
-      // "immediately" — or a hot `waitForSlot(0)` spin. Falling back to `safetyTimeout` is what
-      // the pre-batch code did in exactly this state.
-      const nearest = [res.msToNext, res.msToSchedule, res.msToLimit].filter((m) => m > 0)
-      const timeout =
-        nearest.length === 0
-          ? this.safetyTimeout
-          : Math.min(Math.min(...nearest) / 1000, this.safetyTimeout)
-      // With every slot busy there is nothing Redis could tell us that we could act on, and the
-      // next thing we *can* act on — a slot freeing — is local. Park on it and skip the round
-      // trip entirely; a completion re-drives the loop the instant it lands.
-      // Redis blocking timeouts can fire 100 ms late. Rate limits need the local timer.
-      if (saturated || res.msToLimit > 0) await this.waitForSlot(timeout * 1000)
-      else await this.blockingRedis.brpop(this.wfWake, this.nsWake, timeout)
-      // Wake-loop re-poll is the idle-worker stalled-recovery trigger — no dedicated poller.
-      if (!this.closing) void this.recoverStalled()
     }
   }
 
-  /**
-   * The thin JS cron tick, folded into the wake loop — no poller. `reserve` hands back the due
-   * schedules (`[scheduleId, score, …]`), this computes each one's `nextRun(max(now, score))` via
-   * Croner and calls the `fireSchedule` CAS script with the score it saw. CAS-on-score =
-   * exactly-once across N workers; computing next in JS *before* the call = crash-safe. A backlog
-   * after downtime collapses to one fire because `nextRun(now)` jumps forward. Errors are
-   * best-effort logged.
-   */
+  private async pass(): Promise<void> {
+    const want = Math.min(this.concurrency - this.inFlight, RESERVE_BATCH_CAP)
+    const res = await this.reserve(want)
+    for (const claim of res.claims) this.start(claim)
+    if (this.closing) return
+
+    if (res.dueSchedules.length > 0) {
+      await this.tickSchedules(res.dueSchedules)
+      return
+    }
+    const saturated = this.inFlight >= this.concurrency
+    if (!saturated && res.claims.length === want) return
+    if (!saturated && res.msToNext === 0 && !res.maxed) return
+    const nearest = [res.msToNext, res.msToSchedule, res.msToLimit].filter((m) => m > 0)
+    const timeout =
+      nearest.length === 0
+        ? this.safetyTimeout
+        : Math.min(Math.min(...nearest) / 1000, this.safetyTimeout)
+    if (saturated || res.msToLimit > 0) await this.waitForSlot(timeout * 1000)
+    else await this.blockingRedis.brpop(this.wfWake, this.nsWake, timeout)
+    if (!this.closing) void this.recoverStalled()
+  }
+
   private async tickSchedules(due: string[]): Promise<void> {
     try {
       for (let i = 0; i < due.length && !this.closing; i += 2) {
@@ -174,11 +130,10 @@ export class Worker {
         const expectedScore = due[i + 1]!
         const scheduleKey = `${this.queue.prefix}:${this.queue.id}:schedule:${scheduleId}`
         const [pattern, tz] = await this.redis.hmget(scheduleKey, 'pattern', 'tz')
-        if (!pattern) continue // removed concurrently
-        // A worker clock behind Redis would otherwise compute the occurrence being fired again.
+        if (!pattern) continue
         const from = new Date(Math.max(Date.now(), Number(expectedScore)))
         const next = nextRunMs(pattern, tz ?? localTimeZone(), from)
-        if (next === null) continue // no future occurrence
+        if (next === null) continue
         const [fired] = await this.redis.fireSchedule(
           this.queue.prefix,
           this.queue.id,
@@ -198,12 +153,6 @@ export class Worker {
     }
   }
 
-  /**
-   * Fire the throttled stalled-recovery scan. Redis owns the cross-process gate; the local
-   * timestamp keeps this worker from paying a round-trip per wake to be told so — during a fast
-   * drain that is one saved command every time round the loop. Either way some worker scans
-   * within `stalledInterval`, which is the only guarantee recovery makes.
-   */
   private async recoverStalled(): Promise<void> {
     const now = Date.now()
     if (now - this.lastStalledScan < this.stalledInterval) return
@@ -221,13 +170,11 @@ export class Worker {
       )
       this.metrics?.stalled(requeued, deadLettered)
     } catch (err) {
-      // The scan never happened, so it must not count against the local throttle.
       this.lastStalledScan = 0
       this.onError(err)
     }
   }
 
-  /** Claim up to `want` jobs (0 = report only) and read back both wake timers, in one call. */
   private async reserve(want: number): Promise<ReserveResult> {
     const [jobs, msToNext, msToSchedule, dueSchedules, maxed, msToLimit] = await this.redis.reserve(
       this.queue.prefix,
@@ -276,11 +223,6 @@ export class Worker {
     this.inProgress.add(promise)
   }
 
-  /**
-   * Park until a slot frees locally (or `timeoutMs` elapses) — the zero-round-trip block. There
-   * is only ever one waiter, the single wake loop, so this is one nullable callback rather than
-   * a waiter list.
-   */
   private async waitForSlot(timeoutMs: number): Promise<void> {
     const { promise, resolve } = Promise.withResolvers<void>()
     const timer = setTimeout(resolve, timeoutMs)
@@ -301,7 +243,6 @@ export class Worker {
     const stopHeartbeat = this.startHeartbeat(claim, controller)
     const start = performance.now()
     let durationMs = 0
-    // Recorded only once Redis commits the outcome: a stale-token finalize is another claim's.
     const settled = (outcome: AttemptOutcome) =>
       this.metrics?.attempt(
         outcome,
@@ -323,9 +264,6 @@ export class Worker {
         durationMs = performance.now() - start
       }
       await started
-      // Abort-on-lost-claim: the heartbeat aborted because the claim was recovered
-      // and re-reserved elsewhere — drop the job without committing. The token-guard on
-      // complete/fail makes those no-ops anyway, but skipping avoids the wasted round-trip.
       if (controller.signal.aborted) return
       const record = JSON.stringify({ state: 'completed', value: result })
       const completed = await this.redis.complete(
@@ -364,13 +302,6 @@ export class Worker {
     }
   }
 
-  /**
-   * Renew the claim on a derived timer. A token-CAS renew returning 0 (the claim was
-   * recovered + re-reserved elsewhere) or erroring past `lockMs` aborts `ctx.signal` and stops
-   * the timer, so a cooperative handler can bail and `process` drops the job. Each successful
-   * tick also fires the throttled stalled scan — the busy-worker recovery trigger.
-   * Returns a stop function.
-   */
   private startHeartbeat(claim: Claim, controller: AbortController): () => void {
     let lastRenew = Date.now()
     const timer = setInterval(() => {
@@ -391,7 +322,6 @@ export class Worker {
           lastRenew = Date.now()
           void this.recoverStalled()
         } catch (err) {
-          // A transient renew error is tolerated until the lock could actually have expired.
           if (Date.now() - lastRenew >= this.lockMs) {
             controller.abort()
             clearInterval(timer)
@@ -403,17 +333,8 @@ export class Worker {
     return () => clearInterval(timer)
   }
 
-  /**
-   * Route a handler throw through the token-guarded `fail` script: it increments `attempts`
-   * and either requeues via the delayed ZSET after `backoff` (releasing all slots) or
-   * dead-letters. `attemptsMade` counts prior attempts, so the attempt that just failed is
-   * `attemptsMade + 1`. Backoff `runAt` is computed here (JS) and stored verbatim as the score.
-   * Returns the script's result: 0 stale token, 1 dead-lettered, 2 requeued.
-   */
   private async fail(claim: Claim, err: unknown): Promise<number> {
     const error = err instanceof Error ? err : new Error(String(err))
-    // Best-effort local failure notification — fires on every handler failure, retryable or
-    // terminal.
     this.onFailed(claim.job, error)
     const runAt = Date.now() + this.backoff(claim.job.attemptsMade + 1)
     try {
@@ -436,10 +357,8 @@ export class Worker {
     }
   }
 
-  /** Stop accepting work, drain in-flight jobs, then quit the blocking connection. */
   async close(): Promise<void> {
     this.closing = true
-    // Unblock the loop so it can observe `closing`, whichever way it is parked.
     this.wakeSlot?.()
     await this.redis.lpush(this.wfWake, '1')
     await this.redis.ltrim(this.wfWake, 0, 0)
