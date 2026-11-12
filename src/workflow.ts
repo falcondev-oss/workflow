@@ -27,21 +27,17 @@ import { runWithTracing } from './tracer'
 
 export type { WorkflowEvent } from './job'
 
-/** Per-workflow queue overrides (module `QueueOptions` minus the id). */
 export type WorkflowQueueOptions<Names extends readonly string[] = readonly string[]> = Omit<
   QueueOptions,
   'id' | 'rateLimiters'
 > & {
-  /** Replaces the namespace default list. Use [] to remove every limiter. */
   rateLimiters?: Names
 }
 
-/** Per-workflow worker overrides plus the lib's OTel metrics binding. */
 export type WorkflowWorkerOptions = WorkerOptions & {
   metrics?: MetricsOptions
 }
 
-/** Per-run enqueue overrides (`runAt`/`runIn` are set by `runAt()`/`runIn()`). */
 export type WorkflowJobRunOptions = Omit<AddOptions, 'runAt' | 'runIn'>
 
 export interface WorkflowNamespaceOptions<
@@ -52,17 +48,8 @@ export interface WorkflowNamespaceOptions<
   concurrency?: number
   redis?: Redis
   prefix?: string
-  /** Logger inherited by every workflow, queue and worker of this namespace. Default: none. */
   logger?: WorkflowLogger
-  /**
-   * Close the namespace (draining workers, disconnecting redis) on `SIGINT`/`SIGTERM`/exit.
-   * Default: true.
-   */
   autoClose?: boolean
-  /**
-   * At most limit starts in any window ms. Bursts are allowed; retries and stalled
-   * re-claims count too. Both limit and window must be positive integers.
-   */
   rateLimiters?: Limiters
   queueOptions?: WorkflowQueueOptions<Names>
   workerOptions?: WorkflowWorkerOptions
@@ -87,7 +74,6 @@ export interface CreateWorkflowOptions<
   run: WorkflowHandler<Input, Output, ProgressInput, Names>
 }
 
-/** `createWorkflow` options without `run`, so enqueueing code never loads the handler. */
 export interface DefineWorkflowOptions<
   RunInput,
   Input,
@@ -115,13 +101,6 @@ export interface WorkflowScheduleOptions<RunInput> {
   skipIfRunning?: boolean
 }
 
-/**
- * Owns the shared redis + single pub/sub connection (via the queue module's `Namespace`) and the
- * cross-workflow concurrency cap. Mints workflows whose namespace-level option bags are shallow-
- * merged under each workflow's own overrides. Default concurrency is unlimited (no cross-workflow
- * cap). The module `Namespace` is created lazily so the default (async) redis connection can be
- * resolved on first use.
- */
 export class WorkflowNamespace<
   const Limiters extends Record<string, RateLimiterBudget> = Record<never, never>,
   const Defaults extends readonly (keyof Limiters & string)[] = [],
@@ -160,8 +139,6 @@ export class WorkflowNamespace<
           logger: this.opts.logger,
           rateLimiters: this.opts.rateLimiters,
         })
-        // One namespace-level exit hook: drains every worker and disconnects redis on a
-        // process signal. Opt out with `autoClose: false` to own shutdown yourself.
         if (this.opts.autoClose ?? true) {
           this.unregisterExitHook = asyncExitHook(
             async (signal) => {
@@ -190,10 +167,6 @@ export class WorkflowNamespace<
     return this.defineWorkflow(opts).returns<Output>().handle(opts.run)
   }
 
-  /**
-   * A workflow without its handler: enqueue, schedule and inspect jobs. Attach the handler with
-   * `handle()` in the module the worker process imports.
-   */
   defineWorkflow<
     RunInput,
     Input = RunInput,
@@ -216,16 +189,13 @@ export class WorkflowNamespace<
     })
   }
 
-  /** Point-in-time starts in the current window and pausedMs remaining, per declared limiter. */
   async getRateLimiterMetrics(): Promise<Record<keyof Limiters & string, RateLimiterMetrics>> {
     const namespace = await this.getNamespace()
     return namespace.getRateLimiterMetrics()
   }
 
-  /** Top-level cascade: closes every queue/worker and disconnects the shared connections. */
   async close(): Promise<void> {
     if (!this.namespace) return
-    // Drop the exit hook first: an explicit close means a later signal must not close again.
     this.unregisterExitHook?.()
     this.unregisterExitHook = undefined
     const namespace = await this.namespace
@@ -233,7 +203,6 @@ export class WorkflowNamespace<
   }
 }
 
-/** Enqueues, schedules and inspects jobs. `handle()` attaches the handler a worker runs. */
 export class WorkflowDefinition<
   RunInput,
   Input,
@@ -287,14 +256,11 @@ export class WorkflowDefinition<
           {
             groupId,
             priority: opts?.priority ?? this.opts.jobOptions?.priority,
-            // `maxAttempts` is applied per-job at enqueue time, so a per-workflow retry default
-            // only takes effect if it is passed here.
             maxAttempts:
               opts?.maxAttempts ??
               this.opts.jobOptions?.maxAttempts ??
               this.opts.workerOptions?.maxAttempts,
             jobId: opts?.jobId ?? this.opts.jobOptions?.jobId,
-            // `runAt`/`runIn` are mutually exclusive; pass only the one that was set.
             ...(opts?.runIn === undefined ? { runAt: opts?.runAt } : { runIn: opts.runIn }),
           },
         )
@@ -328,9 +294,6 @@ export class WorkflowDefinition<
     return this.queue
   }
 
-  // The `this` guards keep `returns()` and `handle()` off a `Workflow`, which already has its handler.
-
-  /** Declares the handler's return type, so enqueueing code gets a typed `job.wait()`. */
   returns<T>(this: this & { work?: never }) {
     return new WorkflowDefinition<RunInput, Input, T, ProgressInput, Progress, Names>(
       this.ns,
@@ -344,7 +307,6 @@ export class WorkflowDefinition<
   ): Workflow<
     RunInput,
     Input,
-    // A declared output wins; only an undeclared one is inferred from the handler.
     unknown extends Output ? HandlerOutput : Output,
     ProgressInput,
     Progress,
@@ -390,10 +352,6 @@ export class WorkflowDefinition<
     return this.enqueue(input, { ...opts, runAt: date.getTime() })
   }
 
-  /**
-   * Register (or idempotently replace) a cron schedule. The typed `input` is validated against
-   * `schema` at registration time (fail fast) and stored pre-serialized as opaque `data`.
-   */
   async upsertSchedule(scheduleId: string, opts: WorkflowScheduleOptions<RunInput>): Promise<void> {
     const parsed = this.opts.schema && (await this.opts.schema['~standard'].validate(opts.input))
     if (parsed?.issues) throw new Error('Invalid workflow input')
@@ -419,10 +377,6 @@ export class WorkflowDefinition<
     return queue.getSchedules()
   }
 
-  /**
-   * Point-in-time snapshot of a group's unfinished jobs: active, waiting in claim order, then
-   * delayed. `input` is returned as stored, validated at enqueue. Finished jobs are not included.
-   */
   async getGroupJobs(groupId: string) {
     const queue = await this.getQueue()
     const jobs = await queue.getGroupJobs(groupId)
@@ -432,7 +386,6 @@ export class WorkflowDefinition<
     }))
   }
 
-  /** Point-in-time queue-depth gauges (`active`/`waiting`/`delayed`/`failed`) for this workflow. */
   async getMetrics() {
     const queue = await this.getQueue()
     return queue.getMetrics()
@@ -501,7 +454,6 @@ export class Workflow<
   async work(opts?: WorkflowWorkerOptions): Promise<Worker> {
     const queue = await this.getQueue()
     const { metrics, ...workerOpts } = { ...this.opts.workerOptions, ...opts }
-    // Caps stack, lowest wins. So a shared `work({ concurrency })` can't widen what a workflow set.
     const caps = [this.opts.workerOptions?.concurrency, opts?.concurrency].filter(
       (cap) => cap !== undefined,
     )
@@ -516,8 +468,6 @@ export class Workflow<
         const parsedData =
           this.opts.schema && (await this.opts.schema['~standard'].validate(deserializedData.input))
         if (parsedData?.issues) {
-          // Stored payload no longer matches the schema — typically a job enqueued before a
-          // schema change. Retrying re-reads the same payload, so this can never succeed.
           this.logger?.warn?.(
             `[${this.id}] Job ${job.id} data does not match the workflow schema (stale payload from an older schema version?):`,
             parsedData.issues,
@@ -619,15 +569,6 @@ export interface WorkflowRunContext<Input, Progress = never, Names extends strin
   input: IsUnknown<Input> extends true ? undefined : Input
   step: WorkflowStep<Progress>
   span: Span
-  /**
-   * Aborts when the job's claim is lost: its lock expired or another worker re-reserved it.
-   * Pass it to long-running work so it stops instead of running alongside the retry.
-   */
   signal: AbortSignal
-  /**
-   * Throws and pauses the limiter for every workflow using it, without using an attempt.
-   * A pause never shortens an earlier pause. The name is required with several limiters;
-   * with no limiters, only this workflow pauses. ms must be a positive finite number.
-   */
   rateLimit: RateLimit<Names>
 }

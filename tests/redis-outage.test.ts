@@ -6,7 +6,6 @@ import { Redis } from 'ioredis'
 import { expect, onTestFinished, test, vi } from 'vitest'
 import { WorkflowNamespace } from '../src'
 
-/** A TCP proxy in front of the test Redis that drops every connection while `down`. */
 async function redisProxy() {
   const proxy = { down: true }
   const sockets = new Set<Socket>()
@@ -51,7 +50,6 @@ test('a worker started while Redis is down keeps running and works once Redis is
   const worker = await workflow.work({ onError })
   onTestFinished(async () => worker.close())
 
-  // Before the fix, the failed connect rejected the wake loop and Node exited on the unhandled rejection.
   await vi.waitFor(() => expect(onError).toHaveBeenCalled())
 
   proxy.down = false

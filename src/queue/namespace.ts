@@ -11,11 +11,6 @@ import type {
 import { Queue } from './queue'
 import { registerScripts, UNLIMITED } from './scripts'
 
-/**
- * Owns the shared redis connection, the single pub/sub connection, and the cross-workflow
- * concurrency cap. Mints queues and cascades `close`. The pub/sub connection backs every
- * `wait()`, so waiting works from a pure producer with no worker.
- */
 export class Namespace {
   private readonly subscriber: Redis
   private readonly subscriberReady: Promise<unknown>
@@ -91,7 +86,6 @@ export class Namespace {
     )
   }
 
-  /** Register a waiter on a pub/sub channel; subscribes on first listener. */
   async addWaiter(channel: string, cb: (message: string) => void): Promise<void> {
     await this.subscriberReady
     let set = this.channelListeners.get(channel)
@@ -104,7 +98,6 @@ export class Namespace {
     await this.channelSubscriptions.get(channel)
   }
 
-  /** Remove a waiter; unsubscribes once the channel has no listeners. */
   async removeWaiter(channel: string, cb: (message: string) => void): Promise<void> {
     const set = this.channelListeners.get(channel)
     if (!set) return
@@ -118,12 +111,10 @@ export class Namespace {
     }
   }
 
-  /** Wait until this connection has dispatched every Pub/Sub message Redis sent before the ping. */
   async flushWaiters(): Promise<void> {
     await this.subscriber.ping()
   }
 
-  /** Drains and closes every queue, then disconnects the shared + pub/sub connections. */
   async close(): Promise<void> {
     await Promise.all([...this.queues].map(async (q) => q.close()))
     this.subscriber.disconnect()

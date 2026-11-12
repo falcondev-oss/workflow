@@ -1,24 +1,14 @@
-/**
- * End-to-end benchmark. Spins a real Redis (testcontainers, same image as the tests) and drives
- * the public API — `run()` / `work()` / `job.wait()` — so every number includes serialization,
- * the Lua round-trips, the worker wake loop and pub/sub delivery.
- *
- * Run: `pnpm bench`.
- */
-
 import type { RateLimiterBudget } from '../src/queue/types'
 import { randomUUID } from 'node:crypto'
 import { RedisContainer } from '@testcontainers/redis'
 import { createRedis, WorkflowNamespace } from '../src'
 
-/** Runs per scenario. Throughput on a shared box is noisy; the best run is the least polluted. */
 const RUNS = 3
 
 function report(name: string, value: string, note: string) {
   console.log(`  ${name.padEnd(34)} ${value.padStart(10)} ${note}`)
 }
 
-/** Best of `RUNS` — the run least disturbed by the rest of the machine. */
 async function best(name: string, run: () => Promise<number>) {
   const samples: number[] = []
   for (let i = 0; i < RUNS; i++) samples.push(await run())
@@ -34,10 +24,6 @@ interface RedisAddr {
   port: number
 }
 
-/**
- * A namespace with a fresh id (key isolation) on its own connection — `namespace.close()`
- * disconnects the connection it was handed, so scenarios cannot share one.
- */
 async function makeNamespace(
   addr: RedisAddr,
   opts?: { concurrency?: number; rateLimiters?: Record<string, RateLimiterBudget> },
@@ -48,12 +34,10 @@ async function makeNamespace(
     autoClose: false,
     concurrency: opts?.concurrency,
     rateLimiters: opts?.rateLimiters,
-    // A silently failing job would just stall the scenario forever — make it loud.
     logger: { error: console.error, warn: console.warn },
   })
 }
 
-/** Enqueue `count` jobs through `run()`, `parallel` at a time. */
 async function enqueueAll(run: (i: number) => Promise<unknown>, count: number, parallel: number) {
   for (let i = 0; i < count; i += parallel) {
     await Promise.all(
@@ -62,11 +46,9 @@ async function enqueueAll(run: (i: number) => Promise<unknown>, count: number, p
   }
 }
 
-/** Resolves once `count` jobs have been observed by the worker handler. */
 function makeCounter(count: number) {
   let seen = 0
   const { promise, resolve: done, reject: fail } = Promise.withResolvers<void>()
-  // A job that dies (or never gets reserved) would otherwise hang the run forever.
   const timer = setTimeout(() => fail(new Error(`only ${seen}/${count} jobs ran`)), 120_000)
   return {
     hit: () => {
@@ -78,7 +60,6 @@ function makeCounter(count: number) {
   }
 }
 
-/** Producer-side cost of `run()`: superjson + the `enqueue` script, no worker running. */
 async function benchEnqueue(addr: RedisAddr) {
   const count = 5000
   const ns = await makeNamespace(addr)
@@ -88,7 +69,7 @@ async function benchEnqueue(addr: RedisAddr) {
     run: async () => 1,
   })
 
-  await wf.run(undefined) // warm the lazy queue + script load
+  await wf.run(undefined)
 
   for (const parallel of [1, 50]) {
     await best(`enqueue (${parallel === 1 ? 'serial' : `${parallel} inflight`})`, async () => {
@@ -107,11 +88,9 @@ interface DrainOptions {
   concurrency: number
   groups: number
   steps: number
-  /** This many limiters, each far above the drain rate, so the gate never closes. */
   limiters?: number
 }
 
-/** Steady-state drain: jobs are all enqueued up front, then a worker chews through them. */
 async function benchThroughput(addr: RedisAddr, opts: DrainOptions) {
   await best(opts.name, async () => runDrain(addr, opts))
 }
@@ -152,7 +131,6 @@ async function runDrain(
   return (count / elapsed) * 1000
 }
 
-/** Full round trip a client actually feels: enqueue → execute → pub/sub notify → result read. */
 async function benchLatency(addr: RedisAddr) {
   const count = 300
   const ns = await makeNamespace(addr)

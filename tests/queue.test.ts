@@ -25,7 +25,6 @@ async function connect() {
   return createRedis({ host: 'localhost', port: Number(process.env.REDIS_PORT) })
 }
 
-/** Cardinality of every active structure under a prefix — must be 0 after a full drain. */
 async function activeCounts(prefix: string, wfId: string, nsId: string) {
   const groupActiveKeys = await redis.keys(`${prefix}:${wfId}:g:*:active`)
   let groupActive = 0
@@ -104,11 +103,6 @@ test('add() throws JobAlreadyExistsError on a live id collision', async () => {
   }
 })
 
-// ---------------------------------------------------------------------------
-// Four-level concurrency caps (ticket 03)
-// ---------------------------------------------------------------------------
-
-/** Tracks live count + high-water mark; enter on job start, exit on job end. */
 function makeTracker() {
   let current = 0
   let max = 0
@@ -129,13 +123,11 @@ function makeTracker() {
   }
 }
 
-/** A latch every gated handler awaits, so jobs pile up "running" until released. */
 function makeGate() {
   const { promise, resolve: open } = Promise.withResolvers<void>()
   return { wait: async () => promise, open }
 }
 
-/** Wait until `cap` jobs are running, then prove no extra sneaks in past the cap. */
 async function assertRunsExactly(tracker: ReturnType<typeof makeTracker>, cap: number) {
   await vi.waitFor(() => {
     expect(tracker.current).toBe(cap)
@@ -145,7 +137,6 @@ async function assertRunsExactly(tracker: ReturnType<typeof makeTracker>, cap: n
   expect(tracker.max).toBe(cap)
 }
 
-/** Assert every active structure for each workflow (and the shared namespace) is empty. */
 async function assertDrained(prefix: string, wfIds: string[], nsId: string) {
   await vi.waitFor(async () => {
     expect(await redis.scard(`${prefix}:ns:${nsId}:active`)).toBe(0)
@@ -169,7 +160,6 @@ test('worker cap: only `concurrency` jobs run in a process while the rest wait',
   const nsId = randomUUID()
   const wfId = randomUUID()
   const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
-  // namespace + workflow unlimited; every add its own group (group cap 1 never binds).
   const queue = ns.queue({ id: wfId })
   const tracker = makeTracker()
   const gate = makeGate()
@@ -210,7 +200,7 @@ test('workflow cap: `Queue.concurrency` bounds a workflow even with worker headr
       tracker.exit()
       return 'ok'
     },
-    { concurrency: 10 }, // worker room >> workflow cap, so the workflow cap is what binds
+    { concurrency: 10 },
   )
 
   try {
@@ -229,7 +219,7 @@ test('namespace cap: `Namespace.concurrency` bounds all sibling workflows togeth
   const wfA = randomUUID()
   const wfB = randomUUID()
   const ns = new Namespace({ id: nsId, concurrency: 2, redis: await connect(), prefix })
-  const qA = ns.queue({ id: wfA }) // each workflow unlimited
+  const qA = ns.queue({ id: wfA })
   const qB = ns.queue({ id: wfB })
   const tracker = makeTracker()
   const gate = makeGate()
@@ -246,7 +236,7 @@ test('namespace cap: `Namespace.concurrency` bounds all sibling workflows togeth
   try {
     for (let i = 0; i < 3; i++) await qA.add(`a${i}`)
     for (let i = 0; i < 3; i++) await qB.add(`b${i}`)
-    await assertRunsExactly(tracker, 2) // 2 total across BOTH workflows
+    await assertRunsExactly(tracker, 2)
     gate.open()
     await assertDrained(prefix, [wfA, wfB], nsId)
   } finally {
@@ -255,7 +245,6 @@ test('namespace cap: `Namespace.concurrency` bounds all sibling workflows togeth
 })
 
 test('group cap 1 serializes a group; cap > 1 parallelizes it', async () => {
-  // cap 1
   {
     const prefix = randomUUID()
     const nsId = randomUUID()
@@ -275,7 +264,7 @@ test('group cap 1 serializes a group; cap > 1 parallelizes it', async () => {
     )
     try {
       for (let i = 0; i < 3; i++) await queue.add(`g${i}`, { groupId: 'grp' })
-      await assertRunsExactly(tracker, 1) // serialized
+      await assertRunsExactly(tracker, 1)
       gate.open()
       await assertDrained(prefix, [wfId], nsId)
     } finally {
@@ -283,7 +272,6 @@ test('group cap 1 serializes a group; cap > 1 parallelizes it', async () => {
     }
   }
 
-  // cap 3
   {
     const prefix = randomUUID()
     const nsId = randomUUID()
@@ -303,7 +291,7 @@ test('group cap 1 serializes a group; cap > 1 parallelizes it', async () => {
     )
     try {
       for (let i = 0; i < 5; i++) await queue.add(`g${i}`, { groupId: 'grp' })
-      await assertRunsExactly(tracker, 3) // 3 of one group run at once
+      await assertRunsExactly(tracker, 3)
       gate.open()
       await assertDrained(prefix, [wfId], nsId)
     } finally {
@@ -317,8 +305,6 @@ test('combined gating: a top-gate binds even when group and worker have room', a
   const nsId = randomUUID()
   const wfId = randomUUID()
   const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
-  // workflow cap 2 is the only thing that should bind: group cap 5 and worker cap 5 both
-  // have plenty of room, yet no more than 2 may run.
   const queue = ns.queue({ id: wfId, concurrency: 2, groupConcurrency: 5 })
   const tracker = makeTracker()
   const gate = makeGate()
@@ -333,7 +319,6 @@ test('combined gating: a top-gate binds even when group and worker have room', a
   )
 
   try {
-    // 4 jobs across 2 groups (2 each): groups could run 2 apiece, worker could run 5.
     for (let i = 0; i < 2; i++) await queue.add(`x${i}`, { groupId: 'A' })
     for (let i = 0; i < 2; i++) await queue.add(`y${i}`, { groupId: 'B' })
     await assertRunsExactly(tracker, 2)
@@ -363,11 +348,8 @@ test('a capped group does not block a runnable sibling group (no head-of-line st
   )
 
   try {
-    // Group A is enqueued first with 3 jobs (cap 1 ⇒ 2 of them are stuck behind the head).
     for (let i = 0; i < 3; i++) await queue.add(`a${i}`, { groupId: 'A' })
-    // Group B has a single job; it must run even though A's backlog sits ahead in time.
     await queue.add('b0', { groupId: 'B' })
-    // One from A + one from B run concurrently; A's cap does not wedge B.
     await assertRunsExactly(tracker, 2)
     gate.open()
     await assertDrained(prefix, [wfId], nsId)
@@ -409,7 +391,6 @@ test('contention invariant: K workers × M jobs, no leak, no cap ever exceeded',
   }
 
   try {
-    // 2 workers per workflow (K = 4 total), each worker cap 2.
     for (const wfId of [wfA, wfB]) {
       for (let w = 0; w < 2; w++) {
         const workerTracker = makeTracker()
@@ -433,7 +414,6 @@ test('contention invariant: K workers × M jobs, no leak, no cap ever exceeded',
       }
     }
 
-    // M jobs per workflow: 3 groups × 2 jobs each = 6, so 12 jobs total.
     for (const wfId of [wfA, wfB]) {
       for (let g = 0; g < 3; g++) {
         for (let j = 0; j < 2; j++) {
@@ -444,36 +424,25 @@ test('contention invariant: K workers × M jobs, no leak, no cap ever exceeded',
 
     await assertDrained(prefix, [wfA, wfB], nsId)
 
-    // No cap was ever exceeded at any level.
     expect(nsTracker.max).toBeLessThanOrEqual(NS_CAP)
     for (const wfId of [wfA, wfB]) expect(wfTrackers[wfId]!.max).toBeLessThanOrEqual(WF_CAP)
     for (const t of groupTrackers.values()) expect(t.max).toBeLessThanOrEqual(GROUP_CAP)
     for (const t of workerTrackers) expect(t.max).toBeLessThanOrEqual(WORKER_CAP)
-    // Sanity: work actually overlapped somewhere (otherwise the caps proved nothing).
     expect(nsTracker.max).toBeGreaterThan(1)
   } finally {
     await ns.close()
   }
 })
 
-// ---------------------------------------------------------------------------
-// Numeric priority ordering (ticket 04)
-// ---------------------------------------------------------------------------
-
-// Ordering is observable only with a single worker at concurrency 1: it pops one job at
-// a time, so the sequence it sees is exactly the queue's chosen order. All jobs are added
-// *before* the worker exists, so the full waiting set is present when it starts draining.
-
 test('priority: higher runs first across groups; default 0 runs after any expedited job', async () => {
   const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
-  const queue = ns.queue({ id: randomUUID() }) // each add = its own group (default cap 1)
+  const queue = ns.queue({ id: randomUUID() })
 
   try {
-    // Enqueue in an order that does NOT match priority order, across distinct groups.
-    await queue.add('p0-a') // default priority 0
+    await queue.add('p0-a')
     await queue.add('p5', { priority: 5 })
     await queue.add('p10', { priority: 10 })
-    await queue.add('p0-b') // default priority 0
+    await queue.add('p0-b')
 
     const order: string[] = []
     queue.worker(
@@ -484,7 +453,6 @@ test('priority: higher runs first across groups; default 0 runs after any expedi
       { concurrency: 1 },
     )
 
-    // Highest priority first; equal-priority (both 0) fall back to FIFO-by-enqueue.
     await vi.waitFor(() => {
       expect(order).toEqual(['p10', 'p5', 'p0-a', 'p0-b'])
     })
@@ -499,7 +467,7 @@ test('priority: equal-priority jobs run FIFO by promotion (enqueue) order', asyn
 
   try {
     const added = ['a', 'b', 'c', 'd', 'e']
-    for (const d of added) await queue.add(d, { priority: 7 }) // all equal priority
+    for (const d of added) await queue.add(d, { priority: 7 })
 
     const order: string[] = []
     queue.worker(
@@ -511,7 +479,7 @@ test('priority: equal-priority jobs run FIFO by promotion (enqueue) order', asyn
     )
 
     await vi.waitFor(() => {
-      expect(order).toEqual(added) // tiebreak = FIFO by the counter stamped at promotion
+      expect(order).toEqual(added)
     })
   } finally {
     await ns.close()
@@ -526,17 +494,12 @@ test('add() rejects an out-of-range or non-integer priority', async () => {
     await expect(queue.add('x', { priority: -1 })).rejects.toBeInstanceOf(RangeError)
     await expect(queue.add('x', { priority: 2 ** 21 })).rejects.toBeInstanceOf(RangeError)
     await expect(queue.add('x', { priority: 1.5 })).rejects.toBeInstanceOf(RangeError)
-    // Boundaries are accepted.
     await queue.add('lo', { priority: 0 })
     await queue.add('hi', { priority: 2 ** 21 - 1 })
   } finally {
     await ns.close()
   }
 })
-
-// ---------------------------------------------------------------------------
-// Mutable step data (ticket 05)
-// ---------------------------------------------------------------------------
 
 test('setStepData writes an opaque string to the job step hash', async () => {
   const prefix = randomUUID()
@@ -548,10 +511,10 @@ test('setStepData writes an opaque string to the job step hash', async () => {
   try {
     const jobId = randomUUID()
     const stepsKey = `${prefix}:${wfId}:j:${jobId}:steps`
-    expect(await conn.hget(stepsKey, 'step-a')).toBeNull() // never written
+    expect(await conn.hget(stepsKey, 'step-a')).toBeNull()
     await queue.setStepData(jobId, 'step-a', 'opaque \n{"x":1}')
     expect(await conn.hget(stepsKey, 'step-a')).toBe('opaque \n{"x":1}')
-    expect(await conn.hget(stepsKey, 'step-b')).toBeNull() // distinct field still missing
+    expect(await conn.hget(stepsKey, 'step-b')).toBeNull()
   } finally {
     await ns.close()
   }
@@ -603,24 +566,18 @@ test(':steps hash is deleted when the job completes', async () => {
   }
 })
 
-// ---------------------------------------------------------------------------
-// Delayed / scheduled jobs (ticket 06)
-// ---------------------------------------------------------------------------
-
 test('runAt stores the absolute score; runIn resolves against the Redis clock', async () => {
   const prefix = randomUUID()
   const wfId = randomUUID()
   const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
-  const queue = ns.queue({ id: wfId }) // no worker: delayed jobs just sit in the ZSET
+  const queue = ns.queue({ id: wfId })
   const delayedKey = `${prefix}:${wfId}:delayed`
 
   try {
-    // Absolute runAt is stored verbatim as the score.
     const runAt = Date.now() + 3_600_000
     const { id: a } = await queue.add('at', { runAt })
     expect(Number(await redis.zscore(delayedKey, a))).toBe(runAt)
 
-    // runIn resolves to `redisNow + runIn`; bracket it with generous skew tolerance.
     const before = Date.now()
     const { id: b } = await queue.add('in', { runIn: 3_600_000 })
     const after = Date.now()
@@ -628,7 +585,6 @@ test('runAt stores the absolute score; runIn resolves against the Redis clock', 
     expect(score).toBeGreaterThanOrEqual(before + 3_600_000 - 2000)
     expect(score).toBeLessThanOrEqual(after + 3_600_000 + 2000)
 
-    // Both are parked as delayed, neither entered the waiting structure.
     expect(await redis.zcard(delayedKey)).toBe(2)
     expect(await redis.zcard(`${prefix}:${wfId}:ready`)).toBe(0)
   } finally {
@@ -654,11 +610,10 @@ test('a past runAt skips the delayed ZSET and enqueues straight into waiting', a
   const prefix = randomUUID()
   const wfId = randomUUID()
   const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
-  const queue = ns.queue({ id: wfId }) // no worker: observe the raw enqueue placement
+  const queue = ns.queue({ id: wfId })
 
   try {
     const { id, groupId } = await queue.add('past', { runAt: Date.now() - 1000 })
-    // Never entered `delayed`; it is immediately runnable in its group's waiting ZSET.
     expect(await redis.zcard(`${prefix}:${wfId}:delayed`)).toBe(0)
     expect(await redis.zscore(`${prefix}:${wfId}:g:${groupId}:jobs`, id)).not.toBeNull()
     expect(await redis.zcard(`${prefix}:${wfId}:ready`)).toBe(1)
@@ -671,23 +626,20 @@ test('promotion order is FIFO-by-due-time, not enqueue order', async () => {
   const prefix = randomUUID()
   const wfId = randomUUID()
   const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
-  const queue = ns.queue({ id: wfId }) // each add its own group ⇒ pure priority/FIFO index
+  const queue = ns.queue({ id: wfId })
   const delayedKey = `${prefix}:${wfId}:delayed`
 
   try {
-    // Enqueue far in the future so nothing auto-promotes, then back-date the stored scores
-    // (no fake clock) so due order (y < z < x) differs from enqueue order (x, y, z).
     const ids: Record<string, string> = {}
     for (const d of ['x', 'y', 'z']) {
       const { id } = await queue.add(d, { runAt: Date.now() + 3_600_000 })
       ids[d] = id
     }
     const base = Date.now() - 10_000
-    await redis.zadd(delayedKey, base + 3, ids.x!) // due last
-    await redis.zadd(delayedKey, base + 1, ids.y!) // due first
-    await redis.zadd(delayedKey, base + 2, ids.z!) // due second
+    await redis.zadd(delayedKey, base + 3, ids.x!)
+    await redis.zadd(delayedKey, base + 1, ids.y!)
+    await redis.zadd(delayedKey, base + 2, ids.z!)
 
-    // Single worker at concurrency 1 observes exactly the promotion (= due) order.
     const order: string[] = []
     queue.worker(
       (job) => {
@@ -714,8 +666,6 @@ test('per-call promote cap drains a larger backlog in chunks', async () => {
   const N = 10
 
   try {
-    // Enqueue future, then back-date every score so all N are due at once — more than the
-    // promote cap, so a single reserve cannot promote them all.
     const base = Date.now() - 10_000
     for (let i = 0; i < N; i++) {
       const { id } = await queue.add(`d${i}`, { runAt: Date.now() + 3_600_000 })
@@ -728,11 +678,9 @@ test('per-call promote cap drains a larger backlog in chunks', async () => {
         seen.add(job.data)
         return 'ok'
       },
-      { concurrency: 2, promoteBatchSize: 3 }, // cap 3 << 10 ⇒ must re-reserve to drain
+      { concurrency: 2, promoteBatchSize: 3 },
     )
 
-    // All eventually run (the worker re-reserves to promote the next chunk), and the
-    // delayed ZSET fully empties.
     await vi.waitFor(() => {
       expect(seen.size).toBe(N)
     })
@@ -753,7 +701,6 @@ test('an idle worker picks up a delayed job when it comes due (block is the time
   })
 
   try {
-    // Worker is idle-blocked; a short-delay job must be promoted and run without a poller.
     const { id } = await queue.add('soon', { runIn: 300 })
     const result = await queue.wait(id)
     expect(result).toBe('ok')
@@ -762,10 +709,6 @@ test('an idle worker picks up a delayed job when it comes due (block is the time
     await ns.close()
   }
 })
-
-// ---------------------------------------------------------------------------
-// Retries, backoff, dead-letter, retention & wait() contract (ticket 07)
-// ---------------------------------------------------------------------------
 
 test('expBackoff jitters within [0, ceiling] and caps the ceiling', () => {
   const b = expBackoff({ base: 100, factor: 2, cap: 1000 })
@@ -796,7 +739,7 @@ test('wait() throws the job failure, carrying its reason', async () => {
 
 test('wait() rejects with TimeoutError when the deadline elapses', async () => {
   const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix: randomUUID() })
-  const queue = ns.queue({ id: randomUUID() }) // no worker ⇒ never finishes
+  const queue = ns.queue({ id: randomUUID() })
 
   try {
     const { id } = await queue.add('x')
@@ -810,12 +753,11 @@ test('wait() rejects with ResultExpiredError when notified but the result is gon
   const prefix = randomUUID()
   const wfId = randomUUID()
   const ns = new Namespace({ id: randomUUID(), redis: await connect(), prefix })
-  const queue = ns.queue({ id: wfId }) // no worker, so no result record is ever written
+  const queue = ns.queue({ id: wfId })
 
   try {
     const jobId = randomUUID()
-    const waiting = queue.wait(jobId) // subscribes, reads null, then blocks on the publish
-    // Race the subscribe registration: publish `done` (no result key) until the waiter observes it.
+    const waiting = queue.wait(jobId)
     const channel = `${prefix}:${wfId}:done:${jobId}`
     const pump = setInterval(() => void redis.publish(channel, '1'), 20)
     await expect(waiting).rejects.toBeInstanceOf(ResultExpiredError)
@@ -841,18 +783,15 @@ test('a retryable failure requeues via delayed, releasing all slots, then re-run
       if (job.attemptsMade === 0) throw new Error('transient')
       return 'ok'
     },
-    // Long backoff so the delayed/slot-released window is observable; back-date to re-run.
     { backoff: () => 10_000, safetyTimeout: 0.2 },
   )
 
   try {
     const { id } = await queue.add('x', { maxAttempts: 2 })
 
-    // The first failure requeues the job into `delayed` (not terminal).
     await vi.waitFor(async () => {
       expect(await redis.zscore(delayedKey, id)).not.toBeNull()
     })
-    // During backoff every concurrency slot is freed — only the delayed parking remains.
     const counts = await activeCounts(prefix, wfId, nsId)
     expect(counts.wfActive).toBe(0)
     expect(counts.nsActive).toBe(0)
@@ -860,7 +799,6 @@ test('a retryable failure requeues via delayed, releasing all slots, then re-run
     expect(counts.ready).toBe(0)
     expect(attempts).toEqual([0])
 
-    // Make it due and kick the worker; it promotes, re-runs (attemptsMade now 1), and completes.
     await redis.zadd(delayedKey, Date.now() - 1000, id)
     await redis.lpush(wfWake, '1')
     expect(await queue.wait(id)).toBe('ok')
@@ -880,16 +818,15 @@ test('maxAttempts exhaustion dead-letters to the failed ZSET', async () => {
   })
 
   try {
-    const { id } = await queue.add('x') // maxAttempts default 1 ⇒ first failure is terminal
+    const { id } = await queue.add('x')
     await expect(queue.wait(id)).rejects.toThrow('always')
 
     expect(await redis.zscore(`${prefix}:${wfId}:failed`, id)).not.toBeNull()
     const hash = await redis.hgetall(`${prefix}:${wfId}:j:${id}`)
     expect(hash.state).toBe('failed')
     expect(hash.failedReason).toBe('always')
-    expect(hash.attempts).toBe('1') // incremented in Lua, not JS
-    expect(hash.stalledCount).toBe('0') // separate budget, untouched
-    // The claim was released and step data cleared.
+    expect(hash.attempts).toBe('1')
+    expect(hash.stalledCount).toBe('0')
     expect(await redis.zcard(`${prefix}:${wfId}:active`)).toBe(0)
     expect(await redis.exists(`${prefix}:${wfId}:j:${id}:steps`)).toBe(0)
   } finally {
@@ -918,7 +855,7 @@ test('nonRecoverableError dead-letters immediately, skipping the remaining maxAt
     expect(await redis.zscore(`${prefix}:${wfId}:delayed`, id)).toBeNull()
     const hash = await redis.hgetall(`${prefix}:${wfId}:j:${id}`)
     expect(hash.state).toBe('failed')
-    expect(hash.attempts).toBe('1') // burned one of five, then went terminal
+    expect(hash.attempts).toBe('1')
   } finally {
     await ns.close()
   }
@@ -937,12 +874,6 @@ test('keepFailed count-trims the failed ZSET and DELs evicted job hashes', async
   )
 
   try {
-    // Fail 4 jobs one at a time (sequenced via wait) ⇒ strictly increasing `finishedOn`.
-    // `finishedOn` is the retention score and is only millisecond-granular, so two failures
-    // landing in the same millisecond would tie and be evicted in member (uuid) order rather
-    // than the order they finished — which is what this test is asserting. `wait()` now returns
-    // as soon as the notification lands rather than after a second read, so the loop can and
-    // does close that gap on a fast box: step past the millisecond to keep the premise true.
     const ids: string[] = []
     for (let i = 0; i < 4; i++) {
       const { id } = await queue.add(`j${i}`)
@@ -953,9 +884,8 @@ test('keepFailed count-trims the failed ZSET and DELs evicted job hashes', async
 
     const failedKey = `${prefix}:${wfId}:failed`
     await vi.waitFor(async () => {
-      expect(await redis.zcard(failedKey)).toBe(2) // only the newest 2 retained
+      expect(await redis.zcard(failedKey)).toBe(2)
     })
-    // Oldest two evicted from the ZSET and their hashes DEL'd; newest two kept.
     expect(await redis.exists(`${prefix}:${wfId}:j:${ids[0]}`)).toBe(0)
     expect(await redis.exists(`${prefix}:${wfId}:j:${ids[1]}`)).toBe(0)
     expect(await redis.zscore(failedKey, ids[2]!)).not.toBeNull()
@@ -964,13 +894,6 @@ test('keepFailed count-trims the failed ZSET and DELs evicted job hashes', async
     await ns.close()
   }
 })
-
-// ---------------------------------------------------------------------------
-// Stalled-job recovery, heartbeat & abort-on-lost-claim (ticket 08)
-// ---------------------------------------------------------------------------
-
-// No fake clock: a stalled worker is simulated by BACK-DATING the stored `wf:active` deadline
-// score so the deadline-compare scan (`ZRANGEBYSCORE 0 now`) sees the claim as expired.
 
 test('a stalled active job (deadline back-dated) is recovered and re-runs', async () => {
   const prefix = randomUUID()
@@ -987,26 +910,24 @@ test('a stalled active job (deadline back-dated) is recovered and re-runs', asyn
       calls++
       if (calls === 1) {
         started.open()
-        await gate.wait() // first invocation "hangs" as if its process died
+        await gate.wait()
       }
       return `ok:${calls}`
     },
-    { safetyTimeout: 0.2, stalledInterval: 100 }, // fast wake-loop re-poll + throttle
+    { safetyTimeout: 0.2, stalledInterval: 100 },
   )
 
   try {
     const { id } = await queue.add('x')
-    await started.wait() // first invocation is running ⇒ state=active in wf:active
+    await started.wait()
 
-    // Deadline in the past ⇒ a candidate for the scan. The 10s heartbeat can't renew within
-    // the test window, so the worker's own throttled wake-loop scan recovers it.
     await redis.zadd(wfActive, Date.now() - 60_000, id)
     await vi.waitFor(async () => {
       expect(await redis.hget(`${prefix}:${wfId}:j:${id}`, 'stalledCount')).toBe('1')
     })
 
-    gate.open() // let the dead invocation "return" (its commit no-ops — the token was released)
-    expect(await queue.wait(id)).toBe('ok:2') // requeued job re-runs and commits
+    gate.open()
+    expect(await queue.wait(id)).toBe('ok:2')
     expect(calls).toBe(2)
   } finally {
     await ns.close()
@@ -1032,8 +953,6 @@ test('heartbeat renewal keeps a healthy long-running job out of the stalled wind
       }
       return 'ok'
     },
-    // Short lock ⇒ heartbeat every ~100ms and scans every 50ms. A broken heartbeat would let
-    // the deadline fall into the past and the job would be recovered + re-run.
     { lockMs: 300, safetyTimeout: 0.1, stalledInterval: 50 },
   )
 
@@ -1041,11 +960,9 @@ test('heartbeat renewal keeps a healthy long-running job out of the stalled wind
     const { id } = await queue.add('x')
     await started.wait()
 
-    // Work well past lockMs while the handler is still busy; the heartbeat must keep the
-    // deadline in the future so every throttled scan finds no candidate.
     await sleep(900)
     expect(Number(await redis.zscore(wfActive, id))).toBeGreaterThan(Date.now())
-    expect(calls).toBe(1) // never falsely recovered / re-run
+    expect(calls).toBe(1)
     expect(await redis.hget(`${prefix}:${wfId}:j:${id}`, 'stalledCount')).toBe('0')
 
     gate.open()
@@ -1073,7 +990,7 @@ test('recovery requeues at the original score (front of band) and unblocks the g
       if (job.data === 'A' && !blocked) {
         blocked = true
         startedA.open()
-        await gate.wait() // A's first invocation "dies"
+        await gate.wait()
       }
       return 'ok'
     },
@@ -1082,17 +999,15 @@ test('recovery requeues at the original score (front of band) and unblocks the g
 
   try {
     const { id: aId } = await queue.add('A', { groupId: 'g' })
-    await queue.add('B', { groupId: 'g' }) // stuck behind A (group cap 1)
-    await startedA.wait() // A in flight; B cannot run — the group is wedged on the dead A
+    await queue.add('B', { groupId: 'g' })
+    await startedA.wait()
 
-    await redis.zadd(wfActive, Date.now() - 60_000, aId) // A's deadline expires
+    await redis.zadd(wfActive, Date.now() - 60_000, aId)
     await vi.waitFor(async () => {
       expect(await redis.hget(`${prefix}:${wfId}:j:${aId}`, 'stalledCount')).toBe('1')
     })
     gate.open()
 
-    // A requeued at its ORIGINAL score (front of its band) ⇒ it re-runs before B; the group
-    // is unblocked so B runs too. A fresh counter would have ordered A behind B (['A','B','A']).
     await vi.waitFor(() => {
       expect(order).toEqual(['A', 'A', 'B'])
     })
@@ -1110,17 +1025,15 @@ test('a job in state=completing is fenced from recovery', async () => {
   const jobKey = `${prefix}:${wfId}:j:${jobId}`
 
   try {
-    // A job mid-complete: state=completing (the fence set before releaseActive) with an already
-    // expired deadline. Recovery must skip it, closing the complete-vs-recover race.
     // prettier-ignore
     await redis.hset(jobKey, 'state', 'completing', 'groupId', 'g', 'nsId', nsId, 'stalledCount', '0', 'score', '123')
     await redis.zadd(`${prefix}:${wfId}:active`, Date.now() - 60_000, jobId)
 
     const recovered = await ns.redis.recoverStalled(prefix, wfId, 1, 1, 1000, 500, 300, 100)
     expect(recovered).toEqual([0, []])
-    expect(await redis.hget(jobKey, 'stalledCount')).toBe('0') // budget untouched
-    expect(await redis.hget(jobKey, 'state')).toBe('completing') // state unchanged
-    expect(await redis.zscore(`${prefix}:${wfId}:g:g:jobs`, jobId)).toBeNull() // not requeued
+    expect(await redis.hget(jobKey, 'stalledCount')).toBe('0')
+    expect(await redis.hget(jobKey, 'state')).toBe('completing')
+    expect(await redis.zscore(`${prefix}:${wfId}:g:g:jobs`, jobId)).toBeNull()
   } finally {
     await ns.close()
   }
@@ -1136,7 +1049,6 @@ test('a job past maxStalledCount is dead-lettered instead of requeued', async ()
   const wfActive = `${prefix}:${wfId}:active`
 
   try {
-    // Already at the budget (maxStalledCount 1); the next stall (→ 2) exceeds it.
     // prettier-ignore
     await redis.hset(jobKey, 'state', 'active', 'groupId', 'g', 'nsId', nsId, 'stalledCount', '1', 'score', '123', 'maxAttempts', '1', 'attempts', '0', 'createdAt', Date.now() - 60_000)
     await redis.zadd(wfActive, Date.now() - 60_000, jobId)
@@ -1154,13 +1066,12 @@ test('a job past maxStalledCount is dead-lettered instead of requeued', async ()
     expect([requeued, attempts]).toEqual([0, 1])
     expect(ageMs).toBeGreaterThanOrEqual(60_000)
 
-    // Routed through the shared moveToFailed/finalizeFailed dead-letter path (bypasses retry).
     expect(await redis.zscore(`${prefix}:${wfId}:failed`, jobId)).not.toBeNull()
     expect(await redis.hget(jobKey, 'state')).toBe('failed')
     expect(await redis.hget(jobKey, 'failedReason')).toBe('stalled more than allowable limit')
     expect(await redis.hget(jobKey, 'stalledCount')).toBe('2')
-    expect(await redis.zcard(wfActive)).toBe(0) // claim released
-    expect(await redis.zscore(`${prefix}:${wfId}:g:g:jobs`, jobId)).toBeNull() // not requeued
+    expect(await redis.zcard(wfActive)).toBe(0)
+    expect(await redis.zscore(`${prefix}:${wfId}:g:g:jobs`, jobId)).toBeNull()
   } finally {
     await ns.close()
   }
@@ -1182,13 +1093,11 @@ test('abort-on-lost-claim: a worker whose token is stolen aborts ctx.signal and 
           if (ctx.signal.aborted) resolve()
           else ctx.signal.addEventListener('abort', () => resolve())
         }),
-        sleep(3000), // fail-safe so a broken abort surfaces as a failed assertion, not a hang
+        sleep(3000),
       ])
       aborted = ctx.signal.aborted
       return 'should-not-commit'
     },
-    // Short lock ⇒ heartbeat ~100ms for quick lost-claim detection; long re-poll so no
-    // background scan recovers the (post-theft) claim mid-test.
     { lockMs: 300, safetyTimeout: 30 },
   )
 
@@ -1196,28 +1105,19 @@ test('abort-on-lost-claim: a worker whose token is stolen aborts ctx.signal and 
     const { id } = await queue.add('x')
     await started.wait()
 
-    // Steal the claim: overwrite the lock with a foreign token, as recovery + re-reserve would.
     const lockKey = `${prefix}:${wfId}:j:${id}:lock`
     await redis.set(lockKey, 'foreign-token')
 
     await vi.waitFor(() => {
-      expect(aborted).toBe(true) // heartbeat CAS returned 0 ⇒ worker aborted ctx.signal
+      expect(aborted).toBe(true)
     })
-    // The old worker dropped the job without committing (no result written).
     expect(await redis.exists(`${prefix}:${wfId}:result:${id}`)).toBe(0)
-    // The commit stays token-safe: the foreign holder can still finalize the claim.
     const record = JSON.stringify({ state: 'completed', value: 'by-recoverer' })
     expect(await ns.redis.complete(prefix, wfId, id, 'foreign-token', record, 300, 1)).toBe(1)
   } finally {
     await ns.close()
   }
 })
-
-// ---------------------------------------------------------------------------
-// Cron scheduling (ticket 09)
-// ---------------------------------------------------------------------------
-// No fake clock: firing is driven deterministically by BACK-DATING the `schedules:due`
-// score so a schedule is immediately due, never by waiting for a real cron tick.
 
 test('upsertSchedule is idempotent: upserting the same id twice leaves one due entry + one hash', async () => {
   const prefix = randomUUID()
@@ -1229,7 +1129,6 @@ test('upsertSchedule is idempotent: upserting the same id twice leaves one due e
     await queue.upsertSchedule('nightly', { pattern: '* * * * *', data: 'a', tz: 'UTC' })
     await queue.upsertSchedule('nightly', { pattern: '*/5 * * * *', data: 'b', tz: 'UTC' })
 
-    // Keyed by (wfId, scheduleId): the second upsert replaces in place — no duplication.
     expect(await redis.zcard(`${prefix}:${wfId}:schedules:due`)).toBe(1)
     const scheduleKeys = await redis.keys(`${prefix}:${wfId}:schedule:*`)
     expect(scheduleKeys).toHaveLength(1)
@@ -1237,7 +1136,7 @@ test('upsertSchedule is idempotent: upserting the same id twice leaves one due e
     const schedules = await queue.getSchedules()
     expect(schedules).toHaveLength(1)
     expect(schedules[0]!.scheduleId).toBe('nightly')
-    expect(schedules[0]!.pattern).toBe('*/5 * * * *') // replaced, not duplicated
+    expect(schedules[0]!.pattern).toBe('*/5 * * * *')
     expect(schedules[0]!.tz).toBe('UTC')
     expect(schedules[0]!.nextRun).toBeGreaterThan(Date.now())
     expect(schedules[0]!.lastFireAt).toBeNull()
@@ -1259,7 +1158,6 @@ test('cron end-to-end: a worker tick fires a due schedule into a running occurre
 
   try {
     await queue.upsertSchedule('sched', { pattern: '* * * * *', data: 'tick', tz: 'UTC' })
-    // Back-date the due score so the schedule is immediately due on the worker's next tick.
     await redis.zadd(dueKey, Date.now() - 60_000, 'sched')
 
     queue.worker(
@@ -1275,11 +1173,10 @@ test('cron end-to-end: a worker tick fires a due schedule into a running occurre
       expect(runs).toHaveBeenCalledTimes(1)
     })
     await sleep(200)
-    expect(runs).toHaveBeenCalledTimes(1) // the wake-loop tick fired the occurrence once
+    expect(runs).toHaveBeenCalledTimes(1)
     expect(runs).toHaveBeenCalledWith('tick')
-    expect(seenGroups).toEqual(new Set(['sched'])) // default groupId = scheduleId
+    expect(seenGroups).toEqual(new Set(['sched']))
 
-    // Re-armed forward to the next occurrence — a single future due entry.
     expect(await redis.zcard(dueKey)).toBe(1)
     expect(Number(await redis.zscore(dueKey, 'sched'))).toBeGreaterThan(Date.now())
   } finally {
@@ -1298,9 +1195,6 @@ test('cron fires exactly once under concurrent fire (CAS on score): one fired, o
 
   try {
     await queue.upsertSchedule('sched', { pattern: '* * * * *', data: 'tick', tz: 'UTC' })
-    // Two workers that both read the SAME due entry compute the same `expectedScore` and fire
-    // concurrently. Redis serializes the two atomic scripts: the first CAS wins and advances the
-    // score, so the second finds `ZSCORE != expectedScore` and no-ops ⇒ exactly-once, no lock.
     const expected = Date.now() - 60_000
     await redis.zadd(dueKey, expected, 'sched')
     const next = Date.now() + 60_000
@@ -1310,13 +1204,11 @@ test('cron fires exactly once under concurrent fire (CAS on score): one fired, o
       ns.redis.fireSchedule(prefix, wfId, nsId, 'sched', expected, next, 'occ-b', 1, 1),
     ])
 
-    // Exactly one enqueued the occurrence; the other saw the re-armed score and bailed stale.
     expect([a[0], b[0]].toSorted((x, y) => String(x).localeCompare(String(y)))).toEqual([
       'fired',
       'stale',
     ])
-    expect(await redis.zcard(groupJobs)).toBe(1) // a single occurrence waiting, never two
-    // Re-armed exactly once, forward to the next occurrence.
+    expect(await redis.zcard(groupJobs)).toBe(1)
     expect(await redis.zcard(dueKey)).toBe(1)
     expect(Number(await redis.zscore(dueKey, 'sched'))).toBe(next)
   } finally {
@@ -1368,19 +1260,16 @@ test('a worker clock behind Redis fires a due occurrence once, not in a loop', a
 
   const runs = vi.fn()
   try {
-    // Yearly, so real time cannot reach the next occurrence while the test runs.
     await queue.upsertSchedule('sched', {
       pattern: '0 0 1 1 *',
       data: 'x',
       tz: 'UTC',
       skipIfRunning: false,
     })
-    // Due by Redis time, but still a minute in the future by the worker's clock.
     const [seconds] = await redis.time()
     const year = new Date(Number(seconds) * 1000).getUTCFullYear()
     const occurrence = Date.UTC(year, 0, 1)
     await redis.zadd(dueKey, occurrence, 'sched')
-    // `vi.waitFor` advances fake timers, so leave room for that to never reach the occurrence.
     vi.useFakeTimers({ toFake: ['Date'], now: occurrence - 60_000 })
 
     queue.worker(
@@ -1413,7 +1302,6 @@ test('a long-overdue cron fires once then jumps forward (missed-run = skip, no s
   const runs = vi.fn()
   try {
     await queue.upsertSchedule('overdue', { pattern: '* * * * *', data: 'x', tz: 'UTC' })
-    // A whole hour of missed minute-occurrences — a backlog that must NOT stampede.
     await redis.zadd(dueKey, Date.now() - 3_600_000, 'overdue')
 
     queue.worker(
@@ -1428,7 +1316,6 @@ test('a long-overdue cron fires once then jumps forward (missed-run = skip, no s
       expect(runs).toHaveBeenCalledTimes(1)
     })
     await sleep(200)
-    // `nextRun(now)` collapses the backlog: one fire, not ~60, and re-armed into the future.
     expect(runs).toHaveBeenCalledTimes(1)
     expect(Number(await redis.zscore(dueKey, 'overdue'))).toBeGreaterThan(Date.now())
   } finally {
@@ -1448,7 +1335,6 @@ test('skip-if-running: an occurrence is not enqueued while lastJobId is non-term
 
   try {
     await queue.upsertSchedule('sched', { pattern: '* * * * *', data: 'x', tz: 'UTC' })
-    // Pretend the previous occurrence is still in flight (a non-terminal active job hash).
     await redis.hset(scheduleKey, 'lastJobId', 'prev-job')
     await redis.hset(`${prefix}:${wfId}:j:prev-job`, 'state', 'active')
 
@@ -1456,8 +1342,6 @@ test('skip-if-running: an occurrence is not enqueued while lastJobId is non-term
     await redis.zadd(dueKey, past, 'sched')
     const nextScore = Date.now() + 60_000
 
-    // Direct CAS call (deterministic, no worker): the previous job is running ⇒ skip enqueue,
-    // but the score still advances so the schedule stays armed.
     const skipped = await ns.redis.fireSchedule(
       prefix,
       wfId,
@@ -1470,11 +1354,10 @@ test('skip-if-running: an occurrence is not enqueued while lastJobId is non-term
       1,
     )
     expect(skipped[0]).toBe('skipped')
-    expect(Number(await redis.zscore(dueKey, 'sched'))).toBe(nextScore) // re-armed anyway
-    expect(await redis.hget(scheduleKey, 'lastJobId')).toBe('prev-job') // unchanged, nothing enqueued
-    expect(await redis.zcard(groupJobs)).toBe(0) // no occurrence waiting
+    expect(Number(await redis.zscore(dueKey, 'sched'))).toBe(nextScore)
+    expect(await redis.hget(scheduleKey, 'lastJobId')).toBe('prev-job')
+    expect(await redis.zcard(groupJobs)).toBe(0)
 
-    // Once the previous job is terminal (completed ⇒ its hash is DEL'd), the next fire enqueues.
     await redis.del(`${prefix}:${wfId}:j:prev-job`)
     const nextScore2 = nextScore + 60_000
     const fired = await ns.redis.fireSchedule(
@@ -1491,15 +1374,11 @@ test('skip-if-running: an occurrence is not enqueued while lastJobId is non-term
     expect(fired[0]).toBe('fired')
     expect(fired[1]).toBe('occ-2')
     expect(await redis.hget(scheduleKey, 'lastJobId')).toBe('occ-2')
-    expect(await redis.zscore(groupJobs, 'occ-2')).not.toBeNull() // enqueued into its group
+    expect(await redis.zscore(groupJobs, 'occ-2')).not.toBeNull()
   } finally {
     await ns.close()
   }
 })
-
-// ---------------------------------------------------------------------------
-// Events & metrics (ticket 10)
-// ---------------------------------------------------------------------------
 
 test('getMetrics reports active/waiting/delayed; a drained group leaves the groups set', async () => {
   const prefix = randomUUID()
@@ -1509,7 +1388,6 @@ test('getMetrics reports active/waiting/delayed; a drained group leaves the grou
   const started = makeGate()
   const gate = makeGate()
 
-  // A single-slot worker holds exactly one job active (gated) and never picks up the rest.
   queue.worker(
     async () => {
       started.open()
@@ -1520,12 +1398,9 @@ test('getMetrics reports active/waiting/delayed; a drained group leaves the grou
   )
 
   try {
-    // This job is reserved and held active: reserving pops the last job from its group's waiting
-    // ZSET, so the shared maintenance must SREM it from the `groups` set (drained, no over-count).
     await queue.add('active', { groupId: 'active-grp' })
     await started.wait()
 
-    // Waiting work across two groups (worker is full ⇒ stays waiting), plus two future delayed jobs.
     await queue.add('g1-a', { groupId: 'g1' })
     await queue.add('g1-b', { groupId: 'g1' })
     await queue.add('g2-a', { groupId: 'g2' })
@@ -1536,8 +1411,6 @@ test('getMetrics reports active/waiting/delayed; a drained group leaves the grou
       expect(await queue.getMetrics()).toEqual({ active: 1, waiting: 3, delayed: 2, failed: 0 })
     })
 
-    // The drained active group is gone from the metrics set; only the two waiting groups remain
-    // (delayed jobs never enter it). A missing SREM would leave `active-grp` here.
     const groups = await redis.smembers(`${prefix}:${wfId}:groups`)
     expect(groups.toSorted((x, y) => x.localeCompare(y))).toEqual(['g1', 'g2'])
   } finally {
@@ -1579,7 +1452,6 @@ test('onError is invoked when a worker-internal operation throws', async () => {
   const queue = ns.queue({ id: randomUUID() })
   const onError = vi.fn<(error: unknown) => void>()
 
-  // Force the wake-loop's throttled stalled-recovery scan to throw — a worker-internal error path.
   vi.spyOn(ns.redis, 'recoverStalled').mockRejectedValue(new Error('scan failed'))
 
   queue.worker(() => 'ok', { onError, safetyTimeout: 0.1 })
@@ -1597,22 +1469,11 @@ test('onError is invoked when a worker-internal operation throws', async () => {
   }
 })
 
-// ---------------------------------------------------------------------------
-// Batch reserve + local slot parking (perf rework)
-//
-// `reserve` now claims a BATCH of jobs in one atomic script and a saturated worker parks on an
-// in-process signal instead of BRPOP. Both move decisions that used to be one-per-round-trip
-// into places where a bug is invisible from the outside — these pin the invariants that keep
-// them honest, including across workers that do not share a JS heap.
-// ---------------------------------------------------------------------------
-
 test('batch reserve never exceeds the group cap, however many slots the worker offers', async () => {
   const prefix = randomUUID()
   const nsId = randomUUID()
   const wfId = randomUUID()
   const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
-  // One group, cap 1: a single batch could trivially claim all 8 at once if the Lua loop failed
-  // to re-evaluate the group's `ready` membership between claims.
   const queue = ns.queue({ id: wfId, groupConcurrency: 1 })
   const tracker = makeTracker()
   const ran = vi.fn()
@@ -1647,8 +1508,6 @@ test('batch reserve respects the namespace cap across workers on separate connec
   const wfId = randomUUID()
   const NS_CAP = 2
 
-  // Two Namespace instances on two connections = two independent JS heaps' worth of worker
-  // state, exactly like two processes. Only Redis can hold the cap between them.
   const nsA = new Namespace({ id: nsId, concurrency: NS_CAP, redis: await connect(), prefix })
   const nsB = new Namespace({ id: nsId, concurrency: NS_CAP, redis: await connect(), prefix })
   const queueA = nsA.queue({ id: wfId })
@@ -1666,8 +1525,6 @@ test('batch reserve respects the namespace cap across workers on separate connec
           ran(job.data)
           return 'ok'
         },
-        // Each worker offers far more slots than the namespace allows, so an uncapped batch
-        // would blow straight through NS_CAP.
         { concurrency: 20 },
       )
     }
@@ -1692,8 +1549,6 @@ test('every job in one batch gets a distinct claim token, so each one commits', 
   const queue = ns.queue({ id: wfId })
 
   try {
-    // Tokens are derived in-script as `<uuid>:<n>`. If two jobs in a batch shared a token, the
-    // token guard on `complete` would silently no-op one of them and it would hang here.
     queue.worker(() => 'ok', { concurrency: 20 })
 
     const ids: string[] = []
@@ -1715,13 +1570,10 @@ test('a worker held off by a cap another process owns still re-polls and recover
   const nsId = randomUUID()
   const wfId = randomUUID()
   const ns = new Namespace({ id: nsId, redis: await connect(), prefix })
-  // Workflow cap 1: while the dead claim below is held, our worker can never claim anything.
   const queue = ns.queue({ id: wfId, concurrency: 1 })
   const ran = vi.fn()
 
   try {
-    // A claim held by a process that then died: reserved directly, never heartbeated, never
-    // completed. Nothing will ever LPUSH a wake on its behalf.
     const stuck = await queue.add('stuck')
     const noNsCap = Number.MAX_SAFE_INTEGER
     const claimed = await ns.redis.reserve(
@@ -1739,10 +1591,6 @@ test('a worker held off by a cap another process owns still re-polls and recover
     const [claimedJobs] = claimed
     expect(claimedJobs).toHaveLength(1)
 
-    // More due delayed jobs than the promote cap, so `reserve` keeps reporting msToNext = 0
-    // ("work is due right now") while the cap says we cannot have it. That pair used to compute
-    // a BRPOP timeout of 0 — which Redis reads as *block forever*, not *don't block* — so the
-    // worker parked permanently and never ran the stalled scan that frees the dead claim.
     for (let i = 0; i < 3; i++) await queue.add(`delayed-${i}`, { runIn: 40 })
     await sleep(120)
 
@@ -1759,7 +1607,6 @@ test('a worker held off by a cap another process owns still re-polls and recover
       },
     })
 
-    // All four jobs — the recovered one and the three delayed — must drain.
     await vi.waitFor(
       async () => {
         expect(await redis.zcard(`${prefix}:${wfId}:delayed`)).toBe(0)
@@ -1774,10 +1621,6 @@ test('a worker held off by a cap another process owns still re-polls and recover
 })
 
 test('close() during an in-flight batch reserve strands nothing', async () => {
-  // The loop claims up to `concurrency` jobs in one call. If it dropped that batch on seeing
-  // `closing`, those jobs would sit `active` — locked, slot-consuming, invisible — until
-  // stalled-recovery, on every clean shutdown. Racing close() against the reserve pins that:
-  // 0ms lands inside the first round-trip, 2ms after it, so both sides of the window are hit.
   for (const delayMs of [0, 2]) {
     const prefix = randomUUID()
     const nsId = randomUUID()
@@ -1789,11 +1632,9 @@ test('close() during an in-flight batch reserve strands nothing', async () => {
       for (let i = 0; i < 16; i++) await queue.add(`job-${i}`)
 
       const worker = queue.worker(() => 'ok', { concurrency: 16 })
-      // Land close() at varying points across the first reserve round-trip.
       await sleep(delayMs)
       await worker.close()
 
-      // Whatever it claimed, it finished: nothing may be left holding a slot or a lock.
       const lockKeys = await redis.keys(`${prefix}:${wfId}:j:*:lock`)
       expect({
         wfActive: await redis.zcard(`${prefix}:${wfId}:active`),
@@ -1816,8 +1657,6 @@ test('a saturated worker still fires a due cron schedule (it parks locally, not 
   const seen: string[] = []
 
   try {
-    // Concurrency 1, and the only slot is occupied by a job that will not finish until we say
-    // so. A saturated worker parks on an in-process signal now — the cron tick must still run.
     queue.worker(
       async (job) => {
         seen.push(job.data)
@@ -1833,7 +1672,6 @@ test('a saturated worker still fires a due cron schedule (it parks locally, not 
 
     await queue.upsertSchedule('tick', { pattern: '* * * * * *', data: 'from-cron' })
 
-    // The occurrence must reach `waiting` while the worker is still saturated.
     await vi.waitFor(
       async () => {
         expect(await redis.zcard(`${prefix}:${wfId}:ready`)).toBeGreaterThan(0)
@@ -1871,8 +1709,6 @@ test('queueWaitMs counts from enqueue, or from runAt for a delayed job', async (
     })
     await Promise.all([queue.wait(now.id), queue.wait(delayed.id)])
 
-    // No worker was running, so the delayed job is promoted at claim time: its wait must still
-    // start at runAt, not at promotion (≈0) or at enqueue (≈500).
     expect(waits.get(now.id)).toBeGreaterThanOrEqual(450)
     expect(waits.get(delayed.id)).toBeGreaterThanOrEqual(350)
     expect(waits.get(delayed.id)).toBeLessThan(480)

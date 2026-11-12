@@ -12,11 +12,6 @@ export class ResultExpiredError extends Error {
   }
 }
 
-/**
- * Thrown by a handler for a failure that retrying cannot fix — the job is dead-lettered
- * immediately, skipping the remaining `maxAttempts` budget. Only the thrown error itself is
- * checked; wrapping one in another error's `cause` does not skip retries.
- */
 export class NonRecoverableError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options)
@@ -24,7 +19,6 @@ export class NonRecoverableError extends Error {
   }
 }
 
-/** Internal control flow for a handler pause. Not exported from the package. */
 export class RateLimitError extends Error {
   constructor(
     readonly ms: number,

@@ -1,32 +1,13 @@
 import type Redis from 'ioredis'
 
-/**
- * Purpose-built queue Lua. Every atomic op is exactly one script, registered via
- * `defineCommand` (free NOSCRIPT/EVAL fallback). Single-instance only: keys are built
- * inside the scripts from the prefix + ids, so `numberOfKeys` is 0 and everything is
- * passed as ARGV. The `releaseActive` helper is defined once and prepended to every
- * script that frees a claim, so reserve/release can never drift.
- */
-
-/** Max priority (2^21-1) — keeps the packed score exact in a ZSET double. */
 export const PMAX = 2 ** 21 - 1
-/** Sentinel for an unlimited cap. */
 export const UNLIMITED = Number.MAX_SAFE_INTEGER
 
-/** `now` in ms from Redis `TIME` — the single clock authority. */
 const NOW = `
 local __t = redis.call("TIME")
 local now = tonumber(__t[1]) * 1000 + math.floor(tonumber(__t[2]) / 1000)
 `
 
-/**
- * The single source of truth for a group's derived membership: the `ready` ZSET-of-groups
- * (runnable = has waiting jobs AND under the group cap) and the lightweight `groups` metrics
- * SET (a member exactly while the group has waiting jobs). Both are keyed off the one
- * `ZCARD groupJobs` read, so the metrics SET cannot drift from the `ready` set or over-count:
- * every path that adds/pops a waiting job (`addWaiting`, `reserve`'s pop, `releaseActive`) funnels
- * through here. It is a MEMBERSHIP set, never an INCR/DECR count. Assumes nothing else in scope.
- */
 const MAINTAIN_GROUP = `
 local function maintainGroup(wf, groupId, groupCap)
   local groupJobs = wf .. ":g:" .. groupId .. ":jobs"
@@ -47,12 +28,6 @@ local function maintainGroup(wf, groupId, groupCap)
 end
 `
 
-/**
- * The single source of truth for freeing a claim. Reads `groupId`+`nsId` off the job
- * hash and mirrors reserve's writes: removes the job from the three active structures,
- * deletes the lock, re-evaluates the group's `ready`/`groups` membership, and kicks both wake
- * lists. Shared (included, not copied) by every finalize path. Assumes `maintainGroup` is in scope.
- */
 const RELEASE_ACTIVE = `
 local function releaseActive(prefix, wfId, jobId, groupCap)
   local wf = prefix .. ":" .. wfId
@@ -76,15 +51,6 @@ local function releaseActive(prefix, wfId, jobId, groupCap)
 end
 `
 
-/**
- * Terminal-failure finalize, shared (included, not copied) by `fail`'s exhausted branch and
- * `moveToFailed` so a dead-letter entry is only ever written in one place. Sets `state=failed`
- * ahead of `releaseActive` (fences the fail-vs-recover race, mirroring `complete`), frees the
- * claim, deletes step data, appends to the `failed` retention ZSET scored by `finishedOn` and
- * count-trims it (`DEL`ing evicted job hashes), writes the TTL result record, and publishes
- * `done`. The failed job hash is kept (not `DEL`'d) for debug history until trimmed out.
- * Assumes `releaseActive` is already in scope.
- */
 const FINALIZE_FAILED = `
 local function finalizeFailed(prefix, wfId, jobId, reason, stack, resultTtl, groupCap, keepFailed)
   local wf = prefix .. ":" .. wfId
@@ -107,24 +73,12 @@ local function finalizeFailed(prefix, wfId, jobId, reason, stack, resultTtl, gro
 
   local record = cjson.encode({ state = "failed", reason = reason, stack = stack })
   redis.call("SET", wf .. ":result:" .. jobId, record, "EX", resultTtl)
-  -- The record travels in the publish payload, so a waiter never re-reads the key it just got.
   redis.call("PUBLISH", wf .. ":done:" .. jobId, record)
 end
 `
 
-/**
- * Move a job into the waiting structure: stamp the FIFO tiebreak counter (`INCR pc` at
- * promotion time), pack the priority score, `ZADD` the group ZSET, and re-evaluate
- * `ready`. The single source of truth for "a job becomes runnable" — shared (included, not
- * copied) by `enqueue`'s immediate path and `reserve`'s delayed-promotion, so the ready
- * logic can never drift between them. `readyAt` (Redis ms) is when the job became runnable,
- * which `reserve` turns into the queue wait of the claim.
- */
 const ADD_WAITING = `
 local function addWaiting(wf, jobKey, jobId, groupId, priority, groupCap, readyAt, scoreArg)
-  -- Recovery requeues at the STORED packed score (front of its band); the enqueue/promotion
-  -- paths pass no score and stamp a fresh FIFO counter. Either way the ready-set
-  -- maintenance below is the single shared source of truth, so recovery can't drift.
   local score = scoreArg
   if not score then
     local counter = redis.call("INCR", wf .. ":pc") % 4294967296
@@ -136,13 +90,6 @@ local function addWaiting(wf, jobKey, jobId, groupId, priority, groupCap, readyA
 end
 `
 
-/**
- * Write a fresh job hash and drop it straight into waiting via the shared `addWaiting`, then
- * kick `wake`. The single source of truth for "enqueue an immediately-runnable job" — shared
- * (included, not copied) by `enqueue`'s immediate branch and `fireSchedule`'s occurrence, so a
- * cron occurrence is enqueued through the *exact* same path as a plain `add`, never a parallel
- * one. Assumes `addWaiting` is already in scope.
- */
 const ENQUEUE_NOW = `
 local function enqueueNow(prefix, wf, jobKey, jobId, data, groupId, priority, maxAttempts, nsId, groupCap, now)
   redis.call("HSET", jobKey,
@@ -156,17 +103,6 @@ local function enqueueNow(prefix, wf, jobKey, jobId, data, groupId, priority, ma
 end
 `
 
-/**
- * Add a job. `EXISTS` guard on the job hash (in-script, no TOCTOU) → `JobAlreadyExists`.
- * The effective `runAt` is resolved against Redis `TIME`: `runIn` → `now + runIn`,
- * absolute `runAt` verbatim. `runAt > now` lands in the `delayed` ZSET scored by `runAt`
- * (kicking `wake` so an idle worker re-computes to the nearer due time); otherwise
- * (`runAt <= now`, or neither given) the job goes straight into waiting via the shared
- * `enqueueNow`.
- *
- * ARGV: prefix, wfId, nsId, jobId, data, groupId, priority, maxAttempts, groupCap, runAt, runIn
- * (`runAt`/`runIn` use `-1` as the "unset" sentinel; they are mutually exclusive.)
- */
 const ENQUEUE = `
 ${MAINTAIN_GROUP}
 ${ADD_WAITING}
@@ -213,45 +149,6 @@ end
 return 1
 `
 
-/**
- * The hot path, and the worker's *only* per-iteration round-trip: it claims a batch, promotes
- * due delayed jobs, and reports everything the wake loop needs to decide its next block —
- * so an idle or saturated worker costs exactly one command per wake, not four.
- *
- * Delayed-job promotion is embedded at the top: due jobs (`ZRANGEBYSCORE delayed -inf now`,
- * batch-capped) are `ZREM`'d and moved into waiting via the shared `addWaiting` — atomic under
- * Lua's single thread ⇒ exactly-once across concurrent workers, and promoting in `runAt` order
- * stamps `pc` ascending-by-due-time (FIFO-by-ready-time). Then, up to `want` times: O(1)
- * top-gates → pop head group of `ready` → `ZPOPMIN` its head job → all-or-nothing claim into the
- * three active structures + lock + `state=active` → ready-set maintenance. Claiming `want` jobs
- * in one call is what makes a high-concurrency worker cost ~1 reserve per *batch* instead of per
- * job; `want = 0` (locally saturated) still promotes and reports, it just claims nothing.
- *
- * Claim tokens are derived in-script as `<tokenPrefix>:<n>` from the one UUID the caller passes,
- * so a batch needs a single JS UUID and the tokens stay globally unique.
- *
- * Returns `{ jobs, msToNext, msToSchedule, dueSchedules, maxed, msToLimit }`:
- * - `jobs`: array of `{ jobId, groupId, data, attempts, priority, token, steps, queueWait, age }`, where
- *   `steps` is the job's memoized step hash flattened to `[name, value, …]` and `queueWait` is the
- *   ms since the job became runnable, and `age` the ms since it was enqueued, both on the Redis clock
- * - `msToNext`: ms until the next due delayed job (`-1` none, `0` due work left behind by the
- *   promote cap) — the worker's `BRPOP wake` timeout, so the block *is* the delayed-job timer
- * - `msToSchedule`: same, for the nearest cron occurrence
- * - `dueSchedules`: `{ scheduleId, score, … }` of schedules due now, for the JS cron tick
- * - `maxed`: 1 when a concurrency ceiling or the rate limit gate (not an empty queue) stopped the batch
- * - `msToLimit`: ms until the rate limit gate may admit a start again (`-1` when the gate did not
- *   stop the batch). The worker waits on its local timer while the gate is closed.
- *
- * Rate limit gate: one sliding window log per limiter, a ZSET at
- * `<prefix>:ns:<nsId>:rl:<name>` with one member per start (the claim token) scored by its expiry
- * (`start + window`). A pause is a `…:paused` string holding `pausedUntil`, set with `PXAT` so it
- * cleans itself up. The workflow's own pause (no limiters) is `<wf>:paused`. The gate is read
- * lazily, only when a ready group exists and `want > 0`, and every claimed job records a start in
- * every limiter before the next job is considered.
- *
- * ARGV: prefix, wfId, nsId, nsCap, wfCap, groupCap, lockMs, tokenPrefix, promoteCap, want,
- *       limiterCount, then `name, limit, window` per limiter
- */
 const RESERVE = `
 ${MAINTAIN_GROUP}
 ${ADD_WAITING}
@@ -281,19 +178,15 @@ local delayedKey = wf .. ":delayed"
 local scheduleDueKey = wf .. ":schedules:due"
 ${NOW}
 
--- Promote due delayed jobs (batch-capped). ZRANGEBYSCORE ascending ⇒ promote in runAt order.
 local due = redis.call("ZRANGEBYSCORE", delayedKey, "-inf", now, "LIMIT", 0, promoteCap)
 for i = 1, #due do
   local dj = due[i]
   redis.call("ZREM", delayedKey, dj)
   local djKey = wf .. ":j:" .. dj
   local meta = redis.call("HMGET", djKey, "groupId", "priority", "runAt")
-  -- The job was runnable from its runAt, not from whenever a worker got round to promoting it.
   addWaiting(wf, djKey, dj, meta[1], tonumber(meta[2]), groupCap, meta[3])
 end
 
--- ms until the head of a due-scored ZSET (for an idle worker BRPOP timeout). Returns 0 when
--- work is already due, so the worker loops back instead of blocking.
 local function msToHead(key)
   local next = redis.call("ZRANGE", key, 0, 0, "WITHSCORES")
   if #next == 0 then return -1 end
@@ -302,8 +195,6 @@ local function msToHead(key)
   return d
 end
 
--- How many more starts the gate admits right now, and how long until it admits one when it
--- admits none. Waiting is the max over every closed limiter: a start needs all of them.
 local function readGate()
   local allowed = want
   local wait = math.max(0, redis.call("PTTL", wf .. ":paused"))
@@ -341,7 +232,6 @@ while #jobs < want do
       local key, limit = limiters[i][1], limiters[i][2]
       local count = limiters[i][4] + #jobs
       if count >= limit then
-        -- Include this batch's starts. A lower budget needs count - limit + 1 expiries.
         local nth = redis.call("ZRANGE", key, count - limit, count - limit, "WITHSCORES")
         wait = math.max(wait, tonumber(nth[2]) - now)
       end
@@ -353,7 +243,6 @@ while #jobs < want do
   local gid = head[1]
   local popped = redis.call("ZPOPMIN", wf .. ":g:" .. gid .. ":jobs")
   if #popped == 0 then
-    -- ready pointed at a drained group; fix the membership and try the next one.
     maintainGroup(wf, gid, groupCap)
   else
     local jobId = popped[1]
@@ -365,7 +254,6 @@ while #jobs < want do
     redis.call("SADD", wf .. ":g:" .. gid .. ":active", jobId)
     redis.call("SADD", nsActive, wfId .. ":" .. jobId)
     redis.call("SET", jobKey .. ":lock", token, "PX", lockMs)
-    -- Store the popped packed score so stalled-recovery can requeue at the front of its band.
     redis.call("HSET", jobKey, "state", "active", "deadlineAt", deadline, "score", popped[2])
     for i = 1, #limiters do
       redis.call("ZADD", limiters[i][1], now + limiters[i][3], token)
@@ -373,20 +261,14 @@ while #jobs < want do
 
     maintainGroup(wf, gid, groupCap)
 
-    -- The claim makes this worker the only writer of the step hash, so shipping it with the
-    -- job is an exact snapshot: a replay resolves memoized steps with no round-trip at all.
-    -- Jobs made runnable before readyAt existed fall back to createdAt.
     local vals = redis.call("HMGET", jobKey, "data", "priority", "attempts", "readyAt", "createdAt")
     local steps = redis.call("HGETALL", jobKey .. ":steps")
-    -- Clamped: a retry's or absolute runAt comes from a client clock, which may run ahead of Redis.
     local queueWait = math.max(0, now - tonumber(vals[4] or vals[5]))
     local age = math.max(0, now - tonumber(vals[5]))
     jobs[#jobs + 1] = { jobId, gid, vals[1], vals[3], vals[2], token, steps, queueWait, age }
   end
 end
 
--- The log key lives as long as its latest start. Scores are expiries, so the max score is the
--- right TTL whichever pod (and window) wrote it.
 if #jobs > 0 then
   for i = 1, #limiters do
     local last = redis.call("ZRANGE", limiters[i][1], -1, -1, "WITHSCORES")
@@ -398,14 +280,6 @@ local dueSchedules = redis.call("ZRANGEBYSCORE", scheduleDueKey, "-inf", now, "W
 return { jobs, msToHead(delayedKey), msToHead(scheduleDueKey), dueSchedules, maxed, msToLimit }
 `
 
-/**
- * Token-guarded finalize: no-op if `lock != myToken` (recovery took the claim). Else set
- * `state=completing` *before* `releaseActive` (fences the complete-vs-recover race), free
- * the claim, delete the (now reusable) job hash + step data, `SET` the TTL result record,
- * and `PUBLISH done`.
- *
- * ARGV: prefix, wfId, jobId, token, result, resultTtl, groupCap
- */
 const COMPLETE = `
 ${MAINTAIN_GROUP}
 ${RELEASE_ACTIVE}
@@ -430,22 +304,10 @@ releaseActive(prefix, wfId, jobId, groupCap)
 redis.call("DEL", jobKey)
 redis.call("DEL", jobKey .. ":steps")
 redis.call("SET", wf .. ":result:" .. jobId, result, "EX", resultTtl)
--- The record travels in the publish payload, so a waiter never re-reads the key it just got.
 redis.call("PUBLISH", wf .. ":done:" .. jobId, result)
 return 1
 `
 
-/**
- * Token-guarded finalize on a handler throw: no-op if `lock != myToken` (recovery took the
- * claim). Else `HINCRBY attempts 1` (the single attempt counter, never in JS; `stalledCount`
- * is untouched). Retryable (`attempts < maxAttempts`) → set `state=delayed`, `releaseActive`
- * (frees ALL concurrency slots + kicks both wake lists during backoff), and `ZADD delayed` at
- * the JS-computed `runAt` score so `reserve` promotes it when due. Exhausted, or `noRetry=1`
- * (a `NonRecoverableError` — retrying cannot fix it) → `finalizeFailed`.
- *
- * Returns 0 (stale token no-op), 1 (terminal dead-letter), or 2 (requeued for retry).
- * ARGV: prefix, wfId, jobId, token, reason, stack, runAt, resultTtl, groupCap, keepFailed, noRetry
- */
 const FAIL = `
 ${MAINTAIN_GROUP}
 ${RELEASE_ACTIVE}
@@ -483,14 +345,6 @@ finalizeFailed(prefix, wfId, jobId, reason, stack, resultTtl, groupCap, keepFail
 return 1
 `
 
-/**
- * `fail`-terminal minus the token-equality guard and minus backoff — an unconditional
- * dead-letter for callers that already hold the right to finalize (stalled-recovery over its
- * budget). Anti-drift: recovery never hand-writes a failed-set entry, it routes
- * through the same `finalizeFailed`.
- *
- * ARGV: prefix, wfId, jobId, reason, resultTtl, groupCap, keepFailed
- */
 const MOVE_TO_FAILED = `
 ${MAINTAIN_GROUP}
 ${RELEASE_ACTIVE}
@@ -507,15 +361,6 @@ finalizeFailed(prefix, wfId, jobId, reason, "", resultTtl, groupCap, keepFailed)
 return 1
 `
 
-/**
- * Token-CAS heartbeat: no-op returning 0 if `lock != myToken` (the claim was recovered
- * and re-reserved elsewhere → the caller must abort). Else renew the lock PX *and* the
- * `wf:active` deadline score in lockstep so they can never diverge, keeping a healthy
- * long-running job out of the stalled-candidate window. The worker runs it on a derived
- * `min(lockMs/3, 10s)` timer.
- *
- * ARGV: prefix, wfId, jobId, token, lockMs
- */
 const HEARTBEAT = `
 local prefix = ARGV[1]
 local wfId = ARGV[2]
@@ -535,21 +380,6 @@ redis.call("ZADD", wf .. ":active", now + lockMs, jobId)
 return 1
 `
 
-/**
- * The single throttled stalled-recovery scan, never folded into reserve. Gated by
- * `SET wf:stalled-check <now> NX PX interval` so only one worker per interval scans; returns
- * `{ 0, {} }` immediately when the gate is held. Detection is a pure deadline-compare over the
- * deadline-scored active ZSET (`ZRANGEBYSCORE wf:active 0 now`, batch-capped) — no `stalled`
- * SET, no two-pass. Per candidate: a `state == "active"` fence (skips a job mid-`completing`,
- * closing the complete-vs-recover race) → the shared `releaseActive` (frees every slot and
- * unblocks the group for free) → `HINCRBY stalledCount`. Over budget ⇒ the SAME dead-letter
- * path as `moveToFailed` (`finalizeFailed`, bypassing backoff/retry); otherwise requeue at the
- * stored packed score via the shared `addWaiting`. `releaseActive` already kicks both wake lists.
- *
- * Returns `{ requeued, deadLettered }`: the requeued count, and `[attempts, ageMs]` per job
- * dead-lettered, where `attempts` includes the stalled one and `ageMs` is the time since enqueue.
- * ARGV: prefix, wfId, groupCap, maxStalledCount, interval, batchSize, resultTtl, keepFailed
- */
 const RECOVER_STALLED = `
 ${MAINTAIN_GROUP}
 ${RELEASE_ACTIVE}
@@ -595,17 +425,6 @@ end
 return { requeued, deadLettered }
 `
 
-/**
- * Reactive pause. Always writes `pausedUntil = max(existing, now + ms)` on the named
- * limiter, or on the workflow itself when `limiter` is empty, because the 429 is real whoever
- * holds the job. Then, only if the claim token still matches, requeues the job to `waiting` at its
- * stored packed score (the stalled-recovery path): no `attempts` increment, `:steps` untouched.
- * `releaseActive` kicks this workflow's and the namespace's wake lists; woken workers `reserve`,
- * hit the pause and block on `msToLimit`. No other wake is needed: a pause only closes the gate.
- *
- * Returns 0 (stale token: pause written, job left alone) or 1 (paused and requeued).
- * ARGV: prefix, wfId, nsId, jobId, token, ms, limiter, groupCap
- */
 const RATE_LIMIT = `
 ${MAINTAIN_GROUP}
 ${RELEASE_ACTIVE}
@@ -639,27 +458,6 @@ addWaiting(wf, jobKey, jobId, meta[1], 0, groupCap, now, tonumber(meta[2]))
 return 1
 `
 
-/**
- * Cron firing = "JS computes next, Lua commits via CAS-on-score". The JS wake-loop tick
- * reads a due schedule, computes `nextScore = croner.nextRun(now)`, and calls this with the
- * score it saw (`expectedScore`). The CAS bails unless `ZSCORE due scheduleId == expectedScore`,
- * so a racing worker that already fired (and advanced the score) is a no-op ⇒ **exactly-once
- * across N workers with no distributed lock**. Because the next score is computed in JS *before*
- * the call, a crash before it is a no-op retry and a crash after is fully done — never a
- * half-fired state. A `nextScore` that does not advance past `expectedScore` is also stale, so a
- * caller can never re-arm a schedule at the occurrence it just fired.
- *
- * On a winning CAS: re-arm `ZADD due nextScore` (atomic with the enqueue). Skip-if-running:
- * if enabled and the record's `lastJobId` is still non-terminal (its hash exists and is not
- * `failed` — a completed occurrence's hash is `DEL`'d, a failed one carries `state=failed`),
- * advance the score but do NOT enqueue. Otherwise enqueue the occurrence via the shared
- * `enqueueNow` (the exact `add` path, never a parallel one) and stamp `lastJobId`/`lastFireAt`.
- * Missed-run collapses to one fire because the JS tick passed `nextRun(now)`, not the overdue
- * time.
- *
- * Returns `{"stale"}`, `{"skipped"}`, or `{"fired", jobId}`.
- * ARGV: prefix, wfId, nsId, scheduleId, expectedScore, nextScore, jobId, maxAttempts, groupCap
- */
 const FIRE_SCHEDULE = `
 ${MAINTAIN_GROUP}
 ${ADD_WAITING}
@@ -704,7 +502,6 @@ redis.call("HSET", scheduleKey, "lastJobId", jobId, "lastFireAt", now)
 return { "fired", jobId }
 `
 
-/** Read every declared limiter against the Redis clock without modifying the start logs. */
 const RATE_LIMITER_METRICS = `
 ${NOW}
 local values = {}
@@ -719,13 +516,6 @@ end
 return values
 `
 
-/**
- * Read-only snapshot of one group's unfinished jobs: active, then waiting in claim order, then
- * delayed in `runAt` order. Delayed jobs have no group index, so the workflow's `delayed` ZSET is
- * scanned and filtered on each hash's `groupId`.
- *
- * ARGV: prefix, wfId, groupId
- */
 const GROUP_JOBS = `
 local wf = ARGV[1] .. ":" .. ARGV[2]
 local groupId = ARGV[3]
@@ -741,7 +531,6 @@ local function collect(ids)
 end
 collect(redis.call("SMEMBERS", wf .. ":g:" .. groupId .. ":active"))
 collect(redis.call("ZRANGE", wf .. ":g:" .. groupId .. ":jobs", 0, -1))
--- ponytail: O(all delayed jobs) per call. Add a per-group delayed index if that set grows large.
 collect(redis.call("ZRANGE", wf .. ":delayed", 0, -1))
 return jobs
 `
@@ -790,12 +579,10 @@ export interface QueueCommands {
   fireSchedule: (...args: (string | number)[]) => Promise<(string | number)[]>
 }
 
-/** A redis connection with the queue's custom commands registered. */
 export type QueueRedis = Redis & QueueCommands
 
 const registered = new WeakSet<Redis>()
 
-/** Register the queue's Lua commands on a connection (idempotent). */
 export function registerScripts(redis: Redis): QueueRedis {
   if (!registered.has(redis)) {
     redis.defineCommand('enqueue', { numberOfKeys: 0, lua: ENQUEUE })

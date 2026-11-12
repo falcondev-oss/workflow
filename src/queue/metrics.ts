@@ -3,20 +3,16 @@ import type { Meter } from '@opentelemetry/api'
 export interface MetricsOptions {
   meter: Meter
   prefix: string
-  /** Record `<prefix>_workflow_step_duration_ms` per `step.do`. Off by default: step names can be high-cardinality. */
   stepDuration?: boolean
 }
 
-/** What one handler attempt ended as, once Redis committed it. */
 export type AttemptOutcome = 'completed' | 'retried' | 'failed' | 'rate_limited'
 
-// The SDK default stops at 10s, too short for a backlog or a long handler.
 const MS_BUCKETS = [
   5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000, 30_000, 60_000, 300_000, 900_000,
   3_600_000,
 ]
 
-/** The worker's OTel instruments for one workflow, every point tagged with `workflow_id`. */
 export function createWorkerMetrics(
   { meter, prefix, stepDuration }: MetricsOptions,
   workflowId: string,
@@ -60,7 +56,6 @@ export function createWorkerMetrics(
     claimed(queueWaitMs: number) {
       queueWait.record(queueWaitMs, attributes)
     },
-    /** `attemptsUsed` and `endToEndMs` only matter for terminal outcomes. */
     attempt(outcome: AttemptOutcome, durationMs: number, attemptsUsed: number, endToEndMs: number) {
       const outcomeAttributes = { ...attributes, outcome }
       duration.record(durationMs, outcomeAttributes)
